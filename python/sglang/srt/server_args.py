@@ -719,6 +719,17 @@ class ServerArgs:
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    max_consecutive_prefill_batches: A[
+        int,
+        (
+            "The maximum number of consecutive pure prefill batches that may run "
+            "while a decode batch is waiting to run. After this many prefills, "
+            "the scheduler runs one decode batch before admitting more prefills. "
+            "An active chunked request is allowed to finish its next chunk. Set "
+            "to 0 to disable this fairness limit."
+        ),
+        NS("schedule"),
+    ] = 0
     schedule_policy: A[
         str,
         Arg(
@@ -7111,6 +7122,11 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _validate_max_consecutive_prefill_batches(self) -> None:
+        assert (
+            self.max_consecutive_prefill_batches >= 0
+        ), "--max-consecutive-prefill-batches must be non-negative."
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7210,6 +7226,7 @@ class ServerArgs:
         )
 
         # Check scheduling policy
+        self._validate_max_consecutive_prefill_batches()
         if self.enable_priority_scheduling:
             assert self.schedule_policy in [
                 "fcfs",
