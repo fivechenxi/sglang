@@ -17,8 +17,11 @@ ARG TORCHAUDIO_VERSION="2.10.0"
 ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_x86_64.whl"
 ARG SGLANG_TAG=main
+ARG SGLANG_REPOSITORY=https://github.com/sgl-project/sglang.git
+ARG SGLANG_COMMIT=""
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
+ARG APPLY_GLM52_910B_PATCHES=0
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
@@ -94,7 +97,9 @@ RUN (${PIP_INSTALL} pybind11) && \
     (${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn)
 
 # Install SGLang (editable mode to preserve source and git history)
-RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-workspace/sglang && \
+RUN git clone "$SGLANG_REPOSITORY" /sgl-workspace/sglang && \
+    cd /sgl-workspace/sglang && \
+    if [ -n "$SGLANG_COMMIT" ]; then git checkout --detach "$SGLANG_COMMIT"; else git checkout "$SGLANG_TAG"; fi && \
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
 
@@ -108,5 +113,16 @@ RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
     && ${PIP_INSTALL} deep_ep*.whl sgl_kernel_npu*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
+
+RUN if [ "$APPLY_GLM52_910B_PATCHES" = "1" ]; then \
+      python3 /sgl-workspace/sglang/scripts/ascend/patch_glm52_910b_w8a8_runtime.py; \
+    fi
+
+ARG BUILD_COMMIT=""
+ARG BUILD_REPOSITORY=""
+ARG BUILD_WORKFLOW_URL=""
+LABEL org.opencontainers.image.revision="$BUILD_COMMIT" \
+      org.opencontainers.image.source="$BUILD_REPOSITORY" \
+      org.opencontainers.image.url="$BUILD_WORKFLOW_URL"
 
 CMD ["/bin/bash"]
