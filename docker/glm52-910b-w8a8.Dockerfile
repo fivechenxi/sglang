@@ -1,4 +1,4 @@
-FROM quay.io/ascend/sglang@sha256:175e295542c46204cdfcf0d8506d0c45a6c4ad90d7381924dab1f36ef25642de
+FROM ghcr.io/fivechenxi/sglang@sha256:1e3fa2b90bd184dbf2e73cdef1fc5453d5edc5849aadbbde126f93d06082e43e
 
 ARG SGLANG_REPOSITORY
 ARG SGLANG_COMMIT
@@ -20,6 +20,6 @@ RUN python3 /sgl-workspace/sglang/scripts/ascend/patch_glm52_910b_w8a8_runtime.p
 LABEL org.opencontainers.image.revision="$SGLANG_COMMIT" \
       org.opencontainers.image.source="$SGLANG_REPOSITORY" \
       org.opencontainers.image.url="$BUILD_WORKFLOW_URL" \
-      io.maas.base-image="quay.io/ascend/sglang@sha256:175e295542c46204cdfcf0d8506d0c45a6c4ad90d7381924dab1f36ef25642de"
+      io.maas.base-image="ghcr.io/fivechenxi/sglang@sha256:1e3fa2b90bd184dbf2e73cdef1fc5453d5edc5849aadbbde126f93d06082e43e"
 
 CMD ["/bin/bash"]

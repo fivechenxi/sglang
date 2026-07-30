@@ -67,6 +67,6 @@ jobs:
             echo
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Image: \`${{ steps.image.outputs.tag }}\`"
-            echo "- Base digest: \`sha256:175e295542c46204cdfcf0d8506d0c45a6c4ad90d7381924dab1f36ef25642de\`"
+            echo "- Base digest: \`sha256:1e3fa2b90bd184dbf2e73cdef1fc5453d5edc5849aadbbde126f93d06082e43e\`"
             echo "- Dependencies: preserved from the verified production image"
           } >> "$GITHUB_STEP_SUMMARY"
