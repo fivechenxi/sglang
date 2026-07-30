@@ -158,6 +158,14 @@ class ModelSlimConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
+            # GLM-5.2 computes a DSA index only on each "full" indexer layer.
+            # Shared layers reuse that index, so their placeholder indexer
+            # weights are intentionally absent from ModelSlim metadata.
+            if (
+                ".self_attn.indexer." in prefix
+                and prefix + ".weight" not in self.quant_description
+            ):
+                return UnquantizedLinearMethod()
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
             if "vision_model" in prefix:
