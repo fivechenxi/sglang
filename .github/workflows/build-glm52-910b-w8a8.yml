@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/build-glm52-910b-w8a8.yml"
       - "docker/npu.Dockerfile"
+      - "docker/glm52-910b-w8a8.Dockerfile"
       - "python/**"
       - "scripts/ascend/**"
   workflow_dispatch:
@@ -47,21 +48,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: docker
-          file: docker/npu.Dockerfile
+          file: docker/glm52-910b-w8a8.Dockerfile
           platforms: linux/arm64
           push: true
           provenance: true
           sbom: true
           tags: ${{ steps.image.outputs.tag }}
           build-args: |
-            CANN_VERSION=9.0.0
-            DEVICE_TYPE=910b
-            SGLANG_KERNEL_NPU_TAG=2026.6.1
             SGLANG_REPOSITORY=https://github.com/${{ github.repository }}.git
             SGLANG_COMMIT=${{ github.sha }}
-            APPLY_GLM52_910B_PATCHES=1
-            BUILD_COMMIT=${{ github.sha }}
-            BUILD_REPOSITORY=https://github.com/${{ github.repository }}
             BUILD_WORKFLOW_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
       - name: Publish build summary
@@ -72,6 +67,6 @@ jobs:
             echo
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Image: \`${{ steps.image.outputs.tag }}\`"
-            echo "- CANN: \`9.0.0\`"
-            echo "- sgl_kernel_npu: \`2026.6.1\`"
+            echo "- Base digest: \`sha256:175e295542c46204cdfcf0d8506d0c45a6c4ad90d7381924dab1f36ef25642de\`"
+            echo "- Dependencies: preserved from the verified production image"
           } >> "$GITHUB_STEP_SUMMARY"
