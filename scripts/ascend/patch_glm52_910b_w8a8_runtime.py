@@ -3,7 +3,7 @@
 
 The compatibility fixes target the DeepEP package shipped by the Ascend image:
 
-* add the hybrid prefill/decode strategy;
+* add the hybrid prefill/decode strategies;
 * use graph-compatible all_to_all_single in the equal-split fallback.
 
 The patch is intentionally strict and idempotent. It exits instead of silently
@@ -99,22 +99,37 @@ def patch_deepep_all_to_all() -> list[Path]:
 
 def patch_deepep_hybrid_strategy() -> list[Path]:
     path = package_root("deep_ep") / "ep_strategy.py"
-    old = """        ("ops"): (
+    text = path.read_text()
+    if '("hybrid_ops"): (' in text:
+        return []
+
+    ops = """        ("ops"): (
             NormalStrategy.DEFAULT,
             LowLatencyStrategy.OPS,
         ),
 """
-    new = """        ("ops"): (
-            NormalStrategy.DEFAULT,
-            LowLatencyStrategy.OPS,
-        ),
-        # GLM-5.2 910B: prefill uses all-to-all while decode keeps the native
+    hybrid = """        # GLM-5.2 910B: prefill uses all-to-all while decode keeps the native
         # low-latency dispatch/combine implementation.
         ("hybrid"): (
             NormalStrategy.ALLTOALL,
             LowLatencyStrategy.DEFAULT,
         ),
 """
+    hybrid_ops = """        # Experimental small-token decode path: keep the validated all-to-all
+        # prefill fallback, but call the torch_npu V2 dispatch/combine ops
+        # directly during decode.
+        ("hybrid_ops"): (
+            NormalStrategy.ALLTOALL,
+            LowLatencyStrategy.OPS,
+        ),
+"""
+    if hybrid in text:
+        old = hybrid
+        new = hybrid + hybrid_ops
+    else:
+        old = ops
+        new = ops + hybrid + hybrid_ops
+
     return (
         [path]
         if replace_once(
@@ -122,7 +137,7 @@ def patch_deepep_hybrid_strategy() -> list[Path]:
             old,
             new,
             "DeepEP hybrid strategy",
-            applied_marker='("hybrid"): (',
+            applied_marker='("hybrid_ops"): (',
         )
         else []
     )

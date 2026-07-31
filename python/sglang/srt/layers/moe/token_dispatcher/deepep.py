@@ -671,7 +671,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
-        topk_ids = topk_ids.to(torch.int64)
+        topk_ids = topk_ids.to(
+            torch.int32
+            if _is_npu and envs.SGLANG_NPU_DEEPEP_KEEP_INT32_TOPK.get()
+            else torch.int64
+        )
         expected_m = (
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts

@@ -30,6 +30,20 @@ The resulting transport split is:
 - decode: native DeepEP low-latency dispatch/combine;
 - decode batch sizes 4, 8, and 16 may be captured by the NPU graph backend.
 
+For a single-variable experiment that preserves the same prefill path but calls
+the Ascend V2 low-latency operators directly during decode:
+
+```bash
+export DEEP_USE_MODE=hybrid_ops
+```
+
+After `hybrid_ops` passes correctness and performance validation, the optional
+top-k cast experiment can be enabled independently:
+
+```bash
+export SGLANG_NPU_DEEPEP_KEEP_INT32_TOPK=1
+```
+
 This is an exact production-recovery branch, not evidence that a newer SGLang
 `main` commit works with the package set above. Move the branch forward only
 after the same four-node startup and protocol regression passes.

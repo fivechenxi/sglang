@@ -667,6 +667,10 @@ class Envs:
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)  # This argument is deprecated
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
+    # Ascend DeepEP strategies consume int32 expert IDs. Keeping them int32
+    # across dispatch and combine avoids two per-layer int64<->int32 casts.
+    # Disabled by default until the production W4 path passes accuracy A/B.
+    SGLANG_NPU_DEEPEP_KEEP_INT32_TOPK = EnvBool(False)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.

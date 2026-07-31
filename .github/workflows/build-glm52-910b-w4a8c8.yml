@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - agent/glm52-w4a8c8-plan
+      - agent/glm52-deepep-small-token
     paths:
       - ".github/workflows/build-glm52-910b-w4a8c8.yml"
       - "docker/glm52-910b-w4a8c8.Dockerfile"
