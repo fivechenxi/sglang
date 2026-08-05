@@ -7165,7 +7165,11 @@ class ServerArgs:
         if self.speculative_algorithm is not None:
             assert (
                 not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+                or self.speculative_skip_dp_mlp_sync
+            ), (
+                "enable_mixed_chunk with speculative decoding requires "
+                "speculative_skip_dp_mlp_sync"
+            )
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
