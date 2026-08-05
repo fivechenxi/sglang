@@ -518,11 +518,15 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
+    if (
+        server_args.enable_mixed_chunk
+        and not server_args.speculative_skip_dp_mlp_sync
+    ):
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "eagle speculative decoding. To enable this experimental path, "
+            "also set --speculative-skip-dp-mlp-sync."
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
