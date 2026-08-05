@@ -38,10 +38,15 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.spec_algorithm.is_none.return_value = not speculative
     scheduler.server_args = SimpleNamespace(speculative_skip_dp_mlp_sync=False)
     scheduler.dp_attn_adapter = MagicMock()
-    scheduler.dp_attn_adapter.coordinate_force_decode.side_effect = lambda value: value
-    scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
-        lambda batch, **_: batch
-    )
+
+    def _sync_batch(batch, **kwargs):
+        if batch is not None:
+            batch.fairness_force_decode_next = kwargs.get(
+                "fairness_force_decode_next", False
+            )
+        return batch
+
+    scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = _sync_batch
     scheduler.ngram_embedding_manager = MagicMock()
     scheduler.ngram_embedding_manager.prepare_for_forward.side_effect = (
         lambda batch, **_: batch
@@ -53,6 +58,7 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.is_mixed_chunk = False
     scheduler.max_consecutive_prefill_batches = max_consecutive_prefills
     scheduler.consecutive_prefill_batches = 0
+    scheduler.prefill_fairness_force_decode_pending = False
     return scheduler
 
 
@@ -91,8 +97,7 @@ class TestPrefillDecodeFairness(CustomTestCase):
     def test_speculative_decode_uses_dp_coordinated_force_decision(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
         scheduler.consecutive_prefill_batches = 1
-        scheduler.dp_attn_adapter.coordinate_force_decode.return_value = True
-        scheduler.dp_attn_adapter.coordinate_force_decode.side_effect = None
+        scheduler.prefill_fairness_force_decode_pending = True
         running_batch = _batch(empty=False)
         scheduler.get_new_batch_prefill = MagicMock()
 
@@ -101,10 +106,9 @@ class TestPrefillDecodeFairness(CustomTestCase):
         )
 
         self.assertIs(plan.batch_to_run, running_batch)
-        scheduler.dp_attn_adapter.coordinate_force_decode.assert_called_once_with(True)
         scheduler.get_new_batch_prefill.assert_not_called()
 
-    def test_speculative_first_prefill_skips_fairness_collective(self):
+    def test_speculative_prefill_records_next_force_decision(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
         running_batch = _batch(empty=False)
         prefill_batch = _batch(empty=False)
@@ -118,8 +122,8 @@ class TestPrefillDecodeFairness(CustomTestCase):
             scheduler, running_batch=running_batch, last_batch=None
         )
 
-        scheduler.dp_attn_adapter.coordinate_force_decode.assert_not_called()
         self.assertEqual(scheduler.consecutive_prefill_batches, 1)
+        self.assertTrue(scheduler.prefill_fairness_force_decode_pending)
 
     def test_zero_disables_fairness_limit(self):
         scheduler = _scheduler(max_consecutive_prefills=0, speculative=True)
@@ -144,6 +148,7 @@ class TestPrefillDecodeFairness(CustomTestCase):
     def test_active_chunked_request_yields_at_chunk_boundary(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
         scheduler.consecutive_prefill_batches = 1
+        scheduler.prefill_fairness_force_decode_pending = True
         scheduler.chunked_req = MagicMock()
         scheduler.chunked_req.extend_range.end = 0
         scheduler.chunked_req.prefix_indices = []

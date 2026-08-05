@@ -1917,6 +1917,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None
+    # DP-wide decode fairness decision gathered with the existing MLP sync.
+    fairness_force_decode_next: bool = False
     spec_verify_tier_num_tokens: int = -1
 
     # For processing logprobs

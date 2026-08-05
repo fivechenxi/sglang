@@ -967,6 +967,7 @@ class Scheduler(
             self.server_args.max_consecutive_prefill_batches
         )
         self.consecutive_prefill_batches = 0
+        self.prefill_fairness_force_decode_pending = False
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2718,22 +2719,20 @@ class Scheduler(
             and not running_batch.is_empty()
             and not running_batch.is_prefill_only
         )
-        force_decode = (
-            decode_is_runnable
-            and self.consecutive_prefill_batches >= self.max_consecutive_prefill_batches
-        )
         coordinate_dp_fairness = (
             prefill_decode_fairness_enabled
             and self.require_mlp_sync
             and not self.spec_algorithm.is_none()
             and not self.server_args.speculative_skip_dp_mlp_sync
         )
-        if (
-            coordinate_dp_fairness
-            and self.consecutive_prefill_batches
-            >= self.max_consecutive_prefill_batches
-        ):
-            force_decode = self.dp_attn_adapter.coordinate_force_decode(force_decode)
+        if coordinate_dp_fairness:
+            force_decode = self.prefill_fairness_force_decode_pending
+        else:
+            force_decode = (
+                decode_is_runnable
+                and self.consecutive_prefill_batches
+                >= self.max_consecutive_prefill_batches
+            )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -2754,8 +2753,21 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
+            fairness_force_decode_next = (
+                coordinate_dp_fairness
+                and decode_is_runnable
+                and self.consecutive_prefill_batches + 1
+                >= self.max_consecutive_prefill_batches
+            )
+            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                new_batch,
+                fairness_force_decode_next=fairness_force_decode_next,
+            )
             need_mlp_sync = new_batch is None
+            if coordinate_dp_fairness and new_batch is not None:
+                self.prefill_fairness_force_decode_pending = (
+                    new_batch.fairness_force_decode_next
+                )
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -2763,10 +2775,10 @@ class Scheduler(
             if prefill_decode_fairness_enabled:
                 if coordinate_dp_fairness and not new_batch.decoding_reqs:
                     # The speculative DP synchronization above converts every
-                    # rank to prefill/idle together.  Count that global prefill
-                    # turn on every rank so the next arbitration collective is
-                    # entered in the same scheduler iteration.  This keeps the
-                    # extra collective off the pure-decode hot path.
+                    # rank to prefill/idle together. Count that global prefill
+                    # turn on every rank. The next force-decode decision was
+                    # piggybacked on that same sync, so no new collective is
+                    # introduced on either the prefill or decode path.
                     self.consecutive_prefill_batches += 1
                 elif decode_is_runnable and not new_batch.decoding_reqs:
                     self.consecutive_prefill_batches += 1
@@ -2779,9 +2791,11 @@ class Scheduler(
                 ret = running_batch if not running_batch.is_empty() else None
                 if ret is not None:
                     self.consecutive_prefill_batches = 0
+                    self.prefill_fairness_force_decode_pending = False
             else:
                 ret = None
                 self.consecutive_prefill_batches = 0
+                self.prefill_fairness_force_decode_pending = False
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(

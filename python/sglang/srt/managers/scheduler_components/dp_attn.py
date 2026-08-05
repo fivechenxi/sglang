@@ -49,6 +49,7 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_run_breakable_cuda_graph: bool
+    fairness_force_decode_next: bool = False
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -57,6 +58,7 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    global_fairness_force_decode_next: bool = False
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -68,6 +70,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
+                int(self.fairness_force_decode_next),
             ],
             device=device,
             dtype=dtype,
@@ -83,6 +86,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
+                0,  # fairness_force_decode_next
             ],
             device=device,
             dtype=dtype,
@@ -91,7 +95,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
+            (self.dp_size, self.tp_size * self.cp_size, 8),
             dtype=torch.int64,
             device=device,
         )
@@ -107,7 +111,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 8)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -119,6 +123,7 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.global_fairness_force_decode_next = bool(tp0_info[:, 7].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -146,6 +151,9 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_breakable_cuda_graph
+    batch.fairness_force_decode_next = (
+        mlp_sync_info.global_fairness_force_decode_next
+    )
 
 
 def prepare_mlp_sync_batch_raw(
@@ -159,6 +167,7 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    fairness_force_decode_next: bool = False,
 ):
     # Check if other DP workers have running batches
     if (
@@ -229,6 +238,7 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
+        fairness_force_decode_next=fairness_force_decode_next,
     )
 
     if not skip_all_gather:
@@ -289,7 +299,11 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self,
+        local_batch: ScheduleBatch,
+        fairness_force_decode_next: bool = False,
+    ):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -301,12 +315,14 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            fairness_force_decode_next=fairness_force_decode_next,
         )
 
     def maybe_prepare_mlp_sync_batch(
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        fairness_force_decode_next: bool = False,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -317,38 +333,11 @@ class SchedulerDPAttnAdapter:
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(
+                batch,
+                fairness_force_decode_next=fairness_force_decode_next,
+            )
         return batch
-
-    def coordinate_force_decode(self, local_force_decode: bool) -> bool:
-        """Make a fairness-forced decode decision consistent across DP ranks.
-
-        A local ``None`` batch is converted to an idle batch by the normal DP
-        MLP synchronization when another DP rank selects prefill.  Therefore a
-        local-only fairness decision cannot bound decode starvation.  Reduce
-        the intent before either side mutates its prefill queue so every rank
-        chooses decode/idle for the same scheduler iteration.
-        """
-        if self.server_args.dp_size <= 1:
-            return local_force_decode
-
-        if len(self.offload_tags) == 0 and (
-            self.server_args.disable_overlap_schedule
-            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
-        ):
-            group = self.tp_group.device_group
-            device = self.tp_group.device
-        else:
-            group = self.tp_group.cpu_group
-            device = "cpu"
-
-        force_decode = torch.tensor(
-            [int(local_force_decode)], dtype=torch.int32, device=device
-        )
-        torch.distributed.all_reduce(
-            force_decode, op=torch.distributed.ReduceOp.MAX, group=group
-        )
-        return bool(force_decode.item())
 
     def get_idle_batch(self) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
