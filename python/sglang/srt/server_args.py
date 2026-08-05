@@ -728,7 +728,6 @@ class ServerArgs:
             "An active chunked request is allowed to finish its next chunk. Set "
             "to 0 to disable this fairness limit."
         ),
-        NS("schedule"),
     ] = 0
     schedule_policy: A[
         str,
