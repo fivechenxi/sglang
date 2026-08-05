@@ -123,7 +123,7 @@ class TestPrefillDecodeFairness(CustomTestCase):
         self.assertTrue(all(batch is prefill_batch for batch in selected))
         self.assertEqual(scheduler.consecutive_prefill_batches, 0)
 
-    def test_active_chunked_request_continues_prefill(self):
+    def test_active_chunked_request_yields_at_chunk_boundary(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
         scheduler.consecutive_prefill_batches = 1
         scheduler.chunked_req = MagicMock()
@@ -141,13 +141,9 @@ class TestPrefillDecodeFairness(CustomTestCase):
             scheduler, running_batch=running_batch, last_batch=None
         )
 
-        self.assertIs(plan.batch_to_run, prefill_batch)
-
-        scheduler.chunked_req = None
-        plan = Scheduler.get_next_batch_to_run(
-            scheduler, running_batch=running_batch, last_batch=None
-        )
         self.assertIs(plan.batch_to_run, running_batch)
+        scheduler.get_new_batch_prefill.assert_not_called()
+        self.assertIsNotNone(scheduler.chunked_req)
 
     def test_mixed_prefill_that_advances_decode_resets_streak(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=False)

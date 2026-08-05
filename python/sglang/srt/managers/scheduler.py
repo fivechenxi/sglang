@@ -2720,8 +2720,6 @@ class Scheduler(
         )
         force_decode = (
             decode_is_runnable
-            # A partially processed request must continue its next chunk.
-            and self.chunked_req is None
             and self.consecutive_prefill_batches >= self.max_consecutive_prefill_batches
         )
         if (
