@@ -36,7 +36,10 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.require_mlp_sync = speculative
     scheduler.spec_algorithm = MagicMock()
     scheduler.spec_algorithm.is_none.return_value = not speculative
-    scheduler.server_args = SimpleNamespace(speculative_skip_dp_mlp_sync=False)
+    scheduler.server_args = SimpleNamespace(
+        speculative_skip_dp_mlp_sync=False,
+        num_continuous_decode_steps=1,
+    )
     scheduler.dp_attn_adapter = MagicMock()
 
     def _sync_batch(batch, **kwargs):
@@ -59,6 +62,7 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.max_consecutive_prefill_batches = max_consecutive_prefills
     scheduler.consecutive_prefill_batches = 0
     scheduler.prefill_fairness_force_decode_pending = False
+    scheduler.prefill_fairness_decode_steps_remaining = 0
     scheduler.prefill_fairness_debug_count = 64
     scheduler.ps = SimpleNamespace(attn_tp_rank=0, dp_rank=0)
     return scheduler
@@ -144,6 +148,31 @@ class TestPrefillDecodeFairness(CustomTestCase):
         )
 
         self.assertTrue(scheduler.prefill_fairness_force_decode_pending)
+
+    def test_speculative_fairness_runs_configured_decode_quota(self):
+        scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
+        scheduler.server_args.num_continuous_decode_steps = 4
+        running_batch = _batch(empty=False)
+        prefill_batch = _batch(empty=False)
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=NextBatchPlan(
+                batch_to_run=prefill_batch, running_batch=running_batch
+            )
+        )
+
+        selected = []
+        for _ in range(6):
+            plan = Scheduler.get_next_batch_to_run(
+                scheduler, running_batch=running_batch, last_batch=None
+            )
+            selected.append(
+                "decode" if plan.batch_to_run is running_batch else "prefill"
+            )
+
+        self.assertEqual(
+            selected,
+            ["prefill", "decode", "decode", "decode", "decode", "prefill"],
+        )
 
     def test_zero_disables_fairness_limit(self):
         scheduler = _scheduler(max_consecutive_prefills=0, speculative=True)

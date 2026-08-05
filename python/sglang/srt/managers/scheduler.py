@@ -968,6 +968,7 @@ class Scheduler(
         )
         self.consecutive_prefill_batches = 0
         self.prefill_fairness_force_decode_pending = False
+        self.prefill_fairness_decode_steps_remaining = 0
         # Temporary, bounded research probe. Keep this off the hot-path after
         # the prefill/decode fairness behavior is verified on real DP traffic.
         self.prefill_fairness_debug_count = 0
@@ -2729,7 +2730,12 @@ class Scheduler(
             and not self.server_args.speculative_skip_dp_mlp_sync
         )
         if coordinate_dp_fairness:
-            force_decode = self.prefill_fairness_force_decode_pending
+            if self.prefill_fairness_force_decode_pending:
+                self.prefill_fairness_decode_steps_remaining = max(
+                    self.prefill_fairness_decode_steps_remaining,
+                    self.server_args.num_continuous_decode_steps,
+                )
+            force_decode = self.prefill_fairness_decode_steps_remaining > 0
         else:
             force_decode = (
                 decode_is_runnable
@@ -2757,10 +2763,11 @@ class Scheduler(
             logger.info(
                 "PREFILL_FAIRNESS_PROBE dp=%s consecutive=%s "
                 "decode_runnable=%s force_decode=True selected=DECODE "
-                "chunked=%s running=%s",
+                "decode_remaining=%s chunked=%s running=%s",
                 self.ps.dp_rank,
                 self.consecutive_prefill_batches,
                 decode_is_runnable,
+                self.prefill_fairness_decode_steps_remaining,
                 self.chunked_req is not None,
                 running_batch.batch_size(),
             )
@@ -2849,6 +2856,12 @@ class Scheduler(
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
+
+        if coordinate_dp_fairness and force_decode:
+            if ret is None:
+                self.prefill_fairness_decode_steps_remaining = 0
+            else:
+                self.prefill_fairness_decode_steps_remaining -= 1
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
