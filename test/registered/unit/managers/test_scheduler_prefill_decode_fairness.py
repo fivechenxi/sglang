@@ -59,6 +59,8 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.max_consecutive_prefill_batches = max_consecutive_prefills
     scheduler.consecutive_prefill_batches = 0
     scheduler.prefill_fairness_force_decode_pending = False
+    scheduler.prefill_fairness_debug_count = 64
+    scheduler.ps = SimpleNamespace(attn_tp_rank=0, dp_rank=0)
     return scheduler
 
 
@@ -123,6 +125,24 @@ class TestPrefillDecodeFairness(CustomTestCase):
         )
 
         self.assertEqual(scheduler.consecutive_prefill_batches, 1)
+        self.assertTrue(scheduler.prefill_fairness_force_decode_pending)
+
+    def test_first_speculative_prefill_records_next_force_before_decode_is_runnable(
+        self,
+    ):
+        scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
+        running_batch = _batch(empty=True)
+        prefill_batch = _batch(empty=False)
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=NextBatchPlan(
+                batch_to_run=prefill_batch, running_batch=running_batch
+            )
+        )
+
+        Scheduler.get_next_batch_to_run(
+            scheduler, running_batch=running_batch, last_batch=None
+        )
+
         self.assertTrue(scheduler.prefill_fairness_force_decode_pending)
 
     def test_zero_disables_fairness_limit(self):

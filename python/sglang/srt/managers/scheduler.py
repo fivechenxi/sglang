@@ -2746,6 +2746,26 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
+        local_prefill_selected = new_batch is not None
+
+        if (
+            coordinate_dp_fairness
+            and force_decode
+            and self.ps.attn_tp_rank == 0
+            and self.prefill_fairness_debug_count < 64
+        ):
+            logger.info(
+                "PREFILL_FAIRNESS_PROBE dp=%s consecutive=%s "
+                "decode_runnable=%s force_decode=True selected=DECODE "
+                "chunked=%s running=%s",
+                self.ps.dp_rank,
+                self.consecutive_prefill_batches,
+                decode_is_runnable,
+                self.chunked_req is not None,
+                running_batch.batch_size(),
+            )
+            self.prefill_fairness_debug_count += 1
+
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
@@ -2758,7 +2778,7 @@ class Scheduler(
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
             fairness_force_decode_next = (
                 coordinate_dp_fairness
-                and decode_is_runnable
+                and local_prefill_selected
                 and self.consecutive_prefill_batches + 1
                 >= self.max_consecutive_prefill_batches
             )
