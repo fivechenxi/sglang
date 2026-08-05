@@ -968,6 +968,9 @@ class Scheduler(
         )
         self.consecutive_prefill_batches = 0
         self.prefill_fairness_force_decode_pending = False
+        # Temporary, bounded research probe. Keep this off the hot-path after
+        # the prefill/decode fairness behavior is verified on real DP traffic.
+        self.prefill_fairness_debug_count = 0
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -2768,6 +2771,31 @@ class Scheduler(
                 self.prefill_fairness_force_decode_pending = (
                     new_batch.fairness_force_decode_next
                 )
+                if (
+                    self.ps.attn_tp_rank == 0
+                    and self.prefill_fairness_debug_count < 64
+                    and (
+                        decode_is_runnable
+                        or force_decode
+                        or fairness_force_decode_next
+                        or self.prefill_fairness_force_decode_pending
+                    )
+                ):
+                    logger.info(
+                        "PREFILL_FAIRNESS_PROBE dp=%s consecutive=%s "
+                        "decode_runnable=%s force_decode=%s local_next=%s "
+                        "global_next=%s selected=%s chunked=%s running=%s",
+                        self.ps.dp_rank,
+                        self.consecutive_prefill_batches,
+                        decode_is_runnable,
+                        force_decode,
+                        fairness_force_decode_next,
+                        self.prefill_fairness_force_decode_pending,
+                        new_batch.forward_mode.name,
+                        self.chunked_req is not None,
+                        running_batch.batch_size(),
+                    )
+                    self.prefill_fairness_debug_count += 1
 
         if new_batch is not None:
             # Run prefill first if possible
