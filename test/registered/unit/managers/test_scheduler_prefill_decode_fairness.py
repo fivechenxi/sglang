@@ -90,6 +90,7 @@ class TestPrefillDecodeFairness(CustomTestCase):
 
     def test_speculative_decode_uses_dp_coordinated_force_decision(self):
         scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
+        scheduler.consecutive_prefill_batches = 1
         scheduler.dp_attn_adapter.coordinate_force_decode.return_value = True
         scheduler.dp_attn_adapter.coordinate_force_decode.side_effect = None
         running_batch = _batch(empty=False)
@@ -100,8 +101,25 @@ class TestPrefillDecodeFairness(CustomTestCase):
         )
 
         self.assertIs(plan.batch_to_run, running_batch)
-        scheduler.dp_attn_adapter.coordinate_force_decode.assert_called_once_with(False)
+        scheduler.dp_attn_adapter.coordinate_force_decode.assert_called_once_with(True)
         scheduler.get_new_batch_prefill.assert_not_called()
+
+    def test_speculative_first_prefill_skips_fairness_collective(self):
+        scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
+        running_batch = _batch(empty=False)
+        prefill_batch = _batch(empty=False)
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=NextBatchPlan(
+                batch_to_run=prefill_batch, running_batch=running_batch
+            )
+        )
+
+        Scheduler.get_next_batch_to_run(
+            scheduler, running_batch=running_batch, last_batch=None
+        )
+
+        scheduler.dp_attn_adapter.coordinate_force_decode.assert_not_called()
+        self.assertEqual(scheduler.consecutive_prefill_batches, 1)
 
     def test_zero_disables_fairness_limit(self):
         scheduler = _scheduler(max_consecutive_prefills=0, speculative=True)

@@ -2722,10 +2722,16 @@ class Scheduler(
             decode_is_runnable
             and self.consecutive_prefill_batches >= self.max_consecutive_prefill_batches
         )
-        if (
+        coordinate_dp_fairness = (
             prefill_decode_fairness_enabled
             and self.require_mlp_sync
+            and not self.spec_algorithm.is_none()
             and not self.server_args.speculative_skip_dp_mlp_sync
+        )
+        if (
+            coordinate_dp_fairness
+            and self.consecutive_prefill_batches
+            >= self.max_consecutive_prefill_batches
         ):
             force_decode = self.dp_attn_adapter.coordinate_force_decode(force_decode)
 
@@ -2755,7 +2761,14 @@ class Scheduler(
             # Run prefill first if possible
             ret = new_batch
             if prefill_decode_fairness_enabled:
-                if decode_is_runnable and not new_batch.decoding_reqs:
+                if coordinate_dp_fairness and not new_batch.decoding_reqs:
+                    # The speculative DP synchronization above converts every
+                    # rank to prefill/idle together.  Count that global prefill
+                    # turn on every rank so the next arbitration collective is
+                    # entered in the same scheduler iteration.  This keeps the
+                    # extra collective off the pure-decode hot path.
+                    self.consecutive_prefill_batches += 1
+                elif decode_is_runnable and not new_batch.decoding_reqs:
                     self.consecutive_prefill_batches += 1
                 else:
                     self.consecutive_prefill_batches = 0
