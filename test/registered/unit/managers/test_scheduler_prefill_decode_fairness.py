@@ -38,6 +38,7 @@ def _scheduler(*, max_consecutive_prefills: int, speculative: bool) -> Scheduler
     scheduler.spec_algorithm.is_none.return_value = not speculative
     scheduler.server_args = SimpleNamespace(speculative_skip_dp_mlp_sync=False)
     scheduler.dp_attn_adapter = MagicMock()
+    scheduler.dp_attn_adapter.coordinate_force_decode.side_effect = lambda value: value
     scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
         lambda batch, **_: batch
     )
@@ -86,6 +87,21 @@ class TestPrefillDecodeFairness(CustomTestCase):
 
     def test_bounds_prefill_streak_with_speculative_decode(self):
         self._assert_bounded_prefill_streak(speculative=True)
+
+    def test_speculative_decode_uses_dp_coordinated_force_decision(self):
+        scheduler = _scheduler(max_consecutive_prefills=1, speculative=True)
+        scheduler.dp_attn_adapter.coordinate_force_decode.return_value = True
+        scheduler.dp_attn_adapter.coordinate_force_decode.side_effect = None
+        running_batch = _batch(empty=False)
+        scheduler.get_new_batch_prefill = MagicMock()
+
+        plan = Scheduler.get_next_batch_to_run(
+            scheduler, running_batch=running_batch, last_batch=None
+        )
+
+        self.assertIs(plan.batch_to_run, running_batch)
+        scheduler.dp_attn_adapter.coordinate_force_decode.assert_called_once_with(False)
+        scheduler.get_new_batch_prefill.assert_not_called()
 
     def test_zero_disables_fairness_limit(self):
         scheduler = _scheduler(max_consecutive_prefills=0, speculative=True)

@@ -320,6 +320,36 @@ class SchedulerDPAttnAdapter:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
+    def coordinate_force_decode(self, local_force_decode: bool) -> bool:
+        """Make a fairness-forced decode decision consistent across DP ranks.
+
+        A local ``None`` batch is converted to an idle batch by the normal DP
+        MLP synchronization when another DP rank selects prefill.  Therefore a
+        local-only fairness decision cannot bound decode starvation.  Reduce
+        the intent before either side mutates its prefill queue so every rank
+        chooses decode/idle for the same scheduler iteration.
+        """
+        if self.server_args.dp_size <= 1:
+            return local_force_decode
+
+        if len(self.offload_tags) == 0 and (
+            self.server_args.disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        ):
+            group = self.tp_group.device_group
+            device = self.tp_group.device
+        else:
+            group = self.tp_group.cpu_group
+            device = "cpu"
+
+        force_decode = torch.tensor(
+            [int(local_force_decode)], dtype=torch.int32, device=device
+        )
+        torch.distributed.all_reduce(
+            force_decode, op=torch.distributed.ReduceOp.MAX, group=group
+        )
+        return bool(force_decode.item())
+
     def get_idle_batch(self) -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],

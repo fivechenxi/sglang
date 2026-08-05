@@ -2724,6 +2724,12 @@ class Scheduler(
             and self.chunked_req is None
             and self.consecutive_prefill_batches >= self.max_consecutive_prefill_batches
         )
+        if (
+            prefill_decode_fairness_enabled
+            and self.require_mlp_sync
+            and not self.server_args.speculative_skip_dp_mlp_sync
+        ):
+            force_decode = self.dp_attn_adapter.coordinate_force_decode(force_decode)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
