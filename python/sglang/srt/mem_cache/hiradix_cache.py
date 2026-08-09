@@ -202,7 +202,9 @@ class HiRadixCache(RadixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = server_args.hicache_load_back_threshold
+        if self.load_back_threshold < 0:
+            raise ValueError("--hicache-load-back-threshold must be non-negative")
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)

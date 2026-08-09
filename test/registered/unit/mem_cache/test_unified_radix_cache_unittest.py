@@ -453,7 +453,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNot(match.last_device_node, cache.root_node)
         return match.last_device_node
 
-    def _init_hicache(self, cache, *, write_policy: str = "write_through"):
+    def _init_hicache(
+        self,
+        cache,
+        *,
+        write_policy: str = "write_through",
+        load_back_threshold: int = 0,
+    ):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
@@ -483,11 +489,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
+            hicache_load_back_threshold=load_back_threshold,
         )
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
 
     def _backup_node(self, cache, node):
         backed_up = cache.write_backup(node, write_back=True)
@@ -632,6 +638,21 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+
+    def test_hicache_load_back_threshold_skips_small_host_hit(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(cache, load_back_threshold=5)
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, seq)
+        node = self._leaf_for(cache, seq)
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(seq)))
+
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertIsNone(cache.load_back(node))
+        self.assertTrue(node.evicted)
 
 
 class UnifiedRadixCacheSuite:

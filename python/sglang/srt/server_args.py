@@ -2152,6 +2152,10 @@ class ServerArgs:
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
     ] = 0
+    hicache_load_back_threshold: A[
+        int,
+        "Minimum number of host KV cache tokens required before loading them back to the device.",
+    ] = 10
     hicache_write_policy: A[
         str,
         Arg(
