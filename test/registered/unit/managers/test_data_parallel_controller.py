@@ -476,6 +476,20 @@ class TestPrefixAffinityFallback(CustomTestCase):
         ctl.prefix_affinity_scheduler(_areq(input_ids=[]))
         ctl.workers[1].send_pyobj.assert_called_once()
 
+    def test_keyless_fallback_skips_inactive_rank(self):
+        """The fallback must not inherit total_tokens' inactive-rank behavior."""
+        ctl = _make_affinity_controller(
+            dp_size=4, fallback="total_tokens", disable_token_fallback=True
+        )
+        ctl.dp_budget.total_tokens = [5, 3, 0, 4]
+        ctl.dp_budget.total_requests = [0, 0, 0, 0]
+        ctl.status[2] = False
+
+        ctl.prefix_affinity_scheduler(_areq(input_ids=[1, 2, 3]))
+
+        ctl.workers[2].send_pyobj.assert_not_called()
+        ctl.workers[1].send_pyobj.assert_called_once()
+
     def test_external_routed_dp_rank_bypasses_affinity(self):
         ctl = _make_affinity_controller(dp_size=4)
         ctl.prefix_affinity_scheduler(

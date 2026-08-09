@@ -733,17 +733,25 @@ class DataParallelController:
         self._affinity_fallback_dispatch(req)
 
     def _affinity_fallback_dispatch(self, req: Req):
-        """Dispatch via the configured load-aware fallback method.
-
-        Reuses the existing schedulers so budget accounting and status handling
-        stay identical to those methods.
-        """
-        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
-            self.total_requests_scheduler(req)
-        elif self._affinity_fallback == LoadBalanceMethod.ROUND_ROBIN:
+        """Dispatch keyless traffic via the fallback over live ranks only."""
+        if self._affinity_fallback == LoadBalanceMethod.ROUND_ROBIN:
             self.round_robin_scheduler(req)
+            return
+
+        live = self._live_ranks()
+        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
+            rank = min(live, key=lambda i: self.dp_budget.total_requests[i])
+            self.dp_budget.total_requests[rank] += 1
         else:
-            self.total_tokens_scheduler(req)
+            rank = min(
+                live,
+                key=lambda i: (
+                    self.dp_budget.total_tokens[i],
+                    self.dp_budget.total_requests[i],
+                ),
+            )
+            self._increment_rank_budget(rank, req)
+        sock_send(self.workers[rank], req)
 
     def _live_ranks(self) -> List[int]:
         """Ranks currently marked active; fall back to all ranks if none are."""
