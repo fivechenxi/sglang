@@ -177,7 +177,9 @@ class HiMambaRadixCache(MambaRadixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = server_args.hicache_load_back_threshold
+        if self.load_back_threshold < 0:
+            raise ValueError("--hicache-load-back-threshold must be non-negative")
 
         self.evictable_full_device_leaves: set[TreeNode] = set()
         self.evictable_full_host_leaves: set[TreeNode] = set()

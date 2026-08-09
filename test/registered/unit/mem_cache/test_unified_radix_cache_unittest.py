@@ -2564,6 +2564,7 @@ class UnifiedRadixCacheSuite:
         cache,
         *,
         write_policy: str = "write_through",
+        load_back_threshold: int = 0,
         storage_backend: Optional[str] = None,
         storage_dir: Optional[str] = None,
         prefetch_threshold: Optional[int] = None,
@@ -2634,6 +2635,7 @@ class UnifiedRadixCacheSuite:
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
+            hicache_load_back_threshold=load_back_threshold,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
             hicache_storage_prefetch_policy=prefetch_policy,
@@ -2643,7 +2645,6 @@ class UnifiedRadixCacheSuite:
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
         if storage_backend is not None:
             # Unit fixtures size host/device pools equally, which makes the
             # production prefetch capacity limit (host - device) zero.  Keep the
@@ -2958,6 +2959,25 @@ class UnifiedRadixCacheSuite:
             for actual_conv, expected_conv_buf in zip(loaded_conv, expected_conv):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
+
+    def test_hicache_load_back_threshold_skips_hybrid_host_hit(self):
+        """The threshold skips the whole host path, including auxiliary state."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        base = self._make_seq(1, 2)
+        self._init_hicache(cache, load_back_threshold=len(base) + 1)
+        self._insert(cache, allocator, req_to_token_pool, base)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
+        node = match.last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(base)))
+
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertFalse(cache.load_back(node))
+        self.assertTrue(node.evicted)
 
     def test_hicache_backup_continuity(self):
         """Backed-up nodes form a continuous prefix from the root."""
