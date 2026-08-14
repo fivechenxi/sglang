@@ -12,6 +12,7 @@ from sglang.srt.configs.hybrid_arch import hybrid_gdn_config, mambaish_config
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_dsa_index_head_dim,
+    get_dsa_indexer_layer_ids,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -1006,6 +1007,15 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            indexer_layer_ids=(
+                get_dsa_indexer_layer_ids(
+                    self.model_config.hf_config,
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+                if is_dsa_model
+                else None
+            ),
         )
         return token_to_kv_pool
 

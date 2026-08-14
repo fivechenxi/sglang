@@ -300,6 +300,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        indexer_layer_ids: Optional[list[int]] = None,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -315,6 +316,26 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        if self.index_head_dim is None:
+            self.indexer_layer_ids = []
+        elif indexer_layer_ids is None:
+            self.indexer_layer_ids = list(range(self.start_layer, self.end_layer))
+        else:
+            self.indexer_layer_ids = list(indexer_layer_ids)
+        if len(set(self.indexer_layer_ids)) != len(self.indexer_layer_ids):
+            raise ValueError("indexer_layer_ids must be unique")
+        if any(
+            layer_id < self.start_layer or layer_id >= self.end_layer
+            for layer_id in self.indexer_layer_ids
+        ):
+            raise ValueError(
+                "indexer_layer_ids must be within the pool's layer range "
+                f"[{self.start_layer}, {self.end_layer})"
+            )
+        self.indexer_layer_id_to_slot = {
+            layer_id: slot for slot, layer_id in enumerate(self.indexer_layer_ids)
+        }
+        self.indexer_layer_num = len(self.indexer_layer_ids)
 
         self.custom_mem_pool = None
 
@@ -346,7 +367,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
                     (
-                        layer_num,
+                        self.indexer_layer_num,
                         self.size // self.page_size + 1,
                         self.page_size,
                         1,
@@ -383,9 +404,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []
-        data_ptrs = [self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)]
-        data_lens = [self.index_k_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)]
+        data_ptrs = [
+            self.index_k_buffer[i].data_ptr() for i in range(self.indexer_layer_num)
+        ]
+        data_lens = [
+            self.index_k_buffer[i].nbytes for i in range(self.indexer_layer_num)
+        ]
+        item_lens = [
+            self.index_k_buffer[i][0].nbytes for i in range(self.indexer_layer_num)
+        ]
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
@@ -408,9 +435,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        slot = self._get_indexer_slot(layer_id)
         if self.store_dtype != self.dtype:
-            return self.index_k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.index_k_buffer[layer_id - self.start_layer]
+            return self.index_k_buffer[slot].view(self.dtype)
+        return self.index_k_buffer[slot]
+
+    def _get_indexer_slot(self, layer_id: int) -> int:
+        try:
+            return self.indexer_layer_id_to_slot[layer_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"DSA layer {layer_id} does not own a physical indexer cache; "
+                f"owners={self.indexer_layer_ids}"
+            ) from exc
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -426,13 +463,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr() for i in range(self.layer_num)
+                self.index_k_buffer[i].data_ptr()
+                for i in range(self.indexer_layer_num)
             ]
             kv_data_lens += [
-                self.index_k_buffer[i].nbytes for i in range(self.layer_num)
+                self.index_k_buffer[i].nbytes for i in range(self.indexer_layer_num)
             ]
             kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
+                self.index_k_buffer[i][0].nbytes
+                for i in range(self.indexer_layer_num)
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -483,8 +522,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.store_dtype != self.dtype:
             index_k = index_k.view(self.store_dtype)
 
+        slot = self._get_indexer_slot(layer_id)
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[layer_id - self.start_layer].view(
+            self.index_k_buffer[slot].view(
                 -1, 1, self.index_head_dim
             ),
             loc.view(-1, 1),
@@ -515,9 +555,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         for local_layer_id in range(self.layer_num):
             k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
             v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
+            indexer_slot = self.indexer_layer_id_to_slot.get(
+                self.start_layer + local_layer_id
+            )
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
+                self.index_k_buffer[indexer_slot].view(-1, 1, self.index_head_dim)
+                if has_ik and indexer_slot is not None
                 else None
             )
             buf_of_layers.append([k_layer, v_layer, ik_layer])
@@ -533,9 +576,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         for local_layer_id in range(self.layer_num):
             k_layer = self.k_buffer[local_layer_id].view(-1, 1, self.kv_lora_rank)
             v_layer = self.v_buffer[local_layer_id].view(-1, 1, self.qk_rope_head_dim)
+            indexer_slot = self.indexer_layer_id_to_slot.get(
+                self.start_layer + local_layer_id
+            )
             ik_layer = (
-                self.index_k_buffer[local_layer_id].view(-1, 1, self.index_head_dim)
-                if has_ik
+                self.index_k_buffer[indexer_slot].view(-1, 1, self.index_head_dim)
+                if has_ik and indexer_slot is not None
                 else None
             )
             for i in range(0, len(indices), chunk_size):
@@ -545,7 +591,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 assert k_cpu.shape[0] == len(chunk_indices)
                 k_layer[chunk_indices] = k_cpu.to(k_layer.device, non_blocking=True)
                 v_layer[chunk_indices] = v_cpu.to(v_layer.device, non_blocking=True)
-                if has_ik:
+                if ik_layer is not None:
                     ik_cpu = chunk[2]
                     ik_layer[chunk_indices] = ik_cpu.to(
                         ik_layer.device, non_blocking=True
