@@ -174,10 +174,50 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
+    sfa_c8_enabled: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        self.sfa_c8_enabled = envs.SGLANG_NPU_ENABLE_SFA_C8.get()
+        if not self.sfa_c8_enabled:
+            return
+        if not (
+            _is_npu
+            and self.use_mla_backend
+            and is_deepseek_dsa(self.model_config.hf_config)
+        ):
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_SFA_C8 is only supported by NPU DSA MLA models"
+            )
+        if self.kv_cache_dtype != torch.bfloat16:
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_SFA_C8 requires BF16 source KV dtype; "
+                f"got {self.kv_cache_dtype}"
+            )
+
+        incompatible = []
+        if self.server_args.page_size != 128:
+            incompatible.append("page_size other than 128")
+        if envs.SGLANG_NPU_USE_MLAPO.get():
+            incompatible.append("SGLANG_NPU_USE_MLAPO")
+        if self.server_args.dcp_size > 1:
+            incompatible.append("decode context parallelism/DCP")
+        if self.server_args.enable_dsa_prefill_context_parallel:
+            incompatible.append("DSA prefill context parallelism")
+        if self.server_args.disaggregation_mode != "null":
+            incompatible.append("PD disaggregation")
+        if self.server_args.enable_hierarchical_cache:
+            incompatible.append("hierarchical cache")
+        if self.server_args.cpu_offload_gb > 0:
+            incompatible.append("CPU offload")
+        if not self.spec_algorithm.is_none():
+            incompatible.append("speculative decoding/MTP")
+        if incompatible:
+            raise ValueError(
+                "The first SFA C8 experiment does not support: "
+                + ", ".join(incompatible)
+            )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -1016,6 +1056,7 @@ class KVCacheConfigurator:
                 if is_dsa_model
                 else None
             ),
+            sfa_c8_enabled=self.sfa_c8_enabled,
         )
         return token_to_kv_pool
 

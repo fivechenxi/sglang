@@ -201,11 +201,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * effective_num_layers
-                * kv_size
-            )
+            if kvc.sfa_c8_enabled:
+                from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+                    get_sfa_c8_packed_head_dim,
+                )
+
+                cell_size = (
+                    get_sfa_c8_packed_head_dim(
+                        model_config.kv_lora_rank,
+                        model_config.qk_rope_head_dim,
+                    )
+                    * effective_num_layers
+                )
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * effective_num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
