@@ -34,6 +34,15 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
