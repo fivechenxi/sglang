@@ -1020,6 +1020,11 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def _should_defer_prefill(self) -> bool:
+        # DP-attention invariant: every rank calls this exactly once per
+        # globally synchronized scheduling round. The preceding round's MLP
+        # all-gather is the lockstep barrier, so ``remaining`` stays identical
+        # without a separate collective. Never clear or decrement this counter
+        # from rank-local idle/decode state.
         if self._prefill_decode_interval_remaining == 0:
             return False
 
@@ -1027,18 +1032,26 @@ class Scheduler(
             # The previous decode wave has drained. Do not carry a partially
             # consumed protection window into a future, unrelated decode wave.
             self._prefill_decode_interval_remaining = 0
+            self._record_prefill_decode_interval_event("early_clear")
             return False
 
         self._prefill_decode_interval_remaining -= 1
+        self._record_prefill_decode_interval_event("defer")
         return True
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0:
             return
 
+        # In DP-attention mode ``batch`` must be the post-all-gather batch: its
+        # phase flags are global, even if this rank is locally idle. Using a
+        # pre-gather/local batch here would break the lockstep invariant above.
         if batch is None:
+            had_remaining = self._prefill_decode_interval_remaining > 0
             self._prefill_decode_global_decode_active = False
             self._prefill_decode_interval_remaining = 0
+            if had_remaining:
+                self._record_prefill_decode_interval_event("early_clear")
             return
 
         # These scheduler-level flags are synchronized across DP-attention
@@ -1047,11 +1060,20 @@ class Scheduler(
         # which is decode work and must not re-arm the prefill cadence.
         self._prefill_decode_global_decode_active = batch.has_decode_work
         if not batch.has_decode_work:
+            had_remaining = self._prefill_decode_interval_remaining > 0
             self._prefill_decode_interval_remaining = 0
+            if had_remaining:
+                self._record_prefill_decode_interval_event("early_clear")
             return
 
         if batch.is_prefill_in_batch and batch.has_decode_work:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._record_prefill_decode_interval_event("arm")
+
+    def _record_prefill_decode_interval_event(self, event: str) -> None:
+        reporter = getattr(self, "metrics_reporter", None)
+        if reporter is not None:
+            reporter.record_prefill_decode_interval_event(event)
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]

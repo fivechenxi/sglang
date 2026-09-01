@@ -181,6 +181,10 @@ class SchedulerMetricsReporter:
             enable_metrics=self.enable_metrics
         )
 
+    def record_prefill_decode_interval_event(self, event: str) -> None:
+        if self.current_scheduler_metrics_enabled:
+            self.metrics_collector.record_prefill_decode_interval_event(event)
+
     def _install_device_timer_on_runners(self):
         if self.forward_pass_device_timer is None:
             return

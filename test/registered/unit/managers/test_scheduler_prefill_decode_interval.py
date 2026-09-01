@@ -31,6 +31,40 @@ def _make_batch(*, prefill: bool, decode_work: bool):
 
 
 class TestPrefillDecodeInterval(unittest.TestCase):
+    def test_cadence_events_are_observable(self):
+        events = []
+        scheduler = _make_scheduler(interval=2, require_mlp_sync=True)
+        scheduler.metrics_reporter = SimpleNamespace(
+            record_prefill_decode_interval_event=events.append
+        )
+
+        scheduler._arm_prefill_decode_interval(
+            _make_batch(prefill=True, decode_work=True)
+        )
+        self.assertTrue(scheduler._should_defer_prefill())
+        self.assertTrue(scheduler._should_defer_prefill())
+        self.assertEqual(events, ["arm", "defer", "defer"])
+
+    def test_dp_ranks_keep_remaining_in_lockstep(self):
+        ranks = [
+            _make_scheduler(interval=4, require_mlp_sync=True),
+            _make_scheduler(interval=4, require_mlp_sync=True),
+        ]
+
+        # The two ranks may have different local work, but _arm receives only
+        # the post-all-gather global phase flags on both ranks.
+        global_prefill_with_decode = _make_batch(prefill=True, decode_work=True)
+        for rank in ranks:
+            rank._arm_prefill_decode_interval(global_prefill_with_decode)
+
+        for remaining in [3, 2, 1, 0]:
+            decisions = [rank._should_defer_prefill() for rank in ranks]
+            self.assertEqual(decisions, [True, True])
+            self.assertEqual(
+                [rank._prefill_decode_interval_remaining for rank in ranks],
+                [remaining, remaining],
+            )
+
     def test_global_phase_sequence_is_one_prefill_then_decode_interval(self):
         """A globally observed P+D collision must protect the next D rounds."""
         scheduler = _make_scheduler(interval=4, require_mlp_sync=True)

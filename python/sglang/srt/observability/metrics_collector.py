@@ -302,6 +302,15 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.prefill_decode_interval_events_total = Counter(
+            name="sglang:prefill_decode_interval_events_total",
+            documentation=(
+                "Global prefill/decode cadence events. 'arm' starts a protection "
+                "window, 'defer' protects one decode round, and 'early_clear' "
+                "ends a window because global decode work drained."
+            ),
+            labelnames=list(labels.keys()) + ["event"],
+        )
 
         # =================================================================
         # Memory pool usage ratios
@@ -1128,6 +1137,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def record_prefill_decode_interval_event(self, event: str) -> None:
+        self.prefill_decode_interval_events_total.labels(
+            **self.labels, event=event
+        ).inc()
 
     def observe_kv_transfer_metrics(
         self,
