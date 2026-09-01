@@ -981,6 +981,7 @@ class Scheduler(
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
         self.prefill_decode_interval = self.server_args.prefill_decode_interval
         self._prefill_decode_interval_remaining = 0
+        self._prefill_decode_global_decode_active = False
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1019,25 +1020,29 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def _should_defer_prefill(self) -> bool:
-        if self._prefill_decode_interval_remaining == 0:
+        if (
+            self._prefill_decode_interval_remaining == 0
+            or not self._prefill_decode_global_decode_active
+        ):
             return False
 
         self._prefill_decode_interval_remaining -= 1
         return True
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
-        if self.prefill_decode_interval == 0 or batch is None:
+        if self.prefill_decode_interval == 0:
             return
 
-        # DP attention synchronizes this flag across ranks. This keeps every
-        # rank on the same prefill/decode cadence even when only one rank has
-        # local prefill work. Non-DP scheduling can use the local mode directly.
-        is_extend = (
-            batch.is_extend_in_batch
-            if self.require_mlp_sync
-            else batch.forward_mode.is_extend()
-        )
-        if is_extend:
+        if batch is None:
+            self._prefill_decode_global_decode_active = False
+            return
+
+        # These scheduler-level flags are synchronized across DP-attention
+        # ranks by prepare_mlp_sync_batch_raw. Do not use is_extend_in_batch:
+        # ForwardMode.is_extend() also includes speculative TARGET_VERIFY,
+        # which is decode work and must not re-arm the prefill cadence.
+        self._prefill_decode_global_decode_active = batch.has_decode_work
+        if batch.is_prefill_in_batch and batch.has_decode_work:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
     def init_metrics_reporter(
@@ -2729,6 +2734,12 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        # Phase flags describe only the next forward. A completed prefill
+        # batch may become the running decode batch, so never let its marker
+        # leak into a later decode round.
+        running_batch.is_prefill_in_batch = False
+        running_batch.has_decode_work = False
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill():
@@ -2738,7 +2749,18 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
+        local_decode_active = (
+            not running_batch.is_empty() and not running_batch.is_prefill_only
+        )
+        if new_batch is not None:
+            # Mark actual prompt-prefill scheduling before the DP all-gather.
+            # This intentionally excludes speculative verify forwards whose
+            # ForwardMode is also classified as extend for model execution.
+            new_batch.is_prefill_in_batch = True
+            new_batch.has_decode_work = local_decode_active
+
         need_mlp_sync = self.require_mlp_sync
+        prefill_metadata_synced = False
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
@@ -2748,8 +2770,13 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
+            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                new_batch,
+                local_is_prefill_in_batch=new_batch is not None,
+                local_has_decode_work=local_decode_active,
+            )
             need_mlp_sync = new_batch is None
+            prefill_metadata_synced = new_batch is not None
 
         if new_batch is not None:
             # Run prefill first if possible
@@ -2761,6 +2788,9 @@ class Scheduler(
                 ret = running_batch if not running_batch.is_empty() else None
             else:
                 ret = None
+
+        if ret is not None and not prefill_metadata_synced:
+            ret.has_decode_work = local_decode_active
 
         # Handle DP attention and log stats
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(

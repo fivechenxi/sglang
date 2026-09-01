@@ -1911,6 +1911,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Scheduler-level phase metadata. Unlike ``is_extend_in_batch``, this only
+    # marks real prompt-prefill work and does not classify speculative verify
+    # forwards as prefill.
+    is_prefill_in_batch: bool = False
+    # True when this DP rank still has decode work while choosing the current
+    # forward. DP-attention synchronization turns it into a global flag.
+    has_decode_work: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
@@ -3015,6 +3022,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_prefill_in_batch=self.is_prefill_in_batch,
+            has_decode_work=self.has_decode_work,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

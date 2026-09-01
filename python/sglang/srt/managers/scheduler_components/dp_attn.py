@@ -49,6 +49,8 @@ class MLPSyncBatchInfo:
     local_can_run_tbo: bool
     local_forward_mode: int
     can_run_breakable_cuda_graph: bool
+    is_prefill_in_batch: bool
+    has_decode_work: bool
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -68,6 +70,8 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_breakable_cuda_graph),
+                int(self.is_prefill_in_batch),
+                int(self.has_decode_work),
             ],
             device=device,
             dtype=dtype,
@@ -83,6 +87,8 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_breakable_cuda_graph
+                0,  # is_prefill_in_batch
+                0,  # has_decode_work
             ],
             device=device,
             dtype=dtype,
@@ -91,7 +97,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
+            (self.dp_size, self.tp_size * self.cp_size, 9),
             dtype=torch.int64,
             device=device,
         )
@@ -107,7 +113,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 9)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -119,6 +125,8 @@ class MLPSyncBatchInfo:
         self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+        self.is_prefill_in_batch = bool(tp0_info[:, 7].max().item())
+        self.has_decode_work = bool(tp0_info[:, 8].max().item())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
 
@@ -140,6 +148,8 @@ def _update_gather_batch(
         )
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.is_prefill_in_batch = mlp_sync_info.is_prefill_in_batch
+        batch.has_decode_work = mlp_sync_info.has_decode_work
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
@@ -149,7 +159,7 @@ def _update_gather_batch(
 
 
 def prepare_mlp_sync_batch_raw(
-    local_batch: ScheduleBatch,
+    local_batch: Optional[ScheduleBatch],
     dp_size: int,
     attn_tp_size: int,
     attn_cp_size: int,
@@ -159,6 +169,8 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    local_is_prefill_in_batch: Optional[bool] = None,
+    local_has_decode_work: Optional[bool] = None,
 ):
     # Check if other DP workers have running batches
     if (
@@ -202,6 +214,16 @@ def prepare_mlp_sync_batch_raw(
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    is_prefill_in_batch = (
+        bool(local_batch and local_batch.is_prefill_in_batch)
+        if local_is_prefill_in_batch is None
+        else local_is_prefill_in_batch
+    )
+    has_decode_work = (
+        bool(local_batch and local_batch.has_decode_work)
+        if local_has_decode_work is None
+        else local_has_decode_work
+    )
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
@@ -229,6 +251,8 @@ def prepare_mlp_sync_batch_raw(
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
         can_run_breakable_cuda_graph=can_run_breakable_cuda_graph,
+        is_prefill_in_batch=is_prefill_in_batch,
+        has_decode_work=has_decode_work,
     )
 
     if not skip_all_gather:
@@ -289,7 +313,13 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
 
-    def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
+    def prepare_mlp_sync_batch(
+        self,
+        local_batch: Optional[ScheduleBatch],
+        *,
+        local_is_prefill_in_batch: Optional[bool] = None,
+        local_has_decode_work: Optional[bool] = None,
+    ):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -301,12 +331,17 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            local_is_prefill_in_batch=local_is_prefill_in_batch,
+            local_has_decode_work=local_has_decode_work,
         )
 
     def maybe_prepare_mlp_sync_batch(
         self,
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
+        *,
+        local_is_prefill_in_batch: Optional[bool] = None,
+        local_has_decode_work: Optional[bool] = None,
     ) -> Optional[ScheduleBatch]:
         """
         Helper to prepare MLP sync batch for DP attention.
@@ -315,9 +350,18 @@ class SchedulerDPAttnAdapter:
         Args:
             batch: The batch to process
             need_sync: If specified, overrides self.get_require_mlp_sync() for prepare_mlp_sync_batch decision
+            local_is_prefill_in_batch: Scheduler-level prefill decision. This
+                remains available even when DP synchronization replaces a
+                missing local batch with an idle batch.
+            local_has_decode_work: Whether this rank has runnable decode work,
+                including work displaced by a remote DP rank's prefill.
         """
         if need_sync if need_sync is not None else self.get_require_mlp_sync():
-            batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.prepare_mlp_sync_batch(
+                batch,
+                local_is_prefill_in_batch=local_is_prefill_in_batch,
+                local_has_decode_work=local_has_decode_work,
+            )
         return batch
 
     def get_idle_batch(self) -> ScheduleBatch:

@@ -702,7 +702,7 @@ class ServerArgs:
     ] = None
     prefill_decode_interval: A[
         int,
-        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        "The number of decode rounds to run after a prompt-prefill batch before scheduling the next prefill while decode work remains. In data-parallel attention mode, prompt-prefill and decode-active state are synchronized across all DP ranks. Pure-prefill workloads are not throttled. Set to 0 to disable.",
     ] = 0
     enable_dynamic_chunking: A[
         bool,
