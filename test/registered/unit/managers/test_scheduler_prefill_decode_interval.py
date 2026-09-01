@@ -9,6 +9,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -30,6 +31,24 @@ def _make_batch(*, prefill: bool, decode_work: bool):
 
 
 class TestPrefillDecodeInterval(unittest.TestCase):
+    def test_dp_sync_payload_carries_prefill_and_decode_state(self):
+        info = MLPSyncBatchInfo(
+            dp_size=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=8,
+            num_tokens_for_logprob=1,
+            can_cuda_graph=False,
+            is_extend_in_batch=True,
+            local_can_run_tbo=False,
+            local_forward_mode=1,
+            can_run_breakable_cuda_graph=True,
+            is_prefill_in_batch=True,
+            has_decode_work=True,
+        )
+        self.assertEqual(info._get_local_tensor("cpu").tolist()[-2:], [1, 1])
+        self.assertEqual(info._get_fallback_tensor("cpu").tolist()[-2:], [0, 0])
+
     def test_disabled_interval_does_not_arm(self):
         scheduler = _make_scheduler(interval=0, require_mlp_sync=False)
         scheduler._arm_prefill_decode_interval(
@@ -88,7 +107,15 @@ class TestPrefillDecodeInterval(unittest.TestCase):
             _make_batch(prefill=False, decode_work=False)
         )
         self.assertFalse(scheduler._should_defer_prefill())
-        self.assertEqual(scheduler._prefill_decode_interval_remaining, 2)
+        self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)
+
+    def test_idle_batch_clears_stale_protection_window(self):
+        scheduler = _make_scheduler(interval=2, require_mlp_sync=True)
+        scheduler._prefill_decode_interval_remaining = 2
+        scheduler._prefill_decode_global_decode_active = True
+        scheduler._arm_prefill_decode_interval(None)
+        self.assertFalse(scheduler._prefill_decode_global_decode_active)
+        self.assertEqual(scheduler._prefill_decode_interval_remaining, 0)
 
 
 if __name__ == "__main__":

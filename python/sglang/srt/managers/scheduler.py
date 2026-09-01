@@ -1020,10 +1020,13 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def _should_defer_prefill(self) -> bool:
-        if (
-            self._prefill_decode_interval_remaining == 0
-            or not self._prefill_decode_global_decode_active
-        ):
+        if self._prefill_decode_interval_remaining == 0:
+            return False
+
+        if not self._prefill_decode_global_decode_active:
+            # The previous decode wave has drained. Do not carry a partially
+            # consumed protection window into a future, unrelated decode wave.
+            self._prefill_decode_interval_remaining = 0
             return False
 
         self._prefill_decode_interval_remaining -= 1
@@ -1035,6 +1038,7 @@ class Scheduler(
 
         if batch is None:
             self._prefill_decode_global_decode_active = False
+            self._prefill_decode_interval_remaining = 0
             return
 
         # These scheduler-level flags are synchronized across DP-attention
@@ -1042,6 +1046,10 @@ class Scheduler(
         # ForwardMode.is_extend() also includes speculative TARGET_VERIFY,
         # which is decode work and must not re-arm the prefill cadence.
         self._prefill_decode_global_decode_active = batch.has_decode_work
+        if not batch.has_decode_work:
+            self._prefill_decode_interval_remaining = 0
+            return
+
         if batch.is_prefill_in_batch and batch.has_decode_work:
             self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
@@ -2749,8 +2757,9 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
-        local_decode_active = (
-            not running_batch.is_empty() and not running_batch.is_prefill_only
+        local_decode_active = any(
+            not req.finished() and not req.is_prefill_only
+            for req in running_batch.reqs
         )
         if new_batch is not None:
             # Mark actual prompt-prefill scheduling before the DP all-gather.
