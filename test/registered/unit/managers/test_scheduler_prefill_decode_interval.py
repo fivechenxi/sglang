@@ -31,6 +31,29 @@ def _make_batch(*, prefill: bool, decode_work: bool):
 
 
 class TestPrefillDecodeInterval(unittest.TestCase):
+    def test_global_phase_sequence_is_one_prefill_then_decode_interval(self):
+        """A globally observed P+D collision must protect the next D rounds."""
+        scheduler = _make_scheduler(interval=4, require_mlp_sync=True)
+
+        phases = []
+        for _ in range(6):
+            if scheduler._should_defer_prefill():
+                phase = "decode"
+            else:
+                # Model the steady-state contention case: at least one DP rank
+                # has prompt-prefill work whenever the global gate is open.
+                phase = "prefill"
+
+            phases.append(phase)
+            scheduler._arm_prefill_decode_interval(
+                _make_batch(prefill=phase == "prefill", decode_work=True)
+            )
+
+        self.assertEqual(
+            phases,
+            ["prefill", "decode", "decode", "decode", "decode", "prefill"],
+        )
+
     def test_dp_sync_payload_carries_prefill_and_decode_state(self):
         info = MLPSyncBatchInfo(
             dp_size=2,

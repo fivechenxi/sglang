@@ -2758,8 +2758,7 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         local_decode_active = any(
-            not req.finished() and not req.is_prefill_only
-            for req in running_batch.reqs
+            not req.finished() and not req.is_prefill_only for req in running_batch.reqs
         )
         if new_batch is not None:
             # Mark actual prompt-prefill scheduling before the DP all-gather.
