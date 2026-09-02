@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
-    get_sfa_c8_packed_head_dim,
     get_sfa_c8_incompatibilities,
+    get_sfa_c8_packed_head_dim,
     pack_sfa_c8_kv,
     run_sfa_c8_attention,
 )

@@ -220,8 +220,7 @@ class KVCacheConfigurator:
                 self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
             ),
             prefill_graph_enabled=(
-                self.server_args.cuda_graph_config.prefill.backend
-                != Backend.DISABLED
+                self.server_args.cuda_graph_config.prefill.backend != Backend.DISABLED
             ),
         )
         if incompatible:

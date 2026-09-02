@@ -28,15 +28,11 @@ def run_graph_probe(
     """Capture and replay the exact C8 write + QSFA decode operator chain."""
     kv_lora_rank = 512
     rope_head_dim = 64
-    static_k_nope = torch.randn(
-        1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device
-    )
+    static_k_nope = torch.randn(1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device)
     static_k_rope = torch.randn(
         1, 1, rope_head_dim, dtype=torch.bfloat16, device=device
     )
-    static_q_nope = torch.randn(
-        1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device
-    )
+    static_q_nope = torch.randn(1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device)
     static_q_rope = torch.randn(
         1, 1, rope_head_dim, dtype=torch.bfloat16, device=device
     )

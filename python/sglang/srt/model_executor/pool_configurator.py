@@ -161,8 +161,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             kvc.model_config.kv_lora_rank,
                             kvc.model_config.qk_rope_head_dim,
                         ) + (
-                            get_dsa_index_head_dim(kvc.model_config.hf_config)
-                            * kv_size
+                            get_dsa_index_head_dim(kvc.model_config.hf_config) * kv_size
                         )
                     else:
                         draft_cell_size = (
