@@ -69,6 +69,7 @@ def _make_model_runner(
 
     mr.device = "cuda"
     mr.use_mla_backend = use_mla_backend
+    mr.sfa_c8_enabled = False
     mr.is_draft_worker = False
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
@@ -239,6 +240,31 @@ class TestDefaultConfigurator(unittest.TestCase):
 
         self.assertEqual(cfg._cell_size, 78 * (512 + 64) * 2 + 21 * 128 * 2)
 
+    def test_npu_dsa_sfa_c8_sizes_packed_main_and_bf16_indexer(self):
+        mr = _make_model_runner(num_layers=78, use_mla_backend=True)
+        mr.device = "npu"
+        mr.sfa_c8_enabled = True
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.index_head_dim = 128
+        mr.model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            num_hidden_layers=78,
+            index_topk=2048,
+            index_head_dim=128,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        )
+
+        with mock_cpu_env(kv_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 78 * 656 + 21 * 128 * 2)
+
     def test_npu_dsa_mtp_keeps_one_full_draft_indexer_cache(self):
         mr = _make_model_runner(num_layers=78, use_mla_backend=True)
         mr.device = "npu"
@@ -266,6 +292,36 @@ class TestDefaultConfigurator(unittest.TestCase):
 
         target = 78 * (512 + 64) * 2 + 21 * 128 * 2
         draft = (512 + 64 + 128) * 2
+        self.assertEqual(cfg._cell_size, target + draft)
+
+    def test_npu_dsa_sfa_c8_mtp_sizes_packed_draft_and_bf16_indexer(self):
+        mr = _make_model_runner(num_layers=78, use_mla_backend=True)
+        mr.device = "npu"
+        mr.sfa_c8_enabled = True
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.model_config.index_head_dim = 128
+        mr.model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            num_hidden_layers=78,
+            index_topk=2048,
+            index_head_dim=128,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+
+        with mock_cpu_env(kv_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        target = 78 * 656 + 21 * 128 * 2
+        draft = 656 + 128 * 2
         self.assertEqual(cfg._cell_size, target + draft)
 
 

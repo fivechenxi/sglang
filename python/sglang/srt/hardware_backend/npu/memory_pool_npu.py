@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+
+logger = logging.getLogger(__name__)
 
 
 def _init_npu_conv_state(
@@ -301,6 +304,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         indexer_layer_ids: Optional[list[int]] = None,
+        sfa_c8_enabled: bool = False,
     ):
         super(MLATokenToKVPool, self).__init__(
             size=size,
@@ -336,33 +340,60 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             layer_id: slot for slot, layer_id in enumerate(self.indexer_layer_ids)
         }
         self.indexer_layer_num = len(self.indexer_layer_ids)
+        self.sfa_c8_enabled = sfa_c8_enabled
+        if self.sfa_c8_enabled:
+            from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+                get_sfa_c8_packed_head_dim,
+            )
+
+            self.sfa_c8_packed_head_dim = get_sfa_c8_packed_head_dim(
+                self.kv_lora_rank, self.qk_rope_head_dim
+            )
+        else:
+            self.sfa_c8_packed_head_dim = None
 
         self.custom_mem_pool = None
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
+            if self.sfa_c8_enabled:
+                self.packed_kv_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.sfa_c8_packed_head_dim,
+                    ),
+                    dtype=torch.int8,
+                    device=self.device,
+                )
+                self.k_buffer = None
+                self.v_buffer = None
+            else:
+                self.packed_kv_buffer = None
+                self.k_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.kv_lora_rank,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.v_buffer = torch.zeros(
+                    (
+                        layer_num,
+                        self.size // self.page_size + 1,
+                        self.page_size,
+                        1,
+                        self.qk_rope_head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 self.index_k_buffer = torch.zeros(
@@ -378,15 +409,27 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
 
         self._finalize_allocation_log(size)
+        if self.sfa_c8_enabled:
+            logger.info(
+                "NPU SFA C8 cache layout: main_dtype=%s, packed_head_dim=%d "
+                "bytes, main_layers=%d, indexer_dtype=%s, indexer_layers=%d",
+                self.packed_kv_buffer.dtype,
+                self.sfa_c8_packed_head_dim,
+                self.layer_num,
+                self.index_k_buffer.dtype if self.index_k_buffer is not None else None,
+                self.indexer_layer_num,
+            )
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
         kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
+        if self.sfa_c8_enabled:
+            for packed_cache in self.packed_kv_buffer:
+                kv_size_bytes += get_tensor_size_bytes(packed_cache)
+        else:
+            for k_cache in self.k_buffer:
+                kv_size_bytes += get_tensor_size_bytes(k_cache)
+            for v_cache in self.v_buffer:
+                kv_size_bytes += get_tensor_size_bytes(v_cache)
         if self.index_head_dim is not None:
             assert hasattr(self, "index_k_buffer")
             for index_k_cache in self.index_k_buffer:
@@ -394,12 +437,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
     def get_kv_buffer(self, layer_id: int):
+        if self.sfa_c8_enabled:
+            raise RuntimeError(
+                "SFA C8 uses get_sfa_packed_kv_buffer(), not the BF16 K/V API"
+            )
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return (
             self.k_buffer[layer_id - self.start_layer],
             self.v_buffer[layer_id - self.start_layer],
         )
+
+    def get_sfa_packed_kv_buffer(self, layer_id: int):
+        if not self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 packed KV cache is not enabled")
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.packed_kv_buffer[layer_id - self.start_layer]
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
@@ -416,6 +470,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_key_buffer(self, layer_id: int):
+        if self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 has no standalone key buffer")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
@@ -424,6 +480,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.k_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
+        if self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 has no standalone value buffer")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
@@ -451,6 +509,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        if self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 PD/contiguous transfer is not supported yet")
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
@@ -463,15 +523,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr()
-                for i in range(self.indexer_layer_num)
+                self.index_k_buffer[i].data_ptr() for i in range(self.indexer_layer_num)
             ]
             kv_data_lens += [
                 self.index_k_buffer[i].nbytes for i in range(self.indexer_layer_num)
             ]
             kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes
-                for i in range(self.indexer_layer_num)
+                self.index_k_buffer[i][0].nbytes for i in range(self.indexer_layer_num)
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -482,6 +540,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        if self.sfa_c8_enabled:
+            raise RuntimeError(
+                "SFA C8 uses set_sfa_packed_kv_buffer(), not the BF16 K/V API"
+            )
         loc, _, _ = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
@@ -510,6 +572,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
+    def set_sfa_packed_kv_buffer(
+        self,
+        layer_id: int,
+        slot_mapping_sfa,
+        packed_kv: torch.Tensor,
+    ):
+        if not self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 packed KV cache is not enabled")
+        if packed_kv.dtype != torch.int8:
+            raise TypeError(f"SFA C8 packed KV must be int8, got {packed_kv.dtype}")
+        if packed_kv.shape[-1] != self.sfa_c8_packed_head_dim:
+            raise ValueError(
+                "SFA C8 packed KV has invalid head dim: "
+                f"expected {self.sfa_c8_packed_head_dim}, got {packed_kv.shape[-1]}"
+            )
+        # Keep the SFA mapping explicit. In a future DCP path this must be the
+        # DCP-sharded physical mapping, not the replicated LI/indexer mapping.
+        loc, _, _ = unwrap_write_loc(slot_mapping_sfa)
+        torch_npu.npu_scatter_nd_update_(
+            self.packed_kv_buffer[layer_id - self.start_layer].view(
+                -1, 1, self.sfa_c8_packed_head_dim
+            ),
+            loc.view(-1, 1),
+            packed_kv.view(-1, 1, self.sfa_c8_packed_head_dim),
+        )
+
     def set_index_k_buffer(
         self,
         layer_id: int,
@@ -524,9 +612,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         slot = self._get_indexer_slot(layer_id)
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[slot].view(
-                -1, 1, self.index_head_dim
-            ),
+            self.index_k_buffer[slot].view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
@@ -549,6 +635,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return out
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        if self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 CPU offload/HiCache is not supported yet")
         torch.npu.synchronize()
         buf_of_layers = []
         has_ik = self.index_head_dim is not None
@@ -570,6 +658,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        if self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 CPU offload/HiCache is not supported yet")
         torch.npu.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         has_ik = self.index_head_dim is not None

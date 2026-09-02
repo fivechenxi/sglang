@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -174,10 +175,67 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
+    sfa_c8_enabled: bool = field(init=False)
+    li_c8_enabled: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        self.sfa_c8_enabled = envs.SGLANG_NPU_ENABLE_SFA_C8.get()
+        self.li_c8_enabled = envs.SGLANG_NPU_ENABLE_LI_C8.get()
+        if not (self.sfa_c8_enabled or self.li_c8_enabled):
+            return
+        if not (
+            _is_npu
+            and self.use_mla_backend
+            and is_deepseek_dsa(self.model_config.hf_config)
+        ):
+            raise ValueError("NPU SFA/LI C8 is only supported by NPU DSA MLA models")
+        if self.li_c8_enabled:
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_LI_C8 is reserved for the phase-2 "
+                "LightningIndexer C8 implementation; enable SFA C8 alone for "
+                "the standalone phase-1 experiment"
+            )
+        if self.kv_cache_dtype != torch.bfloat16:
+            raise ValueError(
+                "SGLANG_NPU_ENABLE_SFA_C8 requires BF16 source KV dtype; "
+                f"got {self.kv_cache_dtype}"
+            )
+
+        from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+            get_sfa_c8_incompatibilities,
+        )
+
+        incompatible = get_sfa_c8_incompatibilities(
+            page_size=self.page_size,
+            mlapo_enabled=envs.SGLANG_NPU_USE_MLAPO.get(),
+            dcp_size=self.server_args.dcp_size,
+            prefill_cp_enabled=self.server_args.enable_dsa_prefill_context_parallel,
+            disaggregation_mode=self.server_args.disaggregation_mode,
+            hierarchical_cache_enabled=self.server_args.enable_hierarchical_cache,
+            cpu_offload_gb=self.server_args.cpu_offload_gb,
+            speculative_algorithm=self.spec_algorithm.name,
+            decode_graph_enabled=(
+                self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+            ),
+            prefill_graph_enabled=(
+                self.server_args.cuda_graph_config.prefill.backend != Backend.DISABLED
+            ),
+        )
+        if incompatible:
+            raise ValueError(
+                "The current SFA C8 implementation does not support: "
+                + ", ".join(incompatible)
+            )
+        logger.info(
+            "NPU SFA C8 enabled: role=%s, speculative_algorithm=%s, "
+            "decode_graph=%s, prefill_graph=%s",
+            "draft" if self.is_draft_worker else "target",
+            self.spec_algorithm.name,
+            self.server_args.cuda_graph_config.decode.backend,
+            self.server_args.cuda_graph_config.prefill.backend,
+        )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -1016,6 +1074,7 @@ class KVCacheConfigurator:
                 if is_dsa_model
                 else None
             ),
+            sfa_c8_enabled=self.sfa_c8_enabled,
         )
         return token_to_kv_pool
 

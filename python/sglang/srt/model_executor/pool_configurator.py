@@ -147,23 +147,32 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if kvc.device == "npu" and is_deepseek_dsa(
-                    kvc.model_config.hf_config
-                ):
+                if kvc.device == "npu" and is_deepseek_dsa(kvc.model_config.hf_config):
                     # Each MTP layer computes its own Indexer.  After target
                     # index caches are compacted, scaling the target average
                     # would undercount this one physical draft index cache.
                     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
-                    draft_cell_size = (
-                        kvc.model_config.kv_lora_rank
-                        + kvc.model_config.qk_rope_head_dim
-                        + get_dsa_index_head_dim(kvc.model_config.hf_config)
-                    ) * kv_size
+                    if kvc.sfa_c8_enabled:
+                        from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+                            get_sfa_c8_packed_head_dim,
+                        )
+
+                        draft_cell_size = get_sfa_c8_packed_head_dim(
+                            kvc.model_config.kv_lora_rank,
+                            kvc.model_config.qk_rope_head_dim,
+                        ) + (
+                            get_dsa_index_head_dim(kvc.model_config.hf_config) * kv_size
+                        )
+                    else:
+                        draft_cell_size = (
+                            kvc.model_config.kv_lora_rank
+                            + kvc.model_config.qk_rope_head_dim
+                            + get_dsa_index_head_dim(kvc.model_config.hf_config)
+                        ) * kv_size
                     self._cell_size += draft_cell_size * draft_num_layers
                 else:
                     self._cell_size = int(
-                        self._cell_size
-                        * (1 + draft_num_layers / int(num_layers))
+                        self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -201,11 +210,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         if kvc.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * effective_num_layers
-                * kv_size
-            )
+            if kvc.sfa_c8_enabled:
+                from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+                    get_sfa_c8_packed_head_dim,
+                )
+
+                cell_size = (
+                    get_sfa_c8_packed_head_dim(
+                        model_config.kv_lora_rank,
+                        model_config.qk_rope_head_dim,
+                    )
+                    * effective_num_layers
+                )
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                    * effective_num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -242,9 +264,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         DSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
                     cell_size += (
-                        indexer_size_per_token
-                        * effective_num_layers
-                        * element_size
+                        indexer_size_per_token * effective_num_layers * element_size
                     )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
