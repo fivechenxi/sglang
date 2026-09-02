@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+
+logger = logging.getLogger(__name__)
 
 
 def _init_npu_conv_state(
@@ -406,6 +409,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 )
 
         self._finalize_allocation_log(size)
+        if self.sfa_c8_enabled:
+            logger.info(
+                "NPU SFA C8 cache layout: main_dtype=%s, packed_head_dim=%d "
+                "bytes, main_layers=%d, indexer_dtype=%s, indexer_layers=%d",
+                self.packed_kv_buffer.dtype,
+                self.sfa_c8_packed_head_dim,
+                self.layer_num,
+                self.index_k_buffer.dtype if self.index_k_buffer is not None else None,
+                self.indexer_layer_num,
+            )
 
     def get_kv_size_bytes(self):
         kv_size_bytes = 0
@@ -510,15 +523,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
         if self.index_head_dim is not None:
             kv_data_ptrs += [
-                self.index_k_buffer[i].data_ptr()
-                for i in range(self.indexer_layer_num)
+                self.index_k_buffer[i].data_ptr() for i in range(self.indexer_layer_num)
             ]
             kv_data_lens += [
                 self.index_k_buffer[i].nbytes for i in range(self.indexer_layer_num)
             ]
             kv_item_lens += [
-                self.index_k_buffer[i][0].nbytes
-                for i in range(self.indexer_layer_num)
+                self.index_k_buffer[i][0].nbytes for i in range(self.indexer_layer_num)
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
@@ -601,9 +612,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         slot = self._get_indexer_slot(layer_id)
         torch_npu.npu_scatter_nd_update_(
-            self.index_k_buffer[slot].view(
-                -1, 1, self.index_head_dim
-            ),
+            self.index_k_buffer[slot].view(-1, 1, self.index_head_dim),
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )

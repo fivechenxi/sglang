@@ -58,6 +58,8 @@ class TestNPUMLACompactIndexerPool(unittest.TestCase):
         self.assertEqual((1, 5, 1, 1, 32), pool.index_k_buffer.shape)
         with self.assertRaisesRegex(RuntimeError, "packed"):
             pool.get_kv_buffer(0)
+        with self.assertRaisesRegex(RuntimeError, "packed"):
+            pool.get_kv_buffer_shape()
 
 
 if __name__ == "__main__":

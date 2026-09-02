@@ -1078,9 +1078,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
         q_nope, q_pe = q, q_rope
         if sfa_c8_enabled:
-            packed_kv = self.token_to_kv_pool.get_sfa_packed_kv_buffer(
-                layer.layer_id
-            )
+            packed_kv = self.token_to_kv_pool.get_sfa_packed_kv_buffer(layer.layer_id)
         else:
             k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 

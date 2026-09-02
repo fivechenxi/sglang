@@ -4,7 +4,6 @@ import torch
 
 from sglang.srt.environ import envs
 
-
 SFA_C8_TILE_SIZE = 128
 SFA_C8_QUANT_MODE = 2
 SFA_C8_SCALE_REPO_MODE = 1
@@ -12,6 +11,41 @@ SFA_C8_SCALE_REPO_MODE = 1
 
 def is_sfa_c8_enabled() -> bool:
     return envs.SGLANG_NPU_ENABLE_SFA_C8.get()
+
+
+def get_sfa_c8_phase1_incompatibilities(
+    *,
+    page_size: int,
+    mlapo_enabled: bool,
+    dcp_size: int,
+    prefill_cp_enabled: bool,
+    disaggregation_mode: str,
+    hierarchical_cache_enabled: bool,
+    cpu_offload_gb: float,
+    speculative_decoding_enabled: bool,
+    graph_enabled: bool,
+) -> list[str]:
+    """Return features intentionally excluded from the eager standalone phase."""
+    incompatible = []
+    if page_size != 128:
+        incompatible.append("page_size other than 128")
+    if mlapo_enabled:
+        incompatible.append("SGLANG_NPU_USE_MLAPO")
+    if dcp_size > 1:
+        incompatible.append("decode context parallelism/DCP")
+    if prefill_cp_enabled:
+        incompatible.append("DSA prefill context parallelism")
+    if disaggregation_mode != "null":
+        incompatible.append("PD disaggregation")
+    if hierarchical_cache_enabled:
+        incompatible.append("hierarchical cache")
+    if cpu_offload_gb > 0:
+        incompatible.append("CPU offload")
+    if speculative_decoding_enabled:
+        incompatible.append("speculative decoding/MTP")
+    if graph_enabled:
+        incompatible.append("graph capture/replay (pass --disable-cuda-graph)")
+    return incompatible
 
 
 def get_sfa_c8_packed_head_dim(
@@ -41,9 +75,7 @@ def pack_sfa_c8_kv(
     import torch_npu
 
     if k_nope.shape[-1] != kv_lora_rank:
-        raise ValueError(
-            f"expected K-nope dim {kv_lora_rank}, got {k_nope.shape[-1]}"
-        )
+        raise ValueError(f"expected K-nope dim {kv_lora_rank}, got {k_nope.shape[-1]}")
     if k_rope.shape[-1] != qk_rope_head_dim:
         raise ValueError(
             f"expected K-RoPE dim {qk_rope_head_dim}, got {k_rope.shape[-1]}"
@@ -71,15 +103,10 @@ def pack_sfa_c8_kv(
     quantized = quantized.view(*prefix_shape, kv_lora_rank)
     rope_bytes = k_rope.contiguous().view(torch.int8)
     scale_bytes = (
-        scales.to(torch.float32)
-        .view(*prefix_shape, -1)
-        .contiguous()
-        .view(torch.int8)
+        scales.to(torch.float32).view(*prefix_shape, -1).contiguous().view(torch.int8)
     )
     packed = torch.cat([quantized, rope_bytes, scale_bytes], dim=-1)
-    expected_dim = get_sfa_c8_packed_head_dim(
-        kv_lora_rank, qk_rope_head_dim, tile_size
-    )
+    expected_dim = get_sfa_c8_packed_head_dim(kv_lora_rank, qk_rope_head_dim, tile_size)
     if packed.shape[-1] != expected_dim:
         raise RuntimeError(
             f"invalid SFA C8 packed dim: expected {expected_dim}, got {packed.shape[-1]}"

@@ -8,6 +8,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
     get_sfa_c8_packed_head_dim,
+    get_sfa_c8_phase1_incompatibilities,
     pack_sfa_c8_kv,
     run_sfa_c8_attention,
 )
@@ -17,6 +18,51 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestNPUSFAC8(unittest.TestCase):
+    def test_phase1_requires_eager_standalone_configuration(self):
+        common = dict(
+            page_size=128,
+            mlapo_enabled=False,
+            dcp_size=1,
+            prefill_cp_enabled=False,
+            disaggregation_mode="null",
+            hierarchical_cache_enabled=False,
+            cpu_offload_gb=0,
+            speculative_decoding_enabled=False,
+            graph_enabled=False,
+        )
+        self.assertEqual([], get_sfa_c8_phase1_incompatibilities(**common))
+
+        common["graph_enabled"] = True
+        self.assertEqual(
+            ["graph capture/replay (pass --disable-cuda-graph)"],
+            get_sfa_c8_phase1_incompatibilities(**common),
+        )
+
+        self.assertEqual(
+            [
+                "page_size other than 128",
+                "SGLANG_NPU_USE_MLAPO",
+                "decode context parallelism/DCP",
+                "DSA prefill context parallelism",
+                "PD disaggregation",
+                "hierarchical cache",
+                "CPU offload",
+                "speculative decoding/MTP",
+                "graph capture/replay (pass --disable-cuda-graph)",
+            ],
+            get_sfa_c8_phase1_incompatibilities(
+                page_size=64,
+                mlapo_enabled=True,
+                dcp_size=2,
+                prefill_cp_enabled=True,
+                disaggregation_mode="decode",
+                hierarchical_cache_enabled=True,
+                cpu_offload_gb=1,
+                speculative_decoding_enabled=True,
+                graph_enabled=True,
+            ),
+        )
+
     def test_sfa_and_indexer_c8_switches_are_independent(self):
         with patch.dict(
             "os.environ",
@@ -67,9 +113,7 @@ class TestNPUSFAC8(unittest.TestCase):
     def test_native_qsfa_uses_packed_cache_and_required_modes(self):
         expected = torch.randn(2, 4, 512, dtype=torch.bfloat16)
         qsfa = Mock(return_value=expected)
-        fake_torch_npu = SimpleNamespace(
-            npu_kv_quant_sparse_flash_attention=qsfa
-        )
+        fake_torch_npu = SimpleNamespace(npu_kv_quant_sparse_flash_attention=qsfa)
         q_nope = torch.randn(2, 4, 512, dtype=torch.bfloat16)
         q_rope = torch.randn(2, 4, 64, dtype=torch.bfloat16)
         packed = torch.empty(4, 128, 1, 656, dtype=torch.int8)

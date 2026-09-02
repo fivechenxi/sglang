@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -189,9 +190,7 @@ class KVCacheConfigurator:
             and self.use_mla_backend
             and is_deepseek_dsa(self.model_config.hf_config)
         ):
-            raise ValueError(
-                "NPU SFA/LI C8 is only supported by NPU DSA MLA models"
-            )
+            raise ValueError("NPU SFA/LI C8 is only supported by NPU DSA MLA models")
         if self.li_c8_enabled:
             raise ValueError(
                 "SGLANG_NPU_ENABLE_LI_C8 is reserved for the phase-2 "
@@ -204,23 +203,25 @@ class KVCacheConfigurator:
                 f"got {self.kv_cache_dtype}"
             )
 
-        incompatible = []
-        if self.server_args.page_size != 128:
-            incompatible.append("page_size other than 128")
-        if envs.SGLANG_NPU_USE_MLAPO.get():
-            incompatible.append("SGLANG_NPU_USE_MLAPO")
-        if self.server_args.dcp_size > 1:
-            incompatible.append("decode context parallelism/DCP")
-        if self.server_args.enable_dsa_prefill_context_parallel:
-            incompatible.append("DSA prefill context parallelism")
-        if self.server_args.disaggregation_mode != "null":
-            incompatible.append("PD disaggregation")
-        if self.server_args.enable_hierarchical_cache:
-            incompatible.append("hierarchical cache")
-        if self.server_args.cpu_offload_gb > 0:
-            incompatible.append("CPU offload")
-        if not self.spec_algorithm.is_none():
-            incompatible.append("speculative decoding/MTP")
+        from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+            get_sfa_c8_phase1_incompatibilities,
+        )
+
+        incompatible = get_sfa_c8_phase1_incompatibilities(
+            page_size=self.page_size,
+            mlapo_enabled=envs.SGLANG_NPU_USE_MLAPO.get(),
+            dcp_size=self.server_args.dcp_size,
+            prefill_cp_enabled=self.server_args.enable_dsa_prefill_context_parallel,
+            disaggregation_mode=self.server_args.disaggregation_mode,
+            hierarchical_cache_enabled=self.server_args.enable_hierarchical_cache,
+            cpu_offload_gb=self.server_args.cpu_offload_gb,
+            speculative_decoding_enabled=not self.spec_algorithm.is_none(),
+            graph_enabled=(
+                self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
+                or self.server_args.cuda_graph_config.prefill.backend
+                != Backend.DISABLED
+            ),
+        )
         if incompatible:
             raise ValueError(
                 "The first SFA C8 experiment does not support: "

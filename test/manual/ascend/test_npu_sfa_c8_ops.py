@@ -52,12 +52,10 @@ def main() -> None:
         row_block_size=1,
         col_block_size=tile_size,
     )
-    restored = quantized.float() * scales.float().repeat_interleave(
-        tile_size, dim=-1
-    )
+    restored = quantized.float() * scales.float().repeat_interleave(tile_size, dim=-1)
     quant_max_abs_error = (
-        restored.view_as(k_nope).float() - k_nope.float()
-    ).abs().max().item()
+        (restored.view_as(k_nope).float() - k_nope.float()).abs().max().item()
+    )
     max_scale = scales.float().max().item()
     if quantized.dtype != torch.int8 or scales.dtype != torch.float32:
         raise AssertionError(
@@ -87,9 +85,7 @@ def main() -> None:
     q_nope = torch.randn(1, 1, 512, dtype=torch.bfloat16, device=device)
     q_rope = torch.randn(1, 1, 64, dtype=torch.bfloat16, device=device)
     topk = torch.arange(seq_len, dtype=torch.int32, device=device).view(1, 1, -1)
-    block_table = torch.arange(block_num, dtype=torch.int32, device=device).view(
-        1, -1
-    )
+    block_table = torch.arange(block_num, dtype=torch.int32, device=device).view(1, -1)
     q_lens = torch.tensor([1], dtype=torch.int32, device=device)
     kv_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
     scale_value = 512**-0.5

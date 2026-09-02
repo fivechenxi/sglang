@@ -147,9 +147,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(num_layers) > 0
             ):
                 draft_num_layers = int(eagle_draft_num_layers)
-                if kvc.device == "npu" and is_deepseek_dsa(
-                    kvc.model_config.hf_config
-                ):
+                if kvc.device == "npu" and is_deepseek_dsa(kvc.model_config.hf_config):
                     # Each MTP layer computes its own Indexer.  After target
                     # index caches are compacted, scaling the target average
                     # would undercount this one physical draft index cache.
@@ -162,8 +160,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     self._cell_size += draft_cell_size * draft_num_layers
                 else:
                     self._cell_size = int(
-                        self._cell_size
-                        * (1 + draft_num_layers / int(num_layers))
+                        self._cell_size * (1 + draft_num_layers / int(num_layers))
                     )
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
@@ -255,9 +252,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         DSATokenToKVPool.index_k_with_scale_buffer_dtype
                     )
                     cell_size += (
-                        indexer_size_per_token
-                        * effective_num_layers
-                        * element_size
+                        indexer_size_per_token * effective_num_layers * element_size
                     )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
