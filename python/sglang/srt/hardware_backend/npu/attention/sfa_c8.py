@@ -13,7 +13,7 @@ def is_sfa_c8_enabled() -> bool:
     return envs.SGLANG_NPU_ENABLE_SFA_C8.get()
 
 
-def get_sfa_c8_phase1_incompatibilities(
+def get_sfa_c8_incompatibilities(
     *,
     page_size: int,
     mlapo_enabled: bool,
@@ -22,10 +22,19 @@ def get_sfa_c8_phase1_incompatibilities(
     disaggregation_mode: str,
     hierarchical_cache_enabled: bool,
     cpu_offload_gb: float,
-    speculative_decoding_enabled: bool,
-    graph_enabled: bool,
+    speculative_algorithm: str,
+    decode_graph_enabled: bool,
+    prefill_graph_enabled: bool,
 ) -> list[str]:
-    """Return features intentionally excluded from the eager standalone phase."""
+    """Return features excluded from the standalone/MTP decode-graph phase.
+
+    The production GLM/NEXTN path resolves NEXTN to EAGLE before this check.
+    Its target verify, draft decode, and draft extend forwards are decode-graph
+    workloads and use the same packed SFA cache API as eager execution.  General
+    prefill graph capture remains excluded until it has its own A2 validation.
+    """
+    # decode_graph_enabled is deliberately accepted: the parameter documents
+    # and test-protects the target-verify/draft-decode/draft-extend graph surface.
     incompatible = []
     if page_size != 128:
         incompatible.append("page_size other than 128")
@@ -41,10 +50,13 @@ def get_sfa_c8_phase1_incompatibilities(
         incompatible.append("hierarchical cache")
     if cpu_offload_gb > 0:
         incompatible.append("CPU offload")
-    if speculative_decoding_enabled:
-        incompatible.append("speculative decoding/MTP")
-    if graph_enabled:
-        incompatible.append("graph capture/replay (pass --disable-cuda-graph)")
+    if speculative_algorithm not in ("NONE", "EAGLE"):
+        incompatible.append(
+            f"speculative algorithm {speculative_algorithm} "
+            "(only NEXTN/EAGLE is supported)"
+        )
+    if prefill_graph_enabled:
+        incompatible.append("prefill graph capture/replay")
     return incompatible
 
 

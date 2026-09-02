@@ -204,10 +204,10 @@ class KVCacheConfigurator:
             )
 
         from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
-            get_sfa_c8_phase1_incompatibilities,
+            get_sfa_c8_incompatibilities,
         )
 
-        incompatible = get_sfa_c8_phase1_incompatibilities(
+        incompatible = get_sfa_c8_incompatibilities(
             page_size=self.page_size,
             mlapo_enabled=envs.SGLANG_NPU_USE_MLAPO.get(),
             dcp_size=self.server_args.dcp_size,
@@ -215,18 +215,28 @@ class KVCacheConfigurator:
             disaggregation_mode=self.server_args.disaggregation_mode,
             hierarchical_cache_enabled=self.server_args.enable_hierarchical_cache,
             cpu_offload_gb=self.server_args.cpu_offload_gb,
-            speculative_decoding_enabled=not self.spec_algorithm.is_none(),
-            graph_enabled=(
+            speculative_algorithm=self.spec_algorithm.name,
+            decode_graph_enabled=(
                 self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
-                or self.server_args.cuda_graph_config.prefill.backend
+            ),
+            prefill_graph_enabled=(
+                self.server_args.cuda_graph_config.prefill.backend
                 != Backend.DISABLED
             ),
         )
         if incompatible:
             raise ValueError(
-                "The first SFA C8 experiment does not support: "
+                "The current SFA C8 implementation does not support: "
                 + ", ".join(incompatible)
             )
+        logger.info(
+            "NPU SFA C8 enabled: role=%s, speculative_algorithm=%s, "
+            "decode_graph=%s, prefill_graph=%s",
+            "draft" if self.is_draft_worker else "target",
+            self.spec_algorithm.name,
+            self.server_args.cuda_graph_config.decode.backend,
+            self.server_args.cuda_graph_config.prefill.backend,
+        )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""

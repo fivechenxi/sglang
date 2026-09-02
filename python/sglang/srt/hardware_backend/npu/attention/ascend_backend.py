@@ -1053,6 +1053,11 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
+        # NEXTN target verify and draft extend intentionally stay on the
+        # decode-style sparse path.  During NPU graph capture the tensors below
+        # are static graph buffers; pack -> scatter -> QSFA is captured as one
+        # replayable operator chain, while ordinary prompt prefill remains eager.
+
         sfa_c8_enabled = getattr(self.token_to_kv_pool, "sfa_c8_enabled", False)
 
         if save_kv_cache:

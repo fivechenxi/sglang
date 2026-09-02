@@ -152,11 +152,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # index caches are compacted, scaling the target average
                     # would undercount this one physical draft index cache.
                     kv_size = torch._utils._element_size(kvc.kv_cache_dtype)
-                    draft_cell_size = (
-                        kvc.model_config.kv_lora_rank
-                        + kvc.model_config.qk_rope_head_dim
-                        + get_dsa_index_head_dim(kvc.model_config.hf_config)
-                    ) * kv_size
+                    if kvc.sfa_c8_enabled:
+                        from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+                            get_sfa_c8_packed_head_dim,
+                        )
+
+                        draft_cell_size = get_sfa_c8_packed_head_dim(
+                            kvc.model_config.kv_lora_rank,
+                            kvc.model_config.qk_rope_head_dim,
+                        ) + (
+                            get_dsa_index_head_dim(kvc.model_config.hf_config)
+                            * kv_size
+                        )
+                    else:
+                        draft_cell_size = (
+                            kvc.model_config.kv_lora_rank
+                            + kvc.model_config.qk_rope_head_dim
+                            + get_dsa_index_head_dim(kvc.model_config.hf_config)
+                        ) * kv_size
                     self._cell_size += draft_cell_size * draft_num_layers
                 else:
                     self._cell_size = int(

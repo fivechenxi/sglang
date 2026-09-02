@@ -15,9 +15,114 @@ import torch_npu
 from sglang.srt.hardware_backend.npu.attention.sfa_c8 import pack_sfa_c8_kv
 
 
+def run_graph_probe(
+    *,
+    device: torch.device,
+    packed_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    topk: torch.Tensor,
+    q_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    scale_value: float,
+) -> dict:
+    """Capture and replay the exact C8 write + QSFA decode operator chain."""
+    kv_lora_rank = 512
+    rope_head_dim = 64
+    static_k_nope = torch.randn(
+        1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device
+    )
+    static_k_rope = torch.randn(
+        1, 1, rope_head_dim, dtype=torch.bfloat16, device=device
+    )
+    static_q_nope = torch.randn(
+        1, 1, kv_lora_rank, dtype=torch.bfloat16, device=device
+    )
+    static_q_rope = torch.randn(
+        1, 1, rope_head_dim, dtype=torch.bfloat16, device=device
+    )
+    static_slot = torch.tensor(
+        [int(kv_lens[-1].item()) - 1], dtype=torch.int64, device=device
+    )
+
+    def graph_forward() -> torch.Tensor:
+        packed = pack_sfa_c8_kv(
+            static_k_nope,
+            static_k_rope,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=rope_head_dim,
+        )
+        torch_npu.npu_scatter_nd_update_(
+            packed_cache.view(-1, 1, packed_cache.shape[-1]),
+            static_slot.view(-1, 1),
+            packed.view(-1, 1, packed_cache.shape[-1]),
+        )
+        return torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=torch.cat([static_q_nope, static_q_rope], dim=-1).contiguous(),
+            key=packed_cache,
+            value=packed_cache,
+            sparse_indices=topk,
+            scale_value=scale_value,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            block_table=block_table,
+            actual_seq_lengths_query=q_lens,
+            actual_seq_lengths_kv=kv_lens,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=rope_head_dim,
+        )
+
+    for _ in range(2):
+        graph_forward()
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    capture_stream = torch.npu.Stream()
+    capture_stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.graph(
+        graph,
+        pool=torch.npu.graph_pool_handle(),
+        stream=capture_stream,
+        auto_dispatch_capture=True,
+    ):
+        graph_out = graph_forward()
+    torch.npu.current_stream().wait_stream(capture_stream)
+    torch.npu.synchronize()
+
+    static_k_nope.copy_(torch.randn_like(static_k_nope))
+    static_k_rope.copy_(torch.randn_like(static_k_rope))
+    static_q_nope.copy_(torch.randn_like(static_q_nope))
+    static_q_rope.copy_(torch.randn_like(static_q_rope))
+    graph.replay()
+    torch.npu.synchronize()
+    replay_out = graph_out.clone()
+
+    eager_out = graph_forward()
+    torch.npu.synchronize()
+    max_abs_error = (replay_out.float() - eager_out.float()).abs().max().item()
+    mean_abs_error = (replay_out.float() - eager_out.float()).abs().mean().item()
+    torch.testing.assert_close(replay_out, eager_out, rtol=1e-3, atol=1e-3)
+    return {
+        "captured": True,
+        "replayed": True,
+        "max_abs_error_vs_eager": max_abs_error,
+        "mean_abs_error_vs_eager": mean_abs_error,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="npu:0")
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="also capture/replay quantize + cache write + QSFA in an NPU graph",
+    )
     args = parser.parse_args()
     device = torch.device(args.device)
     torch.npu.set_device(device)
@@ -132,6 +237,18 @@ def main() -> None:
     qsfa_max_abs_error = (c8_out.float() - bf16_out.float()).abs().max().item()
     qsfa_mean_abs_error = (c8_out.float() - bf16_out.float()).abs().mean().item()
 
+    graph_probe = None
+    if args.graph:
+        graph_probe = run_graph_probe(
+            device=device,
+            packed_cache=packed.clone(),
+            block_table=block_table,
+            topk=topk,
+            q_lens=q_lens,
+            kv_lens=kv_lens,
+            scale_value=scale_value,
+        )
+
     print(
         json.dumps(
             {
@@ -148,6 +265,7 @@ def main() -> None:
                     "max_abs_error": qsfa_max_abs_error,
                     "mean_abs_error": qsfa_mean_abs_error,
                 },
+                "graph_probe": graph_probe,
             },
             indent=2,
         )
