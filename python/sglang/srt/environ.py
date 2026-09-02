@@ -569,6 +569,14 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Experimental GLM/DSA packed C8 KV cache for Quant Sparse Flash Attention.
+    # SFA and LightningIndexer use different physical layouts and must remain
+    # independently selectable throughout rollout and rollback.
+    SGLANG_NPU_ENABLE_SFA_C8 = EnvBool(False)
+    # Reserved for the phase-2 LightningIndexer C8 implementation. Defining a
+    # separate switch now prevents the SFA packed layout from becoming an
+    # implicit model-wide "C8" mode.
+    SGLANG_NPU_ENABLE_LI_C8 = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
