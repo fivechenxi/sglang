@@ -44,8 +44,11 @@ def get_sfa_c8_incompatibilities(
         incompatible.append("decode context parallelism/DCP")
     if prefill_cp_enabled:
         incompatible.append("DSA prefill context parallelism")
-    if disaggregation_mode != "null":
-        incompatible.append("PD disaggregation")
+    # PD transfer is byte-oriented.  NPUMLATokenToKVPool exposes each packed
+    # SFA page as one contiguous item, so prefill and decode workers move the
+    # native 656-byte representation without reconstructing BF16 K/V tensors.
+    # Keep the argument in this validation surface so all three roles are
+    # covered by the same phase-boundary tests.
     if hierarchical_cache_enabled:
         incompatible.append("hierarchical cache")
     if cpu_offload_gb > 0:

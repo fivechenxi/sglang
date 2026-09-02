@@ -61,6 +61,19 @@ class TestNPUMLACompactIndexerPool(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "packed"):
             pool.get_kv_buffer_shape()
 
+        ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+        self.assertEqual(3, len(ptrs))
+        self.assertEqual(
+            [
+                pool.packed_kv_buffer[0].data_ptr(),
+                pool.packed_kv_buffer[1].data_ptr(),
+                pool.index_k_buffer[0].data_ptr(),
+            ],
+            ptrs,
+        )
+        self.assertEqual([820, 820, 320], lens)
+        self.assertEqual([164, 164, 64], item_lens)
+
 
 if __name__ == "__main__":
     unittest.main()

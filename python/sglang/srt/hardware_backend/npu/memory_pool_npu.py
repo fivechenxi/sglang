@@ -510,7 +510,51 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     # for disagg
     def get_contiguous_buf_infos(self):
         if self.sfa_c8_enabled:
-            raise RuntimeError("SFA C8 PD/contiguous transfer is not supported yet")
+            # PD transfer operates on opaque byte ranges.  Expose the native
+            # packed cache directly: one pointer per layer and one page-sized
+            # item per transfer index.  In particular, do not present separate
+            # K/V views here; that would either double-transfer the same bytes
+            # or silently expand C8 back to BF16 on the wire.
+            kv_data_ptrs = [
+                self.packed_kv_buffer[i].data_ptr() for i in range(self.layer_num)
+            ]
+            kv_data_lens = [
+                self.packed_kv_buffer[i].nbytes for i in range(self.layer_num)
+            ]
+            kv_item_lens = [
+                self.packed_kv_buffer[i][0].nbytes for i in range(self.layer_num)
+            ]
+            if self.index_head_dim is not None:
+                # The Lightning Indexer remains BF16 in this phase.  It shares
+                # the main cache page ids and therefore travels as additional
+                # opaque page buffers in the same positional descriptor list.
+                kv_data_ptrs += [
+                    self.index_k_buffer[i].data_ptr()
+                    for i in range(self.indexer_layer_num)
+                ]
+                kv_data_lens += [
+                    self.index_k_buffer[i].nbytes
+                    for i in range(self.indexer_layer_num)
+                ]
+                kv_item_lens += [
+                    self.index_k_buffer[i][0].nbytes
+                    for i in range(self.indexer_layer_num)
+                ]
+            logger.info(
+                "NPU SFA C8 PD layout: packed_main_layers=%d, "
+                "packed_main_page_bytes=%d, indexer_layers=%d, "
+                "indexer_page_bytes=%d, descriptor_count=%d",
+                self.layer_num,
+                self.packed_kv_buffer[0][0].nbytes,
+                self.indexer_layer_num,
+                (
+                    self.index_k_buffer[0][0].nbytes
+                    if self.indexer_layer_num > 0
+                    else 0
+                ),
+                len(kv_data_ptrs),
+            )
+            return kv_data_ptrs, kv_data_lens, kv_item_lens
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
         kv_data_ptrs = [self.k_buffer[i].data_ptr() for i in range(self.layer_num)] + [
             self.v_buffer[i].data_ptr() for i in range(self.layer_num)
