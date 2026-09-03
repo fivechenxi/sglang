@@ -160,6 +160,24 @@ The `--version` (or `-V`) flag displays the version string. Use `--version-verbo
   ```
 Prefill entries accept an optional bootstrap port. PD mode merges prefill metadata with decode outputs and streams results back to the client.
 
+To fail fast before dispatching cold prefill work, set per-prefill-worker
+admission budgets (both are disabled by default):
+
+```bash
+--prefill-policy cache_aware \
+--pd-prefill-admission-max-cold-tokens 65536 \
+--pd-prefill-admission-max-cold-requests 2 \
+--pd-prefill-admission-cold-request-threshold-tokens 8192 \
+--pd-prefill-admission-retry-after-secs 1
+```
+
+The router estimates cold tokens from its cache-aware prefix match and the
+configured tokenizer (falling back to
+`--pd-prefill-admission-chars-per-token`). A rejected request receives an
+immediate `429 prefill_admission_limited` with `Retry-After`; it is neither
+queued nor sent to a prefill or decode worker. Reservations are released when
+the prefill side completes its KV-transfer handshake.
+
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash

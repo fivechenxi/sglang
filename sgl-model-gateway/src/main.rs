@@ -349,6 +349,26 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
+    /// Per-prefill-worker in-flight cold-token budget (0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_max_cold_tokens: usize,
+
+    /// Per-prefill-worker in-flight long-cold-request budget (0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_max_cold_requests: usize,
+
+    /// Estimated cold-token threshold used by the request-count budget
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_cold_request_threshold_tokens: usize,
+
+    /// Fallback token estimator when the tokenizer is unavailable
+    #[arg(long, default_value_t = 3.0, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_chars_per_token: f32,
+
+    /// Retry-After value returned with prefill admission 429 responses
+    #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_retry_after_secs: u64,
+
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
@@ -1017,6 +1037,13 @@ impl CliArgs {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .pd_prefill_admission(
+                self.pd_prefill_admission_max_cold_tokens,
+                self.pd_prefill_admission_max_cold_requests,
+                self.pd_prefill_admission_cold_request_threshold_tokens,
+                self.pd_prefill_admission_chars_per_token,
+                self.pd_prefill_admission_retry_after_secs,
+            )
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,
