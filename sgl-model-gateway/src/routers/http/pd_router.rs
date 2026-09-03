@@ -544,9 +544,22 @@ impl PDRouter {
                         };
 
                         let admission_guard = if self.prefill_admission.enabled() {
+                            // A cache entry is only meaningful inside the
+                            // physical P-DP cache domain that created it. A
+                            // basic worker may hide multiple DP ranks behind
+                            // one HTTP endpoint; discounting its router-side
+                            // prefix estimate can therefore admit a request
+                            // that is actually cold on the selected rank.
+                            let matched_chars = if Self::prefill_cache_identity_is_stable(
+                                selected.prefill.as_ref(),
+                            ) {
+                                selected.matched_chars
+                            } else {
+                                0
+                            };
                             let cold_tokens = self.estimate_cold_tokens(
                                 context.request_text.as_deref(),
-                                selected.matched_chars,
+                                matched_chars,
                                 context.model_id,
                                 context.input_tokens,
                             );
@@ -1144,6 +1157,19 @@ impl PDRouter {
         self.prefill_admission.enabled()
             || prefill_policy.needs_request_text()
             || decode_policy.needs_request_text()
+    }
+
+    fn prefill_cache_identity_is_stable(worker: &dyn Worker) -> bool {
+        if worker.dp_rank().is_some() && worker.dp_size().is_some() {
+            return true;
+        }
+
+        worker
+            .metadata()
+            .labels
+            .get("dp_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            == Some(1)
     }
 
     /// Builds the text used for cache-aware routing of a chat request.
@@ -1956,6 +1982,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
@@ -2167,6 +2195,32 @@ mod tests {
             PDRouter::worker_endpoint_url(&worker, "/v1/models"),
             "http://prefill:30000/v1/models"
         );
+    }
+
+    #[test]
+    fn test_prefill_cache_identity_requires_a_physical_cache_domain() {
+        let aggregate = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .labels(HashMap::from([("dp_size".to_string(), "4".to_string())]))
+            .build();
+        assert!(!PDRouter::prefill_cache_identity_is_stable(&aggregate));
+
+        let single = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .labels(HashMap::from([("dp_size".to_string(), "1".to_string())]))
+            .build();
+        assert!(PDRouter::prefill_cache_identity_is_stable(&single));
+
+        let ranked = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        assert!(PDRouter::prefill_cache_identity_is_stable(&ranked));
     }
 
     #[test]
