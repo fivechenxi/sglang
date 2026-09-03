@@ -178,6 +178,17 @@ immediate `429 prefill_admission_limited` with `Retry-After`; it is neither
 queued nor sent to a prefill or decode worker. Reservations are released when
 the prefill side completes its KV-transfer handshake.
 
+When one HTTP endpoint fronts multiple SGLang DP ranks, also pass `--dp-aware`.
+This expands the endpoint into one virtual worker per physical DP cache domain,
+pins cache-aware routing and admission accounting to that domain, and generates
+bootstrap room IDs that satisfy SGLang's `follow_bootstrap_room` invariant. If
+the router cannot prove a stable physical cache identity, admission remains
+fail-closed and does not subtract its logical prefix estimate from cold tokens.
+For a local tokenizer, pass the concrete tokenizer file (for example
+`--tokenizer-path /models/model/tokenizer.json`) and verify the startup log says
+`Successfully loaded tokenizer`; otherwise the configured chars/token fallback
+is used.
+
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash
