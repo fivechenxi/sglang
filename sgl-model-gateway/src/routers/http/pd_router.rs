@@ -346,6 +346,28 @@ impl PDRouter {
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
+    fn generate_bootstrap_room(prefill_worker: &dyn Worker) -> Result<u64, String> {
+        match (prefill_worker.dp_rank(), prefill_worker.dp_size()) {
+            (Some(dp_rank), Some(dp_size)) => {
+                super::pd_types::generate_room_id_for_dp(dp_rank, dp_size).ok_or_else(|| {
+                    format!(
+                        "Invalid DP worker metadata for {}: dp_rank={}, dp_size={}",
+                        prefill_worker.url(),
+                        dp_rank,
+                        dp_size
+                    )
+                })
+            }
+            (None, None) => Ok(super::pd_types::generate_room_id()),
+            (dp_rank, dp_size) => Err(format!(
+                "Incomplete DP worker metadata for {}: dp_rank={:?}, dp_size={:?}",
+                prefill_worker.url(),
+                dp_rank,
+                dp_size
+            )),
+        }
+    }
+
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
@@ -362,7 +384,7 @@ impl PDRouter {
             for _ in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+                rooms.push(Self::generate_bootstrap_room(prefill_worker)?);
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -400,7 +422,7 @@ impl PDRouter {
             );
             obj.insert(
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
+                Value::from(Self::generate_bootstrap_room(prefill_worker)?),
             );
         }
         Ok(original)
@@ -2143,6 +2165,31 @@ mod tests {
             PDRouter::worker_endpoint_url(&worker, "/v1/models"),
             "http://prefill:30000/v1/models"
         );
+    }
+
+    #[test]
+    fn test_dp_aware_bootstrap_rooms_follow_selected_prefill_rank() {
+        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        let single =
+            PDRouter::inject_bootstrap_into_value(json!({"prompt": "single"}), &prefill, None)
+                .unwrap();
+        let room = single["bootstrap_room"].as_u64().unwrap();
+        assert_eq!(room % 4, 2);
+
+        let batch = PDRouter::inject_bootstrap_into_value(
+            json!({"prompt": ["a", "b", "c"]}),
+            &prefill,
+            Some(3),
+        )
+        .unwrap();
+        let rooms = batch["bootstrap_room"].as_array().unwrap();
+        assert_eq!(rooms.len(), 3);
+        assert!(rooms.iter().all(|room| room.as_u64().unwrap() % 4 == 2));
     }
 
     #[tokio::test]
