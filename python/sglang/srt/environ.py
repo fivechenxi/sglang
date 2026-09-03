@@ -357,6 +357,11 @@ class Envs:
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
     SGLANG_DISAGGREGATION_THREAD_POOL_SIZE = EnvInt(None)
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
+    # Decode-side backpressure for requests that have device KV preallocated
+    # but whose P->D transfer has not completed. Zero preserves the historical
+    # unbounded behavior. These are per-DP limits.
+    SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS = EnvInt(0)
+    SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS = EnvInt(0)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)

@@ -10,9 +10,11 @@ import torch
 
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
+    HiCacheRestoreResult,
     SchedulerDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -100,6 +102,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
             kv_receiver=MagicMock(),
             metadata_buffer_index=-1,
             is_rebootstrap=False,
+            prefix_match=None,
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restored_node=None,
         )
 
     def _new_queue(self, decode_reqs, *, low_priority_values_first: bool = False):
@@ -207,6 +212,69 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.scheduler.output_streamer.stream_output.assert_called_once_with(
             [failed_low.req], failed_low.req.return_logprob
         )
+
+    def test_prealloc_queue_limits_inflight_transfers_per_dp(self):
+        reqs = [
+            self._new_decode_req("first", 3),
+            self._new_decode_req("second", 2),
+            self._new_decode_req("third", 1),
+        ]
+        queue = self._new_queue(reqs)
+
+        with (
+            patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096),
+            patch.object(
+                envs.SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS,
+                "get",
+                return_value=1,
+            ),
+        ):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual([req.req.rid for req in preallocated], ["first"])
+        self.assertEqual(failed, [])
+        self.assertEqual([req.req.rid for req in queue.queue], ["second", "third"])
+
+    def test_prealloc_queue_counts_existing_transfer_residency(self):
+        queued = self._new_decode_req("queued", 2)
+        inflight = self._new_decode_req("inflight", 1)
+        queue = self._new_queue([queued])
+        queue.transfer_queue.queue = [inflight]
+
+        with (
+            patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096),
+            patch.object(
+                envs.SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS,
+                "get",
+                return_value=1,
+            ),
+        ):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [])
+        self.assertEqual(failed, [])
+        self.assertEqual(queue.queue, [queued])
+
+    def test_prealloc_queue_limits_inflight_transfer_tokens_per_dp(self):
+        reqs = [
+            self._new_decode_req("first", 2),
+            self._new_decode_req("second", 1),
+        ]
+        queue = self._new_queue(reqs)
+
+        with (
+            patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096),
+            patch.object(
+                envs.SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS,
+                "get",
+                return_value=4,
+            ),
+        ):
+            preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual([req.req.rid for req in preallocated], ["first"])
+        self.assertEqual(failed, [])
+        self.assertEqual([req.req.rid for req in queue.queue], ["second"])
 
 
 class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):

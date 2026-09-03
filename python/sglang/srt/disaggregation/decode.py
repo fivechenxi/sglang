@@ -855,6 +855,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
+    def _log_prealloc_throttle(self, message: str, *args) -> None:
+        """Rate-limit admission diagnostics on the scheduler hot path."""
+        now = time.monotonic()
+        last_log_time = getattr(self, "_prealloc_throttle_last_log_time", 0.0)
+        if now - last_log_time < 5.0:
+            return
+        self._prealloc_throttle_last_log_time = now
+        logger.info(message, *args)
+
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
@@ -864,7 +873,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         failed_reqs = []
         preallocated_reqs = []
+        preallocated_tokens = 0
         indices_to_remove = set()
+
+        # Device KV is reserved before P->D transfer starts. Without a bound,
+        # a burst can reserve most of a DP rank's pool for requests that are
+        # not ready to decode yet. Limit the transfer residency window rather
+        # than only limiting one pop_preallocated() call: scheduler iterations
+        # are fast enough that a per-call-only limit would refill the transfer
+        # queue almost immediately. Defaults are unlimited for compatibility.
+        max_inflight_transfers = (
+            envs.SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS.get()
+        )
+        max_inflight_transfer_tokens = (
+            envs.SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS.get()
+        )
+        existing_inflight_transfers = len(self.transfer_queue.queue)
+        existing_inflight_transfer_tokens = sum(
+            self._pre_alloc_fill_len(item.req) for item in self.transfer_queue.queue
+        )
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -1003,6 +1030,42 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
             if (
+                max_inflight_transfers > 0
+                and existing_inflight_transfers + len(preallocated_reqs)
+                >= max_inflight_transfers
+            ):
+                self._log_prealloc_throttle(
+                    "Deferring decode preallocation: %d transfers are already "
+                    "in flight (limit=%d)",
+                    existing_inflight_transfers + len(preallocated_reqs),
+                    max_inflight_transfers,
+                )
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
+
+            projected_inflight_transfer_tokens = (
+                existing_inflight_transfer_tokens
+                + preallocated_tokens
+                + required_alloc_tokens
+            )
+            if (
+                max_inflight_transfer_tokens > 0
+                and projected_inflight_transfer_tokens
+                > max_inflight_transfer_tokens
+                and (existing_inflight_transfers > 0 or preallocated_reqs)
+            ):
+                self._log_prealloc_throttle(
+                    "Deferring decode preallocation: projected in-flight "
+                    "transfer tokens=%d exceeds limit=%d",
+                    projected_inflight_transfer_tokens,
+                    max_inflight_transfer_tokens,
+                )
+                if prefix_len > 0:
+                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                break
+
+            if (
                 max(
                     required_tokens_for_request,
                     origin_input_len
@@ -1047,6 +1110,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            preallocated_tokens += required_alloc_tokens
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
