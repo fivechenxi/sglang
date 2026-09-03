@@ -124,6 +124,20 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+    /// Reject a PD request with 429 when the selected prefill worker would
+    /// exceed this many in-flight cache-miss tokens. Omit to disable.
+    #[arg(long)]
+    pub prefill_admission_max_inflight_cold_tokens: Option<usize>,
+    /// Reject a PD request with 429 when the selected prefill worker would
+    /// exceed this many concurrent long cold-prefill requests. Omit to disable.
+    #[arg(long)]
+    pub prefill_admission_max_inflight_cold_requests: Option<usize>,
+    /// Cache-miss tokens at or above this value count as a long cold request.
+    #[arg(long, default_value_t = 8192)]
+    pub prefill_admission_cold_request_threshold_tokens: usize,
+    /// Retry-After seconds returned with a prefill-admission 429.
+    #[arg(long, default_value_t = 1)]
+    pub prefill_admission_retry_after_secs: u64,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -153,6 +167,26 @@ impl Cli {
             return Err(anyhow!(
                 "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
                  enabled by --cb-threshold)"
+            ));
+        }
+        if self.prefill_admission_max_inflight_cold_tokens == Some(0) {
+            return Err(anyhow!(
+                "--prefill-admission-max-inflight-cold-tokens must be greater than 0"
+            ));
+        }
+        if self.prefill_admission_max_inflight_cold_requests == Some(0) {
+            return Err(anyhow!(
+                "--prefill-admission-max-inflight-cold-requests must be greater than 0"
+            ));
+        }
+        if self.prefill_admission_cold_request_threshold_tokens == 0 {
+            return Err(anyhow!(
+                "--prefill-admission-cold-request-threshold-tokens must be greater than 0"
+            ));
+        }
+        if self.prefill_admission_retry_after_secs == 0 {
+            return Err(anyhow!(
+                "--prefill-admission-retry-after-secs must be greater than 0"
             ));
         }
         let tuned_cache_aware = self.cache_threshold.is_some()
@@ -274,6 +308,13 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+                prefill_admission_max_inflight_cold_tokens: self
+                    .prefill_admission_max_inflight_cold_tokens,
+                prefill_admission_max_inflight_cold_requests: self
+                    .prefill_admission_max_inflight_cold_requests,
+                prefill_admission_cold_request_threshold_tokens: self
+                    .prefill_admission_cold_request_threshold_tokens,
+                prefill_admission_retry_after_secs: self.prefill_admission_retry_after_secs,
             },
         };
         config.validate()?;
@@ -391,6 +432,58 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert_eq!(
+            c.active_load.prefill_admission_max_inflight_cold_tokens,
+            None
+        );
+        assert_eq!(
+            c.active_load.prefill_admission_max_inflight_cold_requests,
+            None
+        );
+    }
+
+    #[test]
+    fn prefill_admission_knobs_build_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--prefill-admission-max-inflight-cold-tokens",
+            "65536",
+            "--prefill-admission-max-inflight-cold-requests",
+            "4",
+            "--prefill-admission-cold-request-threshold-tokens",
+            "16384",
+            "--prefill-admission-retry-after-secs",
+            "2",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c.active_load.prefill_admission_max_inflight_cold_tokens,
+            Some(65536)
+        );
+        assert_eq!(
+            c.active_load.prefill_admission_max_inflight_cold_requests,
+            Some(4)
+        );
+        assert_eq!(
+            c.active_load
+                .prefill_admission_cold_request_threshold_tokens,
+            16384
+        );
+        assert_eq!(c.active_load.prefill_admission_retry_after_secs, 2);
+    }
+
+    #[test]
+    fn prefill_admission_rejects_zero_caps() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--prefill-admission-max-inflight-cold-tokens",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be greater than 0"), "got: {err}");
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

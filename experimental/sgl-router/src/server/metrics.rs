@@ -33,6 +33,8 @@
 //! | `sgl_router_decode_affinity_total` | Counter | `outcome` |
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
+//! | `sgl_router_prefill_admission_total` | Counter | `worker_url`, `outcome` |
+//! | `sgl_router_prefill_admission_load` | Gauge | `worker_url`, `kind` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -191,6 +193,36 @@ pub enum ActiveLoadKind {
     DecodeBlocks,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum PrefillAdmissionOutcome {
+    Accepted,
+    Rejected,
+}
+
+impl PrefillAdmissionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PrefillAdmissionLoadKind {
+    ColdTokens,
+    ColdRequests,
+}
+
+impl PrefillAdmissionLoadKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ColdTokens => "cold_tokens",
+            Self::ColdRequests => "cold_requests",
+        }
+    }
+}
+
 impl ActiveLoadKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -225,6 +257,8 @@ pub struct MetricsRegistry {
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
+    prefill_admission_total: Mutex<HashMap<PrefillAdmissionKey, Arc<AtomicU64>>>,
+    prefill_admission_load: Mutex<HashMap<PrefillAdmissionKey, Arc<AtomicI64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -270,6 +304,12 @@ pub struct WorkerSnapshot {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 struct ActiveLoadKey {
+    worker_url: String,
+    kind: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct PrefillAdmissionKey {
     worker_url: String,
     kind: &'static str,
 }
@@ -502,6 +542,39 @@ impl MetricsRegistry {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_prefill_admission(&self, worker_url: &str, outcome: PrefillAdmissionOutcome) {
+        let key = PrefillAdmissionKey {
+            worker_url: worker_url.to_owned(),
+            kind: outcome.as_str(),
+        };
+        let mut guard = self.prefill_admission_total.lock();
+        let counter = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_prefill_admission_load(
+        &self,
+        worker_url: &str,
+        kind: PrefillAdmissionLoadKind,
+        value: i64,
+    ) {
+        let key = PrefillAdmissionKey {
+            worker_url: worker_url.to_owned(),
+            kind: kind.as_str(),
+        };
+        let mut guard = self.prefill_admission_load.lock();
+        let gauge = guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicI64::new(0)))
+            .clone();
+        drop(guard);
+        gauge.store(value, Ordering::Relaxed);
+    }
+
     /// Render the registry as a Prometheus 0.0.4 exposition-format string
     /// with no live worker snapshot. The per-worker gauges emit only their
     /// HELP/TYPE headers and a zeroed pool-size series. Production scrapes
@@ -661,6 +734,47 @@ impl MetricsRegistry {
         for (key, value) in entries {
             out.push_str(&format!(
                 "sgl_router_active_load{{worker_url=\"{}\",kind=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                key.kind,
+                value,
+            ));
+        }
+        drop(guard);
+
+        // Fail-fast cold-prefill admission decisions and live reservations.
+        out.push_str(
+            "# HELP sgl_router_prefill_admission_total PD cold-prefill admission decisions.\n",
+        );
+        out.push_str("# TYPE sgl_router_prefill_admission_total counter\n");
+        let guard = self.prefill_admission_total.lock();
+        let mut entries: Vec<(&PrefillAdmissionKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.worker_url, a.0.kind).cmp(&(&b.0.worker_url, b.0.kind)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_prefill_admission_total{{worker_url=\"{}\",outcome=\"{}\"}} {}\n",
+                escape_label(&key.worker_url),
+                key.kind,
+                value,
+            ));
+        }
+        drop(guard);
+
+        out.push_str(
+            "# HELP sgl_router_prefill_admission_load Live PD cold-prefill reservations.\n",
+        );
+        out.push_str("# TYPE sgl_router_prefill_admission_load gauge\n");
+        let guard = self.prefill_admission_load.lock();
+        let mut entries: Vec<(&PrefillAdmissionKey, i64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| (&a.0.worker_url, a.0.kind).cmp(&(&b.0.worker_url, b.0.kind)));
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_prefill_admission_load{{worker_url=\"{}\",kind=\"{}\"}} {}\n",
                 escape_label(&key.worker_url),
                 key.kind,
                 value,

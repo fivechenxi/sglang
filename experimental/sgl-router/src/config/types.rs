@@ -51,6 +51,17 @@ pub struct ActiveLoadConfig {
     /// janitor fires its `cancel_token` and the chat handler returns
     /// 504 `stale_request_expired`. Default 600 s.
     pub stale_request_timeout_secs: u64,
+    /// Per-prefill-worker cap on in-flight cache-miss tokens. `None` disables
+    /// admission control. The router returns 429 before dispatch when adding a
+    /// PD request would exceed this budget.
+    pub prefill_admission_max_inflight_cold_tokens: Option<usize>,
+    /// Optional cap on concurrent long cold-prefill requests per worker.
+    pub prefill_admission_max_inflight_cold_requests: Option<usize>,
+    /// A request counts against the cold-request cap when its estimated cache
+    /// miss is at least this many tokens.
+    pub prefill_admission_cold_request_threshold_tokens: usize,
+    /// `Retry-After` value attached to admission 429 responses.
+    pub prefill_admission_retry_after_secs: u64,
 }
 
 pub fn default_stale_request_timeout_secs() -> u64 {
@@ -61,6 +72,10 @@ impl Default for ActiveLoadConfig {
     fn default() -> Self {
         Self {
             stale_request_timeout_secs: default_stale_request_timeout_secs(),
+            prefill_admission_max_inflight_cold_tokens: None,
+            prefill_admission_max_inflight_cold_requests: None,
+            prefill_admission_cold_request_threshold_tokens: 8192,
+            prefill_admission_retry_after_secs: 1,
         }
     }
 }

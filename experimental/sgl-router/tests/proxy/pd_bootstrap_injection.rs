@@ -58,8 +58,7 @@ fn config() -> Config {
     }
 }
 
-fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
-    let cfg = config();
+fn build_ctx_with_config(cfg: Config, specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -70,7 +69,15 @@ fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
+fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
+    build_ctx_with_config(config(), specs)
+}
+
 fn chat_request() -> Request<Body> {
+    chat_request_with_content("hi")
+}
+
+fn chat_request_with_content(content: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -78,11 +85,78 @@ fn chat_request() -> Request<Body> {
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({
                 "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [{"role": "user", "content": content}],
             }))
             .unwrap(),
         ))
         .unwrap()
+}
+
+/// Admission is fail-fast and sits before the PD fan-out. While one prefill
+/// request holds the sole long-cold slot, the next request gets a router 429;
+/// neither P nor D sees that rejected body. Once the P response finishes, the
+/// detached-task guard releases the slot and a later request is admitted.
+#[tokio::test]
+async fn pd_prefill_admission_returns_429_before_dual_dispatch_and_releases_on_p_end() {
+    let prefill =
+        crate::common::mock_worker::MockWorker::start_hanging(Duration::from_millis(120)).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let mut cfg = config();
+    cfg.active_load.prefill_admission_max_inflight_cold_requests = Some(1);
+    cfg.active_load
+        .prefill_admission_cold_request_threshold_tokens = 1;
+    cfg.active_load.prefill_admission_retry_after_secs = 2;
+    let ctx = build_ctx_with_config(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let first = app
+        .clone()
+        .oneshot(chat_request_with_content("first-admitted"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let _ = await_captured_body(&prefill, Duration::from_secs(1), "prefill").await;
+
+    let rejected = app
+        .clone()
+        .oneshot(chat_request_with_content("second-must-not-dispatch"))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        rejected.headers().get("x-router-error-code").unwrap(),
+        "prefill_admission_limited"
+    );
+    assert_eq!(rejected.headers().get("retry-after").unwrap(), "2");
+    let p_body = prefill.captured.lock().unwrap().last_body.clone().unwrap();
+    let d_body = decode.captured.lock().unwrap().last_body.clone().unwrap();
+    assert!(!String::from_utf8_lossy(&p_body).contains("second-must-not-dispatch"));
+    assert!(!String::from_utf8_lossy(&d_body).contains("second-must-not-dispatch"));
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let third = app
+        .oneshot(chat_request_with_content("third-after-release"))
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
 }
 
 /// Pattern-B dispatch: prefill is `tokio::spawn`'d as a detached task

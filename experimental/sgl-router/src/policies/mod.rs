@@ -7,6 +7,7 @@ pub mod factory;
 pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
+pub mod prefill_admission;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
@@ -235,6 +236,19 @@ impl<'a> SelectionContext<'a> {
 
 pub trait Policy: Send + Sync + std::fmt::Debug {
     fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>>;
+
+    /// Best-effort estimate of prefix tokens already cached on `worker`.
+    /// Policies without a cache directory return zero, which deliberately
+    /// makes admission conservative rather than treating an unknown prefix as
+    /// a hit. The estimate is advisory; engine-side limits remain the final
+    /// safety net for event lag and eviction races.
+    fn estimated_cached_prefix_tokens(
+        &self,
+        _worker: &Worker,
+        _ctx: &SelectionContext<'_>,
+    ) -> usize {
+        0
+    }
 
     /// Whether this policy's ROUTING decision needs the request tokens (i.e.
     /// it routes by prompt prefix). Ingress tokenization itself is no longer
