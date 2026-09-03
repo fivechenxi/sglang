@@ -15,8 +15,10 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
-use super::prefill_admission::{Controller as PrefillAdmissionController, Guard as AdmissionGuard};
+use super::{
+    pd_types::api_path,
+    prefill_admission::{Controller as PrefillAdmissionController, Guard as AdmissionGuard},
+};
 use crate::{
     config::types::RetryConfig,
     core::{
