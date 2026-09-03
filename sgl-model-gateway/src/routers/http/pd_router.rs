@@ -543,16 +543,15 @@ impl PDRouter {
                             }
                         };
 
-                        let admission_guard = match self
-                            .acquire_prefill_admission(&mut selected, &context)
-                        {
-                            Ok(guard) => guard,
-                            Err(rejection) => {
-                                self.prefill_admission
-                                    .record_rejection(selected.prefill.url());
-                                return self.admission_rejected_response(rejection);
-                            }
-                        };
+                        let admission_guard =
+                            match self.acquire_prefill_admission(&mut selected, &context) {
+                                Ok(guard) => guard,
+                                Err(rejection) => {
+                                    self.prefill_admission
+                                        .record_rejection(selected.prefill.url());
+                                    return self.admission_rejected_response(rejection);
+                                }
+                            };
 
                         // Keep handles for outcome accounting after the typed
                         // selection bundle is moved into the dispatcher.
@@ -1177,7 +1176,7 @@ impl PDRouter {
             .prefill_admission
             .try_acquire(selected.prefill.url(), cold_tokens)
         {
-            Ok(guard) => return Ok(Some(guard)),
+            Ok(guard) => Ok(Some(guard)),
             Err(primary_rejection) => {
                 // Continue below: a full preferred cache domain must not hide
                 // idle P-DPs behind an immediate 429.
