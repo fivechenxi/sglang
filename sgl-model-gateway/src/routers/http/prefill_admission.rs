@@ -68,12 +68,6 @@ impl Controller {
         if (self.max_cold_tokens > 0 && next_tokens > self.max_cold_tokens)
             || (self.max_cold_requests > 0 && next_requests > self.max_cold_requests)
         {
-            counter!(
-                "smg_pd_prefill_admission_total",
-                "worker" => worker_url.to_owned(),
-                "result" => "rejected"
-            )
-            .increment(1);
             return Err(Rejection {
                 requested_cold_tokens: cold_tokens,
                 current_cold_tokens: state.cold_tokens,
@@ -100,6 +94,26 @@ impl Controller {
             cold_tokens,
             is_long,
         })
+    }
+
+    /// Record only a request-level rejection. Failed internal candidate probes
+    /// are not externally visible 429s and must not inflate rejection metrics.
+    pub fn record_rejection(&self, worker_url: &str) {
+        counter!(
+            "smg_pd_prefill_admission_total",
+            "worker" => worker_url.to_owned(),
+            "result" => "rejected"
+        )
+        .increment(1);
+    }
+
+    pub fn record_reroute(&self, worker_url: &str) {
+        counter!(
+            "smg_pd_prefill_admission_total",
+            "worker" => worker_url.to_owned(),
+            "result" => "rerouted"
+        )
+        .increment(1);
     }
 
     #[cfg(test)]

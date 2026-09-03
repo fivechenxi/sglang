@@ -529,7 +529,7 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let selected = match self
+                        let mut selected = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.model_id,
@@ -543,37 +543,15 @@ impl PDRouter {
                             }
                         };
 
-                        let admission_guard = if self.prefill_admission.enabled() {
-                            // A cache entry is only meaningful inside the
-                            // physical P-DP cache domain that created it. A
-                            // basic worker may hide multiple DP ranks behind
-                            // one HTTP endpoint; discounting its router-side
-                            // prefix estimate can therefore admit a request
-                            // that is actually cold on the selected rank.
-                            let matched_chars = if Self::prefill_cache_identity_is_stable(
-                                selected.prefill.as_ref(),
-                            ) {
-                                selected.matched_chars
-                            } else {
-                                0
-                            };
-                            let cold_tokens = self.estimate_cold_tokens(
-                                context.request_text.as_deref(),
-                                matched_chars,
-                                context.model_id,
-                                context.input_tokens,
-                            );
-                            match self
-                                .prefill_admission
-                                .try_acquire(selected.prefill.url(), cold_tokens)
-                            {
-                                Ok(guard) => Some(guard),
-                                Err(rejection) => {
-                                    return self.admission_rejected_response(rejection);
-                                }
+                        let admission_guard = match self
+                            .acquire_prefill_admission(&mut selected, &context)
+                        {
+                            Ok(guard) => guard,
+                            Err(rejection) => {
+                                self.prefill_admission
+                                    .record_rejection(selected.prefill.url());
+                                return self.admission_rejected_response(rejection);
                             }
-                        } else {
-                            None
                         };
 
                         // Keep handles for outcome accounting after the typed
@@ -1172,6 +1150,117 @@ impl PDRouter {
             == Some(1)
     }
 
+    fn acquire_prefill_admission(
+        &self,
+        selected: &mut SelectedPDPair,
+        context: &PDRequestContext<'_>,
+    ) -> Result<Option<AdmissionGuard>, super::prefill_admission::Rejection> {
+        if !self.prefill_admission.enabled() {
+            return Ok(None);
+        }
+
+        // A cache entry is meaningful only inside the physical P-DP cache
+        // domain that created it. If an aggregate worker hides multiple ranks,
+        // fail closed and charge the whole request as cold.
+        let matched_chars = if Self::prefill_cache_identity_is_stable(selected.prefill.as_ref()) {
+            selected.matched_chars
+        } else {
+            0
+        };
+        let cold_tokens = self.estimate_cold_tokens(
+            context.request_text.as_deref(),
+            matched_chars,
+            context.model_id,
+            context.input_tokens,
+        );
+        match self
+            .prefill_admission
+            .try_acquire(selected.prefill.url(), cold_tokens)
+        {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(primary_rejection) => {
+                // Continue below: a full preferred cache domain must not hide
+                // idle P-DPs behind an immediate 429.
+                for (worker, matched_chars) in self.alternative_prefill_candidates(
+                    context.request_text.as_deref(),
+                    context.model_id,
+                    selected.prefill.url(),
+                ) {
+                    let cold_tokens = self.estimate_cold_tokens(
+                        context.request_text.as_deref(),
+                        matched_chars,
+                        context.model_id,
+                        context.input_tokens,
+                    );
+                    if let Ok(guard) = self
+                        .prefill_admission
+                        .try_acquire(worker.url(), cold_tokens)
+                    {
+                        selected.prefill = worker;
+                        selected.matched_chars = matched_chars;
+                        self.prefill_admission
+                            .record_reroute(selected.prefill.url());
+                        return Ok(Some(guard));
+                    }
+                }
+                Err(primary_rejection)
+            }
+        }
+    }
+
+    fn prefill_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
+        let effective_model_id = if self.enable_igw { model_id } else { None };
+        if let Some(model) = effective_model_id {
+            self.worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|worker| matches!(worker.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        }
+    }
+
+    fn alternative_prefill_candidates(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        selected_url: &str,
+    ) -> Vec<(Arc<dyn Worker>, usize)> {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let cache_policy = prefill_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>();
+
+        let mut candidates: Vec<_> = self
+            .prefill_workers(model_id)
+            .into_iter()
+            .filter(|worker| worker.is_available() && worker.url() != selected_url)
+            .map(|worker| {
+                let matched_chars = if Self::prefill_cache_identity_is_stable(worker.as_ref()) {
+                    request_text
+                        .zip(cache_policy)
+                        .map(|(text, policy)| {
+                            policy.preview_matched_chars_for_worker(worker.as_ref(), text)
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (worker, matched_chars)
+            })
+            .collect();
+
+        candidates.sort_by(|(left_worker, left_match), (right_worker, right_match)| {
+            right_match
+                .cmp(left_match)
+                .then_with(|| left_worker.load().cmp(&right_worker.load()))
+                .then_with(|| left_worker.url().cmp(right_worker.url()))
+        });
+        candidates
+    }
+
     /// Builds the text used for cache-aware routing of a chat request.
     ///
     /// This must reflect the *full* conversation (system prompt, prior turns,
@@ -1207,16 +1296,7 @@ impl PDRouter {
             self.enable_igw, model_id, effective_model_id
         );
 
-        let prefill_workers = if let Some(model) = effective_model_id {
-            self.worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
-                .cloned()
-                .collect()
-        } else {
-            self.worker_registry.get_prefill_workers()
-        };
+        let prefill_workers = self.prefill_workers(model_id);
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
@@ -2221,6 +2301,67 @@ mod tests {
             })
             .build();
         assert!(PDRouter::prefill_cache_identity_is_stable(&ranked));
+    }
+
+    #[test]
+    fn test_prefill_admission_falls_back_to_idle_dp_rank() {
+        let mut router = create_test_pd_router();
+        router.prefill_admission = PrefillAdmissionController::new(100, 1, 1);
+        router.prefill_admission_chars_per_token = 1.0;
+
+        let prefill0: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:30000", 0, 2)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .build(),
+        );
+        let prefill1: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:30000", 1, 2)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://decode:30000", 0, 2)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        prefill0.set_healthy(true);
+        prefill1.set_healthy(true);
+        decode.set_healthy(true);
+        router.worker_registry.register(Arc::clone(&prefill0));
+        router.worker_registry.register(Arc::clone(&prefill1));
+        router.worker_registry.register(Arc::clone(&decode));
+
+        let _occupied = router
+            .prefill_admission
+            .try_acquire(prefill0.url(), 50)
+            .unwrap();
+        let mut selected = SelectedPDPair {
+            prefill: Arc::clone(&prefill0),
+            decode,
+            matched_chars: 0,
+            publish_prefill_affinity_on_success: true,
+        };
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: Some("x".repeat(50)),
+            input_tokens: Some(50),
+            model_id: None,
+            headers: None,
+        };
+
+        let fallback_guard = router
+            .acquire_prefill_admission(&mut selected, &context)
+            .expect("an idle P-DP should accept the request")
+            .expect("admission is enabled");
+        assert_eq!(selected.prefill.url(), prefill1.url());
+        drop(fallback_guard);
     }
 
     #[test]

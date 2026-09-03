@@ -271,6 +271,25 @@ impl CacheAwarePolicy {
         Some((selected_idx, matched_chars))
     }
 
+    /// Return the approximate prefix match for one concrete cache domain
+    /// without mutating affinity state. Admission fallback uses this when the
+    /// preferred P-DP is full and it must evaluate another physical P-DP.
+    pub fn preview_matched_chars_for_worker(
+        &self,
+        worker: &dyn Worker,
+        request_text: &str,
+    ) -> usize {
+        let tree_key = tree_key_for_worker(worker);
+        self.trees
+            .get(&tree_key)
+            .map(|tree| {
+                tree.prefix_match_tenant(request_text, worker.url())
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Commit cache-affinity state after prefill has completed successfully.
     pub fn record_selected_request(&self, worker: &dyn Worker, request_text: &str) {
         let tree_key = tree_key_for_worker(worker);

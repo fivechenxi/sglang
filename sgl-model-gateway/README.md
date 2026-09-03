@@ -184,6 +184,10 @@ pins cache-aware routing and admission accounting to that domain, and generates
 bootstrap room IDs that satisfy SGLang's `follow_bootstrap_room` invariant. If
 the router cannot prove a stable physical cache identity, admission remains
 fail-closed and does not subtract its logical prefix estimate from cold tokens.
+If the preferred P-DP has exhausted its admission budget, the router atomically
+tries the other physical P-DPs in prefix-match/load order; it returns 429 only
+when none can reserve the request. Such fallbacks are exported as
+`smg_pd_prefill_admission_total{result="rerouted"}`.
 For a local tokenizer, pass the concrete tokenizer file (for example
 `--tokenizer-path /models/model/tokenizer.json`) and verify the startup log says
 `Successfully loaded tokenizer`; otherwise the configured chars/token fallback
