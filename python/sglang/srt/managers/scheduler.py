@@ -3096,6 +3096,26 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _decode_retract_requires_rebootstrap(self) -> bool:
+        return (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and not self.token_to_kv_pool_allocator.get_kvcache().supports_cpu_offload
+        )
+
+    def _requeue_retracted_req(self, req: Req, *, rebootstrap: bool) -> None:
+        if not rebootstrap:
+            self._add_request_to_queue(req, is_retracted=True)
+            return
+
+        # Packed cache layouts without a lossless CPU representation must
+        # recompute the committed prefix on Prefill instead of entering the
+        # CPU-offload resume queue.
+        if req.output_ids:
+            req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
+        req.pd_rebootstrap_in_progress = True
+        req.time_stats.set_retract_time()
+        self.disagg_decode_prealloc_queue.add(req, is_rebootstrap=True)
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -3124,8 +3144,9 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
+            rebootstrap_retracted = self._decode_retract_requires_rebootstrap()
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args, offload_kv=not rebootstrap_retracted
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -3172,7 +3193,9 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
-                self._add_request_to_queue(req, is_retracted=True)
+                self._requeue_retracted_req(
+                    req, rebootstrap=rebootstrap_retracted
+                )
         else:
             self.new_token_ratio_tracker.decay_step()
 

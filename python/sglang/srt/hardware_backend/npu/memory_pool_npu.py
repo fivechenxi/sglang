@@ -289,6 +289,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    @property
+    def supports_cpu_offload(self) -> bool:
+        # The packed C8 layout cannot use the inherited BF16 K/V host-copy
+        # representation. Decode retraction must rebootstrap from Prefill.
+        return not self.sfa_c8_enabled
+
 
     def __init__(
         self,
