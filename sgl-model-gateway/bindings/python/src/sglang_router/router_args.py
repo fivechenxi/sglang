@@ -51,6 +51,7 @@ class RouterArgs:
     decode_urls: List[str] = dataclasses.field(default_factory=list)
     pd_prefill_admission_max_cold_tokens: int = 0
     pd_prefill_admission_max_cold_requests: int = 0
+    pd_prefill_admission_max_inflight_requests: int = 0
     pd_prefill_admission_cold_request_threshold_tokens: int = 0
     pd_prefill_admission_chars_per_token: float = 3.0
     pd_prefill_admission_retry_after_secs: int = 1
@@ -399,6 +400,12 @@ class RouterArgs:
             type=int,
             default=RouterArgs.pd_prefill_admission_max_cold_requests,
             help="Per-prefill-worker in-flight long-cold-request budget (0 disables)",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-max-inflight-requests",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_max_inflight_requests,
+            help="Per-prefill-worker total in-flight request budget (0 disables)",
         )
         pd_group.add_argument(
             f"--{prefix}pd-prefill-admission-cold-request-threshold-tokens",

@@ -183,6 +183,10 @@ pub(crate) fn init_metrics() {
         "smg_pd_prefill_admission_inflight_cold_requests",
         "In-flight long cold prefill requests per prefill worker"
     );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight_requests",
+        "All in-flight prefill requests per prefill worker"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(

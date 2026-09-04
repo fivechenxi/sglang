@@ -357,6 +357,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     pd_prefill_admission_max_cold_requests: usize,
 
+    /// Per-prefill-worker total in-flight request budget (0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_prefill_admission_max_inflight_requests: usize,
+
     /// Estimated cold-token threshold used by the request-count budget
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     pd_prefill_admission_cold_request_threshold_tokens: usize,
@@ -1040,6 +1044,7 @@ impl CliArgs {
             .pd_prefill_admission(
                 self.pd_prefill_admission_max_cold_tokens,
                 self.pd_prefill_admission_max_cold_requests,
+                self.pd_prefill_admission_max_inflight_requests,
                 self.pd_prefill_admission_cold_request_threshold_tokens,
                 self.pd_prefill_admission_chars_per_token,
                 self.pd_prefill_admission_retry_after_secs,

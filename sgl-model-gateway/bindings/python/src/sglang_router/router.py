@@ -204,6 +204,8 @@ class Router:
         pd_prefill_admission_max_cold_tokens: Per-prefill-worker in-flight cold-token budget;
             0 disables the token budget. Default: 0
         pd_prefill_admission_max_cold_requests: Per-prefill-worker in-flight long-cold-request
+        pd_prefill_admission_max_inflight_requests: Per-prefill-worker total in-flight request
+            budget independent of cache-hit estimation; 0 disables.
             budget; 0 disables the request budget. Default: 0
         pd_prefill_admission_cold_request_threshold_tokens: Estimated cold-token threshold for
             counting a request as long. Default: 0

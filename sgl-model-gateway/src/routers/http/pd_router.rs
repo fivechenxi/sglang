@@ -223,6 +223,7 @@ impl PDRouter {
             prefill_admission: PrefillAdmissionController::new(
                 ctx.router_config.pd_prefill_admission_max_cold_tokens,
                 ctx.router_config.pd_prefill_admission_max_cold_requests,
+                ctx.router_config.pd_prefill_admission_max_inflight_requests,
                 ctx.router_config
                     .pd_prefill_admission_cold_request_threshold_tokens,
             ),
@@ -284,12 +285,14 @@ impl PDRouter {
             StatusCode::TOO_MANY_REQUESTS,
             "prefill_admission_limited",
             format!(
-                "Cold prefill capacity is full (requested_cold_tokens={}, inflight_cold_tokens={}, max_cold_tokens={}, inflight_cold_requests={}, max_cold_requests={})",
+            "Cold prefill capacity is full (requested_cold_tokens={}, inflight_cold_tokens={}, max_cold_tokens={}, inflight_cold_requests={}, max_cold_requests={}, inflight_requests={}, max_inflight_requests={})",
                 rejection.requested_cold_tokens,
                 rejection.current_cold_tokens,
                 rejection.max_cold_tokens,
                 rejection.current_cold_requests,
                 rejection.max_cold_requests,
+                rejection.current_inflight_requests,
+                rejection.max_inflight_requests,
             ),
         );
         if let Ok(value) =
@@ -2079,7 +2082,7 @@ mod tests {
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
-            prefill_admission: PrefillAdmissionController::new(0, 0, 0),
+            prefill_admission: PrefillAdmissionController::new(0, 0, 0, 0),
             prefill_admission_chars_per_token: 3.0,
             prefill_admission_retry_after_secs: 1,
         }
@@ -2205,7 +2208,7 @@ mod tests {
     #[tokio::test]
     async fn test_prefill_admission_returns_immediate_429_before_dispatch() {
         let mut router = create_test_pd_router();
-        router.prefill_admission = PrefillAdmissionController::new(1, 1, 1);
+        router.prefill_admission = PrefillAdmissionController::new(1, 1, 0, 1);
         router.prefill_admission_chars_per_token = 1.0;
         router.retry_config = RetryConfig {
             max_retries: 3,
@@ -2303,9 +2306,9 @@ mod tests {
     }
 
     #[test]
-    fn test_prefill_admission_falls_back_to_idle_dp_rank() {
+    fn test_prefill_admission_total_cap_falls_back_to_idle_dp_rank() {
         let mut router = create_test_pd_router();
-        router.prefill_admission = PrefillAdmissionController::new(100, 1, 1);
+        router.prefill_admission = PrefillAdmissionController::new(0, 0, 1, 1);
         router.prefill_admission_chars_per_token = 1.0;
 
         let prefill0: Arc<dyn Worker> = Arc::new(
@@ -2336,12 +2339,12 @@ mod tests {
 
         let _occupied = router
             .prefill_admission
-            .try_acquire(prefill0.url(), 50)
+            .try_acquire(prefill0.url(), 0)
             .unwrap();
         let mut selected = SelectedPDPair {
             prefill: Arc::clone(&prefill0),
             decode,
-            matched_chars: 0,
+            matched_chars: 50,
             publish_prefill_affinity_on_success: true,
         };
         let context = PDRequestContext {

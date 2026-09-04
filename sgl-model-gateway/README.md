@@ -167,6 +167,7 @@ admission budgets (both are disabled by default):
 --prefill-policy cache_aware \
 --pd-prefill-admission-max-cold-tokens 65536 \
 --pd-prefill-admission-max-cold-requests 2 \
+--pd-prefill-admission-max-inflight-requests 2 \
 --pd-prefill-admission-cold-request-threshold-tokens 8192 \
 --pd-prefill-admission-retry-after-secs 1
 ```
@@ -177,6 +178,10 @@ configured tokenizer (falling back to
 immediate `429 prefill_admission_limited` with `Retry-After`; it is neither
 queued nor sent to a prefill or decode worker. Reservations are released when
 the prefill side completes its KV-transfer handshake.
+`--pd-prefill-admission-max-inflight-requests` is an independent per-worker
+hard cap covering both predicted cache hits and cold requests. It bounds the
+backend queue even when the approximate cache-affinity tree overestimates the
+physical prefix cache.
 
 When one HTTP endpoint fronts multiple SGLang DP ranks, also pass `--dp-aware`.
 This expands the endpoint into one virtual worker per physical DP cache domain,

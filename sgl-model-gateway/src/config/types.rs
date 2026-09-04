@@ -51,6 +51,11 @@ pub struct RouterConfig {
     /// Per-prefill-worker long-cold-request budget. Zero disables it.
     #[serde(default)]
     pub pd_prefill_admission_max_cold_requests: usize,
+    /// Per-prefill-worker total in-flight request budget. This is independent
+    /// of cache-hit estimation and prevents stale affinity state from building
+    /// an unbounded backend prefill queue. Zero disables it.
+    #[serde(default)]
+    pub pd_prefill_admission_max_inflight_requests: usize,
     /// Only requests with at least this many estimated cold tokens count as long.
     #[serde(default)]
     pub pd_prefill_admission_cold_request_threshold_tokens: usize,
@@ -553,6 +558,7 @@ impl Default for RouterConfig {
             queue_timeout_secs: 60,
             pd_prefill_admission_max_cold_tokens: 0,
             pd_prefill_admission_max_cold_requests: 0,
+            pd_prefill_admission_max_inflight_requests: 0,
             pd_prefill_admission_cold_request_threshold_tokens: 0,
             pd_prefill_admission_chars_per_token: default_pd_prefill_admission_chars_per_token(),
             pd_prefill_admission_retry_after_secs: default_pd_prefill_admission_retry_after_secs(),

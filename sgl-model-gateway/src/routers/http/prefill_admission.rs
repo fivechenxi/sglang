@@ -20,12 +20,15 @@ pub struct Rejection {
     pub max_cold_tokens: usize,
     pub current_cold_requests: usize,
     pub max_cold_requests: usize,
+    pub current_inflight_requests: usize,
+    pub max_inflight_requests: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct WorkerState {
     cold_tokens: usize,
     cold_requests: usize,
+    inflight_requests: usize,
 }
 
 #[derive(Debug)]
@@ -33,6 +36,7 @@ pub struct Controller {
     workers: Mutex<HashMap<String, WorkerState>>,
     max_cold_tokens: usize,
     max_cold_requests: usize,
+    max_inflight_requests: usize,
     cold_request_threshold_tokens: usize,
 }
 
@@ -40,18 +44,20 @@ impl Controller {
     pub fn new(
         max_cold_tokens: usize,
         max_cold_requests: usize,
+        max_inflight_requests: usize,
         cold_request_threshold_tokens: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             workers: Mutex::new(HashMap::new()),
             max_cold_tokens,
             max_cold_requests,
+            max_inflight_requests,
             cold_request_threshold_tokens,
         })
     }
 
     pub fn enabled(&self) -> bool {
-        self.max_cold_tokens > 0 || self.max_cold_requests > 0
+        self.max_cold_tokens > 0 || self.max_cold_requests > 0 || self.max_inflight_requests > 0
     }
 
     pub fn try_acquire(
@@ -64,9 +70,12 @@ impl Controller {
         let state = workers.entry(worker_url.to_owned()).or_default();
         let next_tokens = state.cold_tokens.saturating_add(cold_tokens);
         let next_requests = state.cold_requests.saturating_add(usize::from(is_long));
+        let next_inflight_requests = state.inflight_requests.saturating_add(1);
 
         if (self.max_cold_tokens > 0 && next_tokens > self.max_cold_tokens)
             || (self.max_cold_requests > 0 && next_requests > self.max_cold_requests)
+            || (self.max_inflight_requests > 0
+                && next_inflight_requests > self.max_inflight_requests)
         {
             return Err(Rejection {
                 requested_cold_tokens: cold_tokens,
@@ -74,13 +83,21 @@ impl Controller {
                 max_cold_tokens: self.max_cold_tokens,
                 current_cold_requests: state.cold_requests,
                 max_cold_requests: self.max_cold_requests,
+                current_inflight_requests: state.inflight_requests,
+                max_inflight_requests: self.max_inflight_requests,
             });
         }
 
         state.cold_tokens = next_tokens;
         state.cold_requests = next_requests;
+        state.inflight_requests = next_inflight_requests;
         drop(workers);
-        publish(worker_url, next_tokens, next_requests);
+        publish(
+            worker_url,
+            next_tokens,
+            next_requests,
+            next_inflight_requests,
+        );
         counter!(
             "smg_pd_prefill_admission_total",
             "worker" => worker_url.to_owned(),
@@ -127,7 +144,7 @@ impl Controller {
     }
 }
 
-fn publish(worker_url: &str, cold_tokens: usize, cold_requests: usize) {
+fn publish(worker_url: &str, cold_tokens: usize, cold_requests: usize, inflight_requests: usize) {
     gauge!(
         "smg_pd_prefill_admission_inflight_cold_tokens",
         "worker" => worker_url.to_owned()
@@ -138,6 +155,11 @@ fn publish(worker_url: &str, cold_tokens: usize, cold_requests: usize) {
         "worker" => worker_url.to_owned()
     )
     .set(cold_requests as f64);
+    gauge!(
+        "smg_pd_prefill_admission_inflight_requests",
+        "worker" => worker_url.to_owned()
+    )
+    .set(inflight_requests as f64);
 }
 
 #[derive(Debug)]
@@ -163,9 +185,15 @@ impl Drop for Guard {
         if self.is_long {
             state.cold_requests = state.cold_requests.saturating_sub(1);
         }
+        state.inflight_requests = state.inflight_requests.saturating_sub(1);
         let state = *state;
         drop(workers);
-        publish(&self.worker_url, state.cold_tokens, state.cold_requests);
+        publish(
+            &self.worker_url,
+            state.cold_tokens,
+            state.cold_requests,
+            state.inflight_requests,
+        );
     }
 }
 
@@ -175,7 +203,7 @@ mod tests {
 
     #[test]
     fn rejects_atomically_and_releases_on_drop() {
-        let controller = Controller::new(1000, 1, 100);
+        let controller = Controller::new(1000, 1, 0, 100);
         let guard = controller.try_acquire("p0", 700).unwrap();
         let rejected = controller.try_acquire("p0", 301).unwrap_err();
         assert_eq!(rejected.current_cold_tokens, 700);
@@ -187,7 +215,7 @@ mod tests {
 
     #[test]
     fn budgets_are_per_prefill_worker() {
-        let controller = Controller::new(100, 0, 0);
+        let controller = Controller::new(100, 0, 0, 0);
         let _guard = controller.try_acquire("p0", 100).unwrap();
         assert!(controller.try_acquire("p0", 1).is_err());
         assert!(controller.try_acquire("p1", 100).is_ok());
@@ -195,11 +223,34 @@ mod tests {
 
     #[test]
     fn zero_cold_token_cache_hit_does_not_consume_long_request_slot() {
-        let controller = Controller::new(0, 1, 0);
+        let controller = Controller::new(0, 1, 0, 0);
         let _cold = controller.try_acquire("p0", 100).unwrap();
         let hit = controller.try_acquire("p0", 0).unwrap();
         assert_eq!(controller.snapshot("p0").cold_requests, 1);
         drop(hit);
         assert_eq!(controller.snapshot("p0").cold_requests, 1);
+    }
+
+    #[test]
+    fn total_request_budget_is_independent_of_cache_estimation() {
+        let controller = Controller::new(0, 0, 2, 0);
+        let cold = controller.try_acquire("p0", 100).unwrap();
+        let predicted_full_hit = controller.try_acquire("p0", 0).unwrap();
+
+        let rejected = controller.try_acquire("p0", 0).unwrap_err();
+        assert_eq!(rejected.current_inflight_requests, 2);
+        assert_eq!(rejected.max_inflight_requests, 2);
+
+        drop(predicted_full_hit);
+        assert!(controller.try_acquire("p0", 0).is_ok());
+        drop(cold);
+    }
+
+    #[test]
+    fn total_request_budget_remains_per_prefill_worker() {
+        let controller = Controller::new(0, 0, 1, 0);
+        let _p0 = controller.try_acquire("p0", 0).unwrap();
+        assert!(controller.try_acquire("p0", 0).is_err());
+        assert!(controller.try_acquire("p1", 0).is_ok());
     }
 }
