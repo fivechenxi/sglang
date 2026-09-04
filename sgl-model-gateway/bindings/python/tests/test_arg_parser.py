@@ -31,6 +31,8 @@ class TestRouterArgs:
         # Test PD-specific defaults
         assert args.prefill_policy is None
         assert args.decode_policy is None
+        assert args.pd_prefill_admission_max_cold_tokens == 0
+        assert args.pd_prefill_admission_max_cold_requests == 0
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -589,6 +591,28 @@ class TestParseRouterArgs:
         assert router_args.health_check_timeout_secs == 3
         assert router_args.health_check_interval_secs == 30
         assert router_args.health_check_endpoint == "/healthz"
+
+    def test_parse_pd_prefill_admission_args(self):
+        router_args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                "--pd-prefill-admission-max-cold-tokens",
+                "65536",
+                "--pd-prefill-admission-max-cold-requests",
+                "2",
+                "--pd-prefill-admission-cold-request-threshold-tokens",
+                "8192",
+                "--pd-prefill-admission-chars-per-token",
+                "2.5",
+                "--pd-prefill-admission-retry-after-secs",
+                "3",
+            ]
+        )
+        assert router_args.pd_prefill_admission_max_cold_tokens == 65536
+        assert router_args.pd_prefill_admission_max_cold_requests == 2
+        assert router_args.pd_prefill_admission_cold_request_threshold_tokens == 8192
+        assert router_args.pd_prefill_admission_chars_per_token == 2.5
+        assert router_args.pd_prefill_admission_retry_after_secs == 3
 
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""

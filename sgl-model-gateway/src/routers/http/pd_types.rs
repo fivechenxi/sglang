@@ -62,6 +62,29 @@ pub fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
+/// Generate a bootstrap room whose modulo selects `dp_rank`.
+///
+/// SGLang's `follow_bootstrap_room` policy routes a request to
+/// `bootstrap_room % dp_size`. A DP-aware external router must preserve that
+/// invariant when it also injects `routed_dp_rank`; otherwise the prefill
+/// worker rejects the transfer before any model work starts.
+pub fn generate_room_id_for_dp(dp_rank: usize, dp_size: usize) -> Option<u64> {
+    if dp_size == 0 || dp_rank >= dp_size {
+        return None;
+    }
+
+    let dp_rank = dp_rank as u64;
+    let dp_size = dp_size as u64;
+    let max_room = i64::MAX as u64;
+    loop {
+        let room = generate_room_id();
+        let aligned = room - (room % dp_size) + dp_rank;
+        if aligned <= max_room {
+            return Some(aligned);
+        }
+    }
+}
+
 /// PD-specific routing policies.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PDSelectionPolicy {

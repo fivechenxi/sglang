@@ -15,7 +15,10 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{
+    pd_types::api_path,
+    prefill_admission::{Controller as PrefillAdmissionController, Guard as AdmissionGuard},
+};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -44,9 +47,9 @@ use crate::{
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
+    tokenizer::registry::TokenizerRegistry,
 };
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -54,6 +57,22 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    prefill_admission: Arc<PrefillAdmissionController>,
+    prefill_admission_chars_per_token: f32,
+    prefill_admission_retry_after_secs: u64,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("retry_config", &self.retry_config)
+            .field("enable_igw", &self.enable_igw)
+            .field("prefill_admission", &self.prefill_admission)
+            .finish_non_exhaustive()
+    }
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -68,8 +87,17 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    input_tokens: Option<usize>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+#[derive(Debug)]
+struct SelectedPDPair {
+    prefill: Arc<dyn Worker>,
+    decode: Arc<dyn Worker>,
+    matched_chars: usize,
+    publish_prefill_affinity_on_success: bool,
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -80,6 +108,12 @@ struct PDRequestContext<'a> {
 /// transport failure can't be misattributed to a healthy prefill.
 #[derive(Clone, Copy)]
 struct BreakerOutcomesRecorded;
+
+/// Marks a local admission rejection so the generic worker retry policy does
+/// not consume it. Worker-originated 429 responses remain retryable; admission
+/// 429 responses must be returned immediately to the upstream gateway.
+#[derive(Debug, Clone, Copy)]
+struct PrefillAdmissionRejected;
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -185,7 +219,86 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            tokenizer_registry: Arc::clone(&ctx.tokenizer_registry),
+            prefill_admission: PrefillAdmissionController::new(
+                ctx.router_config.pd_prefill_admission_max_cold_tokens,
+                ctx.router_config.pd_prefill_admission_max_cold_requests,
+                ctx.router_config
+                    .pd_prefill_admission_cold_request_threshold_tokens,
+            ),
+            prefill_admission_chars_per_token: ctx
+                .router_config
+                .pd_prefill_admission_chars_per_token,
+            prefill_admission_retry_after_secs: ctx
+                .router_config
+                .pd_prefill_admission_retry_after_secs,
         })
+    }
+
+    fn estimate_token_count(&self, text: &str, model_id: Option<&str>) -> usize {
+        let tokenizer = model_id
+            .and_then(|model| self.tokenizer_registry.get(model))
+            .or_else(|| {
+                self.tokenizer_registry
+                    .list()
+                    .first()
+                    .map(|e| e.tokenizer.clone())
+            });
+        if let Some(tokenizer) = tokenizer {
+            if let Ok(encoding) = tokenizer.encode(text, false) {
+                return encoding.token_ids().len();
+            }
+        }
+
+        let chars = text.chars().count();
+        let chars_per_token = self.prefill_admission_chars_per_token.max(0.1) as f64;
+        (chars as f64 / chars_per_token).ceil() as usize
+    }
+
+    fn estimate_cold_tokens(
+        &self,
+        request_text: Option<&str>,
+        matched_chars: usize,
+        model_id: Option<&str>,
+        input_tokens: Option<usize>,
+    ) -> usize {
+        let Some(text) = request_text else {
+            return input_tokens.unwrap_or(0);
+        };
+        let input_chars = text.chars().count();
+        if input_chars == 0 {
+            return 0;
+        }
+        let total_tokens =
+            input_tokens.unwrap_or_else(|| self.estimate_token_count(text, model_id));
+        let matched_tokens =
+            total_tokens.saturating_mul(matched_chars.min(input_chars)) / input_chars;
+        total_tokens.saturating_sub(matched_tokens)
+    }
+
+    fn admission_rejected_response(
+        &self,
+        rejection: super::prefill_admission::Rejection,
+    ) -> Response {
+        let mut response = error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "prefill_admission_limited",
+            format!(
+                "Cold prefill capacity is full (requested_cold_tokens={}, inflight_cold_tokens={}, max_cold_tokens={}, inflight_cold_requests={}, max_cold_requests={})",
+                rejection.requested_cold_tokens,
+                rejection.current_cold_tokens,
+                rejection.max_cold_tokens,
+                rejection.current_cold_requests,
+                rejection.max_cold_requests,
+            ),
+        );
+        if let Ok(value) =
+            HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response.extensions_mut().insert(PrefillAdmissionRejected);
+        response
     }
 
     fn handle_server_selection_error(error: String) -> Response {
@@ -235,6 +348,28 @@ impl PDRouter {
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
+    fn generate_bootstrap_room(prefill_worker: &dyn Worker) -> Result<u64, String> {
+        match (prefill_worker.dp_rank(), prefill_worker.dp_size()) {
+            (Some(dp_rank), Some(dp_size)) => {
+                super::pd_types::generate_room_id_for_dp(dp_rank, dp_size).ok_or_else(|| {
+                    format!(
+                        "Invalid DP worker metadata for {}: dp_rank={}, dp_size={}",
+                        prefill_worker.url(),
+                        dp_rank,
+                        dp_size
+                    )
+                })
+            }
+            (None, None) => Ok(super::pd_types::generate_room_id()),
+            (dp_rank, dp_size) => Err(format!(
+                "Incomplete DP worker metadata for {}: dp_rank={:?}, dp_size={:?}",
+                prefill_worker.url(),
+                dp_rank,
+                dp_size
+            )),
+        }
+    }
+
     fn inject_bootstrap_into_value(
         mut original: Value,
         prefill_worker: &dyn Worker,
@@ -251,7 +386,7 @@ impl PDRouter {
             for _ in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+                rooms.push(Self::generate_bootstrap_room(prefill_worker)?);
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -289,7 +424,7 @@ impl PDRouter {
             );
             obj.insert(
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
+                Value::from(Self::generate_bootstrap_room(prefill_worker)?),
             );
         }
         Ok(original)
@@ -394,7 +529,7 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
-                        let (prefill, decode) = match self
+                        let mut selected = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
                                 context.model_id,
@@ -408,11 +543,26 @@ impl PDRouter {
                             }
                         };
 
+                        let admission_guard =
+                            match self.acquire_prefill_admission(&mut selected, &context) {
+                                Ok(guard) => guard,
+                                Err(rejection) => {
+                                    self.prefill_admission
+                                        .record_rejection(selected.prefill.url());
+                                    return self.admission_rejected_response(rejection);
+                                }
+                            };
+
+                        // Keep handles for outcome accounting after the typed
+                        // selection bundle is moved into the dispatcher.
+                        let prefill = Arc::clone(&selected.prefill);
+                        let decode = Arc::clone(&selected.decode);
+
                         debug!(
                             "PD retry attempt {} using prefill={} decode={}",
                             attempt,
-                            prefill.url(),
-                            decode.url()
+                            selected.prefill.url(),
+                            selected.decode.url()
                         );
 
                         let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
@@ -435,8 +585,8 @@ impl PDRouter {
                                 headers,
                                 json_request,
                                 context,
-                                Arc::clone(&prefill),
-                                Arc::clone(&decode),
+                                selected,
+                                admission_guard,
                                 start_time,
                             )
                             .await;
@@ -480,7 +630,10 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| is_retryable_status(res.status()),
+            |res, _attempt| {
+                res.extensions().get::<PrefillAdmissionRejected>().is_none()
+                    && is_retryable_status(res.status())
+            },
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -505,7 +658,12 @@ impl PDRouter {
                 endpoint,
                 duration,
             );
-        } else if !is_retryable_status(response.status()) {
+        } else if response
+            .extensions()
+            .get::<PrefillAdmissionRejected>()
+            .is_some()
+            || !is_retryable_status(response.status())
+        {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_PD,
@@ -648,10 +806,16 @@ impl PDRouter {
         headers: Option<&HeaderMap>,
         json_request: Value,
         context: PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
+        selected: SelectedPDPair,
+        admission_guard: Option<AdmissionGuard>,
         _start_time: Instant,
     ) -> Response {
+        let SelectedPDPair {
+            prefill,
+            decode,
+            publish_prefill_affinity_on_success,
+            ..
+        } = selected;
         // For non-streaming: use guard for automatic load management
         // For streaming: load will be managed in create_streaming_response
         let _prefill_guard =
@@ -736,6 +900,9 @@ impl PDRouter {
         };
 
         if prefill_failed {
+            // P has stopped doing request-side work; release capacity before
+            // shaping/reading the error response.
+            drop(admission_guard);
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
@@ -765,6 +932,26 @@ impl PDRouter {
             response.extensions_mut().insert(BreakerOutcomesRecorded);
             return response;
         }
+
+        // Publish cache affinity only after P has successfully completed. An
+        // admitted-but-inflight request is not a cache hit yet; publishing it
+        // early would let a concurrent retry bypass the cold-token budget.
+        if publish_prefill_affinity_on_success {
+            if let (Some(text), Some(policy)) = (
+                context.request_text.as_deref(),
+                self.policy_registry
+                    .get_prefill_policy()
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>(),
+            ) {
+                policy.record_selected_request(prefill.as_ref(), text);
+            }
+        }
+
+        // P has finished its request-side work, including the KV transfer
+        // handshake. Release after publishing the now-valid cache affinity and
+        // do not hold cold-prefill capacity for the remainder of decode.
+        drop(admission_guard);
 
         // Prefill ok: take decode's result, awaiting it if still pending.
         let decode_result = match decode_early {
@@ -944,7 +1131,133 @@ impl PDRouter {
     fn policies_need_request_text(&self) -> bool {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
-        prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+        self.prefill_admission.enabled()
+            || prefill_policy.needs_request_text()
+            || decode_policy.needs_request_text()
+    }
+
+    fn prefill_cache_identity_is_stable(worker: &dyn Worker) -> bool {
+        if worker.dp_rank().is_some() && worker.dp_size().is_some() {
+            return true;
+        }
+
+        worker
+            .metadata()
+            .labels
+            .get("dp_size")
+            .and_then(|value| value.parse::<usize>().ok())
+            == Some(1)
+    }
+
+    fn acquire_prefill_admission(
+        &self,
+        selected: &mut SelectedPDPair,
+        context: &PDRequestContext<'_>,
+    ) -> Result<Option<AdmissionGuard>, super::prefill_admission::Rejection> {
+        if !self.prefill_admission.enabled() {
+            return Ok(None);
+        }
+
+        // A cache entry is meaningful only inside the physical P-DP cache
+        // domain that created it. If an aggregate worker hides multiple ranks,
+        // fail closed and charge the whole request as cold.
+        let matched_chars = if Self::prefill_cache_identity_is_stable(selected.prefill.as_ref()) {
+            selected.matched_chars
+        } else {
+            0
+        };
+        let cold_tokens = self.estimate_cold_tokens(
+            context.request_text.as_deref(),
+            matched_chars,
+            context.model_id,
+            context.input_tokens,
+        );
+        match self
+            .prefill_admission
+            .try_acquire(selected.prefill.url(), cold_tokens)
+        {
+            Ok(guard) => Ok(Some(guard)),
+            Err(primary_rejection) => {
+                // Continue below: a full preferred cache domain must not hide
+                // idle P-DPs behind an immediate 429.
+                for (worker, matched_chars) in self.alternative_prefill_candidates(
+                    context.request_text.as_deref(),
+                    context.model_id,
+                    selected.prefill.url(),
+                ) {
+                    let cold_tokens = self.estimate_cold_tokens(
+                        context.request_text.as_deref(),
+                        matched_chars,
+                        context.model_id,
+                        context.input_tokens,
+                    );
+                    if let Ok(guard) = self
+                        .prefill_admission
+                        .try_acquire(worker.url(), cold_tokens)
+                    {
+                        selected.prefill = worker;
+                        selected.matched_chars = matched_chars;
+                        self.prefill_admission
+                            .record_reroute(selected.prefill.url());
+                        return Ok(Some(guard));
+                    }
+                }
+                Err(primary_rejection)
+            }
+        }
+    }
+
+    fn prefill_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
+        let effective_model_id = if self.enable_igw { model_id } else { None };
+        if let Some(model) = effective_model_id {
+            self.worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|worker| matches!(worker.worker_type(), WorkerType::Prefill { .. }))
+                .cloned()
+                .collect()
+        } else {
+            self.worker_registry.get_prefill_workers()
+        }
+    }
+
+    fn alternative_prefill_candidates(
+        &self,
+        request_text: Option<&str>,
+        model_id: Option<&str>,
+        selected_url: &str,
+    ) -> Vec<(Arc<dyn Worker>, usize)> {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let cache_policy = prefill_policy
+            .as_any()
+            .downcast_ref::<crate::policies::CacheAwarePolicy>();
+
+        let mut candidates: Vec<_> = self
+            .prefill_workers(model_id)
+            .into_iter()
+            .filter(|worker| worker.is_available() && worker.url() != selected_url)
+            .map(|worker| {
+                let matched_chars = if Self::prefill_cache_identity_is_stable(worker.as_ref()) {
+                    request_text
+                        .zip(cache_policy)
+                        .map(|(text, policy)| {
+                            policy.preview_matched_chars_for_worker(worker.as_ref(), text)
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                (worker, matched_chars)
+            })
+            .collect();
+
+        candidates.sort_by(|(left_worker, left_match), (right_worker, right_match)| {
+            right_match
+                .cmp(left_match)
+                .then_with(|| left_worker.load().cmp(&right_worker.load()))
+                .then_with(|| left_worker.url().cmp(right_worker.url()))
+        });
+        candidates
     }
 
     /// Builds the text used for cache-aware routing of a chat request.
@@ -974,7 +1287,7 @@ impl PDRouter {
         request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
+    ) -> Result<SelectedPDPair, String> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         debug!(
@@ -982,16 +1295,7 @@ impl PDRouter {
             self.enable_igw, model_id, effective_model_id
         );
 
-        let prefill_workers = if let Some(model) = effective_model_id {
-            self.worker_registry
-                .get_by_model(model)
-                .iter()
-                .filter(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }))
-                .cloned()
-                .collect()
-        } else {
-            self.worker_registry.get_prefill_workers()
-        };
+        let prefill_workers = self.prefill_workers(model_id);
 
         let decode_workers = if let Some(model) = effective_model_id {
             self.worker_registry
@@ -1012,15 +1316,40 @@ impl PDRouter {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let prefill = Self::pick_worker_by_policy_arc(
-            &prefill_workers,
-            &*prefill_policy,
-            request_text,
-            headers,
-            hash_ring.clone(),
-            "prefill",
-        )
-        .await?;
+        // Cache-aware PD selection is two-phase: preview without mutation, then
+        // record only after admission accepts the request. Otherwise a rejected
+        // request would look fully cached on its next attempt.
+        let preview = self
+            .prefill_admission
+            .enabled()
+            .then_some(())
+            .and_then(|_| {
+                prefill_policy
+                    .as_any()
+                    .downcast_ref::<crate::policies::CacheAwarePolicy>()
+                    .and_then(|policy| {
+                        request_text.and_then(|text| policy.preview_worker(&prefill_workers, text))
+                    })
+            });
+
+        let (prefill, matched_chars, defer_affinity_record) = if let Some((idx, matched)) = preview
+        {
+            (prefill_workers[idx].clone(), matched, true)
+        } else {
+            (
+                Self::pick_worker_by_policy_arc(
+                    &prefill_workers,
+                    &*prefill_policy,
+                    request_text,
+                    headers,
+                    hash_ring.clone(),
+                    "prefill",
+                )
+                .await?,
+                0,
+                false,
+            )
+        };
 
         let decode = Self::pick_worker_by_policy_arc(
             &decode_workers,
@@ -1047,7 +1376,12 @@ impl PDRouter {
             decode_policy.name(),
         );
 
-        Ok((prefill, decode))
+        Ok(SelectedPDPair {
+            prefill,
+            decode,
+            matched_chars,
+            publish_prefill_affinity_on_success: defer_affinity_record,
+        })
     }
 
     async fn pick_worker_by_policy_arc(
@@ -1461,7 +1795,9 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
+        let SelectedPDPair {
+            prefill, decode, ..
+        } = match self.select_pd_pair(None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1575,6 +1911,10 @@ impl RouterTrait for PDRouter {
         };
 
         let batch_size = Self::get_generate_batch_size(body);
+        let input_tokens = body.input_ids.as_ref().map(|ids| match ids {
+            InputIds::Single(tokens) => tokens.len(),
+            InputIds::Batch(batches) => batches.iter().map(Vec::len).sum(),
+        });
 
         let context = PDRequestContext {
             route: "/generate",
@@ -1582,6 +1922,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            input_tokens,
             model_id,
             headers: headers.cloned(),
         };
@@ -1613,6 +1954,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            input_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1632,7 +1974,9 @@ impl RouterTrait for PDRouter {
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),
-                StringOrArray::Array(v) => v.first().map(|s| s.to_string()),
+                // A completion batch is dispatched as one unit, so admission
+                // must account for every prompt rather than only the first.
+                StringOrArray::Array(v) => (!v.is_empty()).then(|| v.join("\n")),
             }
         } else {
             None
@@ -1647,6 +1991,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            input_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1673,6 +2018,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            input_tokens: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1715,6 +2061,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
@@ -1730,6 +2078,10 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            prefill_admission: PrefillAdmissionController::new(0, 0, 0),
+            prefill_admission_chars_per_token: 3.0,
+            prefill_admission_retry_after_secs: 1,
         }
     }
 
@@ -1739,6 +2091,22 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_cold_token_estimate_accounts_for_prefix_match() {
+        let mut router = create_test_pd_router();
+        router.prefill_admission_chars_per_token = 1.0;
+
+        assert_eq!(
+            router.estimate_cold_tokens(Some("abcdefgh"), 6, None, None),
+            2
+        );
+        assert_eq!(
+            router.estimate_cold_tokens(Some("abcdefgh"), 4, None, Some(100)),
+            50
+        );
+        assert_eq!(router.estimate_cold_tokens(None, 0, None, Some(128)), 128);
     }
 
     #[test]
@@ -1818,7 +2186,7 @@ mod tests {
         let result = router.select_pd_pair(None, None, None).await;
 
         assert!(result.is_ok());
-        let (prefill, _decode) = result.unwrap();
+        let SelectedPDPair { prefill, .. } = result.unwrap();
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
@@ -1832,6 +2200,62 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[tokio::test]
+    async fn test_prefill_admission_returns_immediate_429_before_dispatch() {
+        let mut router = create_test_pd_router();
+        router.prefill_admission = PrefillAdmissionController::new(1, 1, 1);
+        router.prefill_admission_chars_per_token = 1.0;
+        router.retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 5_000,
+            max_backoff_ms: 5_000,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+
+        // These endpoints deliberately cannot serve requests. Receiving the
+        // local 429 proves admission happened before either HTTP dispatch.
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:9".to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:10".to_string(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "this is cold"}],
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .expect("valid chat request");
+
+        let started = Instant::now();
+        let response = router.route_chat(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "local admission 429 must bypass the generic 429 retry policy"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "prefill_admission_limited");
     }
 
     #[test]
@@ -1850,6 +2274,118 @@ mod tests {
             PDRouter::worker_endpoint_url(&worker, "/v1/models"),
             "http://prefill:30000/v1/models"
         );
+    }
+
+    #[test]
+    fn test_prefill_cache_identity_requires_a_physical_cache_domain() {
+        let aggregate = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .labels(HashMap::from([("dp_size".to_string(), "4".to_string())]))
+            .build();
+        assert!(!PDRouter::prefill_cache_identity_is_stable(&aggregate));
+
+        let single = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .labels(HashMap::from([("dp_size".to_string(), "1".to_string())]))
+            .build();
+        assert!(PDRouter::prefill_cache_identity_is_stable(&single));
+
+        let ranked = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        assert!(PDRouter::prefill_cache_identity_is_stable(&ranked));
+    }
+
+    #[test]
+    fn test_prefill_admission_falls_back_to_idle_dp_rank() {
+        let mut router = create_test_pd_router();
+        router.prefill_admission = PrefillAdmissionController::new(100, 1, 1);
+        router.prefill_admission_chars_per_token = 1.0;
+
+        let prefill0: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:30000", 0, 2)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .build(),
+        );
+        let prefill1: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://prefill:30000", 1, 2)
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(8998),
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://decode:30000", 0, 2)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        prefill0.set_healthy(true);
+        prefill1.set_healthy(true);
+        decode.set_healthy(true);
+        router.worker_registry.register(Arc::clone(&prefill0));
+        router.worker_registry.register(Arc::clone(&prefill1));
+        router.worker_registry.register(Arc::clone(&decode));
+
+        let _occupied = router
+            .prefill_admission
+            .try_acquire(prefill0.url(), 50)
+            .unwrap();
+        let mut selected = SelectedPDPair {
+            prefill: Arc::clone(&prefill0),
+            decode,
+            matched_chars: 0,
+            publish_prefill_affinity_on_success: true,
+        };
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: false,
+            return_logprob: false,
+            request_text: Some("x".repeat(50)),
+            input_tokens: Some(50),
+            model_id: None,
+            headers: None,
+        };
+
+        let fallback_guard = router
+            .acquire_prefill_admission(&mut selected, &context)
+            .expect("an idle P-DP should accept the request")
+            .expect("admission is enabled");
+        assert_eq!(selected.prefill.url(), prefill1.url());
+        drop(fallback_guard);
+    }
+
+    #[test]
+    fn test_dp_aware_bootstrap_rooms_follow_selected_prefill_rank() {
+        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        let single =
+            PDRouter::inject_bootstrap_into_value(json!({"prompt": "single"}), &prefill, None)
+                .unwrap();
+        let room = single["bootstrap_room"].as_u64().unwrap();
+        assert_eq!(room % 4, 2);
+
+        let batch = PDRouter::inject_bootstrap_into_value(
+            json!({"prompt": ["a", "b", "c"]}),
+            &prefill,
+            Some(3),
+        )
+        .unwrap();
+        let rooms = batch["bootstrap_room"].as_array().unwrap();
+        assert_eq!(rooms.len(), 3);
+        assert!(rooms.iter().all(|room| room.as_u64().unwrap() % 4 == 2));
     }
 
     #[tokio::test]
