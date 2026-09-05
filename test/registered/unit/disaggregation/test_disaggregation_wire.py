@@ -1,10 +1,13 @@
+import threading
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+import zmq
 
-from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
@@ -96,6 +99,45 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestMooncakeMetadataSendFailure(unittest.TestCase):
+    class _FailingSocket:
+        def send_multipart(self, _parts):
+            raise zmq.Again()
+
+    def test_send_timeout_marks_request_failed_instead_of_blocking_scheduler(self):
+        failures = []
+        statuses = []
+        mgr = SimpleNamespace(
+            enable_staging=False,
+            local_ip="127.0.0.1",
+            rank_port=12345,
+            record_failure=lambda room, reason: failures.append((room, reason)),
+            update_status=lambda room, status: statuses.append((room, status)),
+        )
+        receiver = object.__new__(MooncakeKVReceiver)
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_infos = [
+            {"rank_ip": "127.0.0.2", "rank_port": 23456, "is_dummy": False}
+        ]
+        receiver.kv_mgr = mgr
+        receiver.session_id = "127.0.0.1:34567"
+        receiver.required_dst_info_num = 1
+        receiver.init_time = None
+        receiver.conclude_state = None
+        receiver._connect_to_bootstrap_server = lambda _info: (
+            self._FailingSocket(),
+            threading.Lock(),
+        )
+
+        receiver.send_metadata(np.array([1, 2], dtype=np.int32), aux_index=0)
+
+        self.assertEqual(receiver.conclude_state, KVPoll.Failed)
+        self.assertEqual(statuses, [(7, KVPoll.Failed)])
+        self.assertEqual(failures[0][0], 7)
+        self.assertIn("send_metadata to prefill", failures[0][1])
+        self.assertIsNone(receiver.init_time)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
