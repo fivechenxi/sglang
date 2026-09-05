@@ -229,6 +229,25 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_prefill_admission(
+        mut self,
+        max_cold_tokens: usize,
+        max_cold_requests: usize,
+        max_inflight_requests: usize,
+        cold_request_threshold_tokens: usize,
+        chars_per_token: f32,
+        retry_after_secs: u64,
+    ) -> Self {
+        self.config.pd_prefill_admission_max_cold_tokens = max_cold_tokens;
+        self.config.pd_prefill_admission_max_cold_requests = max_cold_requests;
+        self.config.pd_prefill_admission_max_inflight_requests = max_inflight_requests;
+        self.config
+            .pd_prefill_admission_cold_request_threshold_tokens = cold_request_threshold_tokens;
+        self.config.pd_prefill_admission_chars_per_token = chars_per_token;
+        self.config.pd_prefill_admission_retry_after_secs = retry_after_secs;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self

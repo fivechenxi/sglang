@@ -171,6 +171,22 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_counter!(
+        "smg_pd_prefill_admission_total",
+        "PD cold-prefill admission decisions per prefill worker"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight_cold_tokens",
+        "Estimated in-flight cold prefill tokens per prefill worker"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight_cold_requests",
+        "In-flight long cold prefill requests per prefill worker"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_inflight_requests",
+        "All in-flight prefill requests per prefill worker"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(

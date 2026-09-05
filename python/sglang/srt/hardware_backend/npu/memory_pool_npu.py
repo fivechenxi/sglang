@@ -289,6 +289,11 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    @property
+    def supports_cpu_offload(self) -> bool:
+        # The packed C8 layout cannot use the inherited BF16 K/V host-copy
+        # representation. Decode retraction must rebootstrap from Prefill.
+        return not self.sfa_c8_enabled
 
     def __init__(
         self,
@@ -533,8 +538,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     for i in range(self.indexer_layer_num)
                 ]
                 kv_data_lens += [
-                    self.index_k_buffer[i].nbytes
-                    for i in range(self.indexer_layer_num)
+                    self.index_k_buffer[i].nbytes for i in range(self.indexer_layer_num)
                 ]
                 kv_item_lens += [
                     self.index_k_buffer[i][0].nbytes
@@ -547,11 +551,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.layer_num,
                 self.packed_kv_buffer[0][0].nbytes,
                 self.indexer_layer_num,
-                (
-                    self.index_k_buffer[0][0].nbytes
-                    if self.indexer_layer_num > 0
-                    else 0
-                ),
+                (self.index_k_buffer[0][0].nbytes if self.indexer_layer_num > 0 else 0),
                 len(kv_data_ptrs),
             )
             return kv_data_ptrs, kv_data_lens, kv_item_lens

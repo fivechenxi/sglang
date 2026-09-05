@@ -201,6 +201,18 @@ class Router:
             If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        pd_prefill_admission_max_cold_tokens: Per-prefill-worker in-flight cold-token budget;
+            0 disables the token budget. Default: 0
+        pd_prefill_admission_max_cold_requests: Per-prefill-worker in-flight long-cold-request
+        pd_prefill_admission_max_inflight_requests: Per-prefill-worker total in-flight request
+            budget independent of cache-hit estimation; 0 disables.
+            budget; 0 disables the request budget. Default: 0
+        pd_prefill_admission_cold_request_threshold_tokens: Estimated cold-token threshold for
+            counting a request as long. Default: 0
+        pd_prefill_admission_chars_per_token: Fallback estimator used when no tokenizer is
+            available. Default: 3.0
+        pd_prefill_admission_retry_after_secs: Retry-After value for fail-fast admission 429s.
+            Default: 1
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None

@@ -478,6 +478,31 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
 
+    def test_sfa_c8_auto_retract_rebootstraps_without_cpu_offload(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
+            supports_cpu_offload=False
+        )
+        req = SimpleNamespace(
+            output_ids=[10, 11, 12],
+            time_stats=MagicMock(),
+        )
+
+        self.assertTrue(scheduler._decode_retract_requires_rebootstrap())
+        scheduler._requeue_retracted_req(req, rebootstrap=True)
+
+        scheduler._add_request_to_queue.assert_not_called()
+        scheduler.disagg_decode_prealloc_queue.add.assert_called_once_with(
+            req, is_rebootstrap=True
+        )
+        self.assertEqual(req.output_ids, [10, 11])
+        self.assertEqual(req.pd_rebootstrap_forced_output_id, 12)
+        self.assertTrue(req.pd_rebootstrap_in_progress)
+        req.time_stats.set_retract_time.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

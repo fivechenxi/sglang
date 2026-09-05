@@ -49,6 +49,12 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    pd_prefill_admission_max_cold_tokens: int = 0
+    pd_prefill_admission_max_cold_requests: int = 0
+    pd_prefill_admission_max_inflight_requests: int = 0
+    pd_prefill_admission_cold_request_threshold_tokens: int = 0
+    pd_prefill_admission_chars_per_token: float = 3.0
+    pd_prefill_admission_retry_after_secs: int = 1
 
     # Routing policy
     policy: str = "cache_aware"
@@ -382,6 +388,42 @@ class RouterArgs:
             f"--{prefix}pd-disaggregation",
             action="store_true",
             help="Enable PD (Prefill-Decode) disaggregated mode",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-max-cold-tokens",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_max_cold_tokens,
+            help="Per-prefill-worker in-flight cold-token budget (0 disables)",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-max-cold-requests",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_max_cold_requests,
+            help="Per-prefill-worker in-flight long-cold-request budget (0 disables)",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-max-inflight-requests",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_max_inflight_requests,
+            help="Per-prefill-worker total in-flight request budget (0 disables)",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-cold-request-threshold-tokens",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_cold_request_threshold_tokens,
+            help="Estimated cold-token threshold used by the request-count budget",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-chars-per-token",
+            type=float,
+            default=RouterArgs.pd_prefill_admission_chars_per_token,
+            help="Fallback token estimator used only when the tokenizer is unavailable",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-prefill-admission-retry-after-secs",
+            type=int,
+            default=RouterArgs.pd_prefill_admission_retry_after_secs,
+            help="Retry-After value on prefill admission 429 responses",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",
