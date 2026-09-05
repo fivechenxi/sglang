@@ -483,8 +483,8 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
-        scheduler.token_to_kv_pool_allocator.get_kvcache.return_value = (
-            SimpleNamespace(supports_cpu_offload=False)
+        scheduler.token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
+            supports_cpu_offload=False
         )
         req = SimpleNamespace(
             output_ids=[10, 11, 12],

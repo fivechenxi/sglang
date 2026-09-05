@@ -3193,9 +3193,7 @@ class Scheduler(
             logger.warning(msg_prefix + msg_details)
 
             for req in retracted_reqs:
-                self._requeue_retracted_req(
-                    req, rebootstrap=rebootstrap_retracted
-                )
+                self._requeue_retracted_req(req, rebootstrap=rebootstrap_retracted)
         else:
             self.new_token_ratio_tracker.decay_step()
 
