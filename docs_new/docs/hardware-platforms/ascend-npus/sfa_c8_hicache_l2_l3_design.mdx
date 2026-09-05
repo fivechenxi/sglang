@@ -1,0 +1,360 @@
+---
+title: "SFA C8 HiCache L2/L3 Design"
+description: "Design for preserving GLM-5.2 packed SFA C8 cache across host HiCache and Mooncake storage on Ascend."
+---
+
+# SFA C8 HiCache L2/L3 Design
+
+Status: design proposal; no runtime implementation is included in this change.
+
+Baseline: `glm52-910b-w4a8c8-sfa-c8-pd-20260905`
+(`bcd4b0a39ced7293c7005c63684f8677170ed2a8`).
+
+## Motivation
+
+The current Ascend GLM-5.2 deployment keeps the main SFA cache in its native
+packed C8 representation and transfers that representation between Prefill and
+Decode workers. This nearly doubles device-cache capacity, but Prefill workers
+still have only their local L1 radix cache. Once an entry is evicted, or a
+session lands on another Prefill DP rank, the prefix is recomputed. Cold long
+prefills then reduce cache-hit ratio and can head-of-line block short requests.
+
+Existing Ascend HiCache cannot be enabled safely for this layout. Its MLA host
+pool and `kernel_ascend` copy path expect separate BF16 `k_buffer`, `v_buffer`,
+and indexer tensors. SFA C8 instead owns:
+
+- 78 packed main-cache layers, each token stored as 656 opaque bytes; and
+- 21 physical Lightning Indexer layers, each token stored as 128 BF16 values.
+
+Treating the packed bytes as ordinary K/V would either expand C8 to BF16,
+transfer the wrong layout, or publish a prefix whose indexer sidecar is absent.
+The design therefore keeps the representation opaque through every cache tier.
+
+## Goals
+
+1. Add Prefill-side local host L2 for packed SFA C8 without BF16 expansion.
+2. Add Mooncake L3 so compatible Prefill replicas can reuse evicted prefixes.
+3. Keep one logical radix page and one validity decision across packed main KV
+   and the BF16 indexer sidecar.
+4. Preserve the current packed P-to-D transfer and Decode behavior.
+5. Fail closed on layout, topology, version, or partial-object mismatches.
+6. Provide enough metrics and fault injection to distinguish L1, L2, L3, and
+   recompute paths in production.
+
+## Non-goals
+
+- This phase does not enable Decode-side HiCache or change Decode retraction.
+- It does not change SFA quantization, QSFA kernels, MTP, graph capture, or the
+  current P-to-D Mooncake transfer protocol.
+- It does not initially deduplicate identical TP-rank cache shards.
+- It does not require direct NPU-to-L3 transfers. The first supported route is
+  NPU L1 to host L2 to Mooncake L3.
+- It does not change admission limits or scheduling policy.
+
+## Data layout and capacity
+
+The cache must remain byte-identical to the device representation:
+
+| Component | Layers | Per-token item | Per-token bytes per rank |
+| --- | ---: | ---: | ---: |
+| Packed SFA main cache | 78 | 656 bytes | 51,168 |
+| Lightning Indexer sidecar | 21 | 128 BF16 | 5,376 |
+| Total | | | 56,544 |
+
+At the current 128-token page size, one logical page contains 7,237,632 bytes
+(6.90234375 MiB) per rank. A host ratio of 2 over a 138,112-token device pool
+would require about 15.62 GB of host memory per rank. Startup must calculate
+this from the physical buffers rather than reuse the BF16 MLA formula.
+
+### Proposed host representation
+
+Use one logical host page index shared by two physical page-first pools:
+
+```text
+logical page id N
+  packed_main[N]: [78, 128, 1, 656] uint8/int8
+  indexer[N]:     [21, 128, 1, 128] bfloat16
+```
+
+The main and indexer tensors may be allocated separately, but allocation,
+freeing, publication, eviction, and lookup are atomic at the logical page
+level. A page is a hit only when both physical components are complete.
+
+This should reuse the existing multi-pool HiCache abstractions introduced for
+compressed DeepSeek V4 caches instead of adding another parallel cache stack:
+
+- `LogicalHostPool` owns logical page indices;
+- a generalized opaque paged host pool owns each physical component;
+- `HostPoolGroup` binds the components to the logical index;
+- `PoolTransfer` carries component-specific device/host indices; and
+- `PoolHitPolicy.ALL_PAGES` takes the minimum valid prefix across components.
+
+`DeepSeekV4PagedHostPool` should be generalized or have a shared base extracted;
+SFA C8 must not depend on a class whose contract is model-specific.
+
+## L1 to L2 transfer
+
+### Required behavior
+
+The transfer operation accepts page-aligned logical indices and performs two
+opaque copies:
+
+1. all 78 packed main-cache page rows; and
+2. all 21 physical indexer page rows.
+
+No dequantization, repacking, K/V split, or layer duplication is allowed. The
+first correctness implementation may use explicit tensor copies. The
+production path should add a dedicated Ascend page-copy operation that batches
+all owned layers and both components, because the existing
+`transfer_kv_dim_exchange` contract assumes separate BF16 K/V.
+
+The load path may expose per-layer completion events to overlap H2D with
+attention, but it publishes a radix hit only after both component transfers
+have succeeded. A failed or cancelled transfer frees the destination device
+and host pages and falls back to normal Prefill recomputation.
+
+### Proposed interfaces
+
+Add layout-neutral descriptors rather than branching on tensor names:
+
+```python
+@dataclass(frozen=True)
+class OpaquePageComponent:
+    name: PoolName
+    device_buffers: list[torch.Tensor]
+    item_bytes_per_page: int
+    required_for_hit: bool = True
+```
+
+The SFA C8 device pool exposes two components and remains the source of truth
+for shape, dtype, layer count, and page size. Host allocation derives from
+those descriptors. This avoids reconstructing the 656-byte contract in a
+second module.
+
+Expected integration points:
+
+- `python/sglang/srt/hardware_backend/npu/memory_pool_npu.py`: expose opaque
+  page components for the packed main cache and indexer sidecar;
+- `python/sglang/srt/mem_cache/memory_pool_host.py` or
+  `python/sglang/srt/mem_cache/pool_host/`: add a generic opaque paged host pool
+  and SFA C8 host-pool builder;
+- `python/sglang/srt/mem_cache/hiradix_cache.py`: select the grouped host pool
+  when the device pool has the SFA C8 layout;
+- `python/sglang/srt/managers/cache_controller.py`: transfer all required
+  components and commit validity atomically; and
+- `sgl-kernel-npu`: add the optimized packed-page D2H/H2D copy only after the
+  reference implementation passes correctness tests.
+
+`supports_cpu_offload` remains false until the complete L2 round trip is
+implemented and tested. Enabling L2 must not silently change Decode retract
+behavior.
+
+## L2 to L3 Mooncake storage
+
+Mooncake v2 already supports multiple `PoolTransfer` objects and multiple
+physical objects per logical page. Add stable pool names for the two SFA C8
+components, for example `sfa_c8_main` and `sfa_c8_indexer`.
+
+Each logical page is stored as two objects:
+
+```text
+<logical-hash>_<cache-identity>_<tp-rank>_sfa_c8_main
+<logical-hash>_<cache-identity>_<tp-rank>_sfa_c8_indexer
+```
+
+The first implementation stores one object per component per page. Page-first
+host layout makes each object a contiguous registered host range, so Mooncake
+can use zero-copy host I/O. The main object is 6,549,504 bytes and the indexer
+object is 688,128 bytes at page size 128.
+
+Mooncake group semantics should publish both objects under one logical group.
+Lookup returns a hit only when every required component exists for every page
+in the prefix. A partial group is treated as a miss and may be garbage
+collected asynchronously; it must never be loaded as a usable prefix.
+
+### Cache identity
+
+The storage namespace must include a deterministic identity covering at least:
+
+- model and tokenizer revisions;
+- SFA packed-layout version and quantization contract;
+- page size;
+- physical main/indexer layer ownership;
+- attention TP/CP topology and rank shard; and
+- framework compatibility version.
+
+An identity mismatch is a normal cache miss, not a best-effort decode. This is
+required for safe rolling upgrades and rollback.
+
+### TP-rank storage
+
+Phase one stores rank-specific objects. Before any deduplication, a test must
+compare packed-main and indexer checksums across all attention TP ranks for
+short, long, cached, and chunked prefills. Rank-zero-only storage is allowed
+only if byte identity and restore semantics are proven for the deployed
+topology; otherwise the conservative rank-specific format remains.
+
+## PD deployment scope
+
+Phase one enables L2/L3 only on Prefill workers:
+
+```text
+request -> PD Router -> Prefill L1
+                         | miss
+                         v
+                       host L2
+                         | miss
+                         v
+                     Mooncake L3
+                         | miss
+                         v
+                      recompute
+                         |
+                         v
+              existing packed C8 P-to-D transfer -> Decode
+```
+
+This directly addresses repeated Agent prefixes without coupling the first
+release to Decode cache lifecycle. The PD Router keeps DP cache affinity as the
+first choice. L3 is shared, so a request routed to another compatible Prefill
+DP can still recover the prefix after its local L1/L2 lookup misses.
+
+Decode-side L2 is a separate phase. It must not be enabled merely by flipping
+`supports_cpu_offload`, because Decode retraction, generated-token ownership,
+and rebootstrap semantics differ from Prefill prefix reuse.
+
+## State and failure semantics
+
+A logical page moves through these states:
+
+```text
+allocated -> copying -> complete -> published -> evictable
+                |           |
+                +-> failed <-+
+```
+
+- Only `complete` pages may become visible to the radix tree or Mooncake.
+- Completion covers both packed main and indexer components on every rank.
+- Cancellation during D2H/H2D/L3 I/O invalidates the destination page.
+- L3 timeout follows the configured HiCache timeout policy, then recomputes.
+- A Mooncake outage degrades to L2/L1/recompute and does not make Prefill
+  unhealthy.
+- Host OOM fails startup for explicitly configured L2 size; it must not shrink
+  silently to a capacity that invalidates planning.
+- Corrupt size, dtype, checksum, or identity metadata fails closed as a miss and
+  increments a dedicated error counter.
+
+## Configuration
+
+No new user-facing switch is required for the final implementation. The
+existing HiCache arguments should select the path based on the device-pool
+layout:
+
+```bash
+--enable-hierarchical-cache
+--hicache-size <validated-host-gb>
+--hicache-write-policy write_through_selective
+--hicache-load-back-threshold 8192
+--hicache-storage-backend mooncake       # phase two
+--hicache-storage-prefetch-policy timeout
+```
+
+Until each phase is implemented, startup validation remains fail-fast:
+
+- SFA C8 + L2 is rejected before the L2 implementation lands;
+- SFA C8 + Mooncake L3 is rejected before grouped storage is validated; and
+- Decode-side SFA C8 HiCache remains rejected in the Prefill-only phase.
+
+The existing selective-write and 8K load-back threshold are starting values,
+not release constants. They must be remeasured because C8 changes transfer
+bytes and the break-even point versus recomputation.
+
+## Observability
+
+Metrics must be split by cache tier and component:
+
+- lookup requests, hit tokens, miss tokens, and effective hit ratio for L1,
+  L2, and L3;
+- D2H, H2D, L3 read, and L3 write bytes and durations;
+- logical pages pending, complete, evicted, cancelled, and partially failed;
+- packed-main and indexer transfer failures;
+- fallback recompute tokens after L2/L3 timeout or corruption; and
+- host-pool used/total bytes plus Mooncake object and group failures.
+
+Logs for a sampled request should include the selected tier, logical page
+count, cache identity, and fallback reason. Logs must never include prompt
+contents, credentials, or raw cache bytes.
+
+## Verification plan
+
+### Unit and CPU-only tests
+
+1. Capacity and page-byte calculations use physical buffers and match 56,544
+   bytes per token per rank for the current model.
+2. Packed main and indexer pages survive byte-exact device-host-device reference
+   round trips.
+3. Logical allocation/free is shared across both physical components.
+4. Missing, short, corrupt, or wrong-version components produce a miss.
+5. Mooncake key expansion and pointer/size metadata produce exactly two objects
+   per page in a stable order.
+6. Cancellation and injected component failure never publish a partial page.
+7. Existing BF16 MLA, MHA, DeepSeek V4, MTP, and non-HiCache paths are unchanged.
+
+### Ascend integration matrix
+
+Run each stage in an isolated candidate deployment; do not mutate the running
+baseline.
+
+| Stage | L2 | L3 | PD | Required evidence |
+| --- | --- | --- | --- | --- |
+| A | on | off | off | byte checksums, logits, L1 eviction then L2 reload |
+| B | on | off | on, P only | packed P-to-D transfer after L2 reload |
+| C | on | Mooncake TCP | on, P only | cross-P-DP L3 hit and timeout fallback |
+| D | on | Mooncake RDMA | on, P only | bandwidth, tail latency, restart recovery |
+
+For every stage cover 1K, 8K, 16K, 64K, 126K, and at least one 200K prefix;
+chunked prefill; concurrent eviction; MTP3; graph decode; streaming; tool calls;
+client cancellation; and Prefill/Decode restart. Compare cold output, L1 hit,
+L2 hit, and L3 hit with fixed sampling. There must be no garbled text, repetition loop,
+missing answer, or token/logit divergence beyond the established C8 tolerance.
+
+### Performance acceptance
+
+- Cold/L1-miss throughput regression is at most 3% with L2 enabled.
+- L2 hit must beat recompute for the selected threshold and improve 16K+
+  prefix TTFT materially; otherwise the threshold is raised.
+- L3 hit must beat recompute at the validated prefix lengths, including P90
+  storage latency.
+- Decode P90 TPOT and output throughput regress by no more than 5% under mixed
+  traffic.
+- No increase in retract/rebootstrap failures, HCCL/Mooncake session loss, or
+  device OOM.
+- A two-hour real-profile replay and a 48-hour 2x replay complete with tiered
+  cache metrics and no cache-related correctness failures.
+
+## Delivery sequence
+
+1. Extract a generic opaque paged host-pool abstraction and add CPU-only tests.
+2. Implement packed main plus indexer L2 reference copies and atomic validity.
+3. Add the optimized Ascend transfer path and establish the new load-back
+   threshold with A/B tests.
+4. Enable Prefill-only L2 in isolated PD validation.
+5. Add Mooncake v2 component keys, group publication, identity checks, and TCP
+   fault tests.
+6. Validate RDMA, cross-P-DP reuse, observability, and long-running replay.
+7. Only after all gates pass, create a separate production rollout PR and keep
+   the current tagged baseline as the rollback target.
+
+## Open decisions requiring measurements
+
+- Whether packed cache bytes are identical across attention TP ranks and can be
+  deduplicated in L3.
+- Whether a fused two-component Ascend copy is faster than two independent
+  transfers at 8K, 64K, and 126K prefixes.
+- The C8 L2 load-back threshold and selective-write hit threshold.
+- Mooncake object sizing limits and whether 6.9 MiB logical pages should be
+  segmented while preserving group atomicity.
+- The host-memory budget per P process after HCCL/DeepEP runtime allocations.
+
+These are acceptance measurements, not assumptions to bake into the first
+implementation.
