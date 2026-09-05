@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -64,6 +64,49 @@ def _fetching_receiver(connection_pool):
 
 
 class TestReceiverConnectionPool(CustomTestCase):
+    @patch.object(CommonKVReceiver, "disconnect_endpoint")
+    def test_generation_change_invalidates_all_routes_for_prefill(
+        self, mock_disconnect
+    ):
+        stale_a = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        stale_b = [{"rank_ip": "10.0.0.1", "rank_port": 1002}]
+        retained = [{"rank_ip": "10.0.0.2", "rank_port": 2001}]
+        manager = object.__new__(CommonKVManager)
+        manager.connection_pool = {
+            "prefill:8998_0_0_0": stale_a,
+            "prefill:8998_0_0_1": stale_b,
+            "other:8998_0_0_0": retained,
+        }
+        manager.connection_lock = threading.Lock()
+        manager.bootstrap_generations = {"prefill:8998": "old:4"}
+
+        manager._observe_bootstrap_generation("prefill:8998", "new:4")
+
+        self.assertEqual(
+            manager.connection_pool, {"other:8998_0_0_0": retained}
+        )
+        self.assertEqual(manager.bootstrap_generations["prefill:8998"], "new:4")
+        self.assertCountEqual(
+            [call.args[0] for call in mock_disconnect.call_args_list],
+            ["tcp://10.0.0.1:1001", "tcp://10.0.0.1:1002"],
+        )
+
+    @patch.object(CommonKVReceiver, "disconnect_endpoint")
+    def test_same_or_initial_generation_keeps_cached_routes(self, mock_disconnect):
+        cached = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        manager = object.__new__(CommonKVManager)
+        manager.connection_pool = {"prefill:8998_0_0_0": cached}
+        manager.connection_lock = threading.Lock()
+        manager.bootstrap_generations = {}
+
+        manager._observe_bootstrap_generation("prefill:8998", "current:4")
+        manager._observe_bootstrap_generation("prefill:8998", "current:4")
+
+        self.assertEqual(
+            manager.connection_pool, {"prefill:8998_0_0_0": cached}
+        )
+        mock_disconnect.assert_not_called()
+
     def test_invalidate_removes_matching_generation(self):
         stale = [
             {"rank_ip": "10.0.0.1", "rank_port": 1001},

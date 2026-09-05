@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -213,6 +214,11 @@ class CommonKVManager(BaseKVManager):
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
+            # A bootstrap HTTP address can survive a prefill restart while the
+            # ephemeral per-rank ZMQ ports behind it change.  Track the server's
+            # route-table generation so heartbeat success cannot leave stale
+            # rank metadata cached indefinitely.
+            self.bootstrap_generations: Dict[str, str] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
@@ -899,6 +905,13 @@ class CommonKVManager(BaseKVManager):
                             headers={"Connection": "keep-alive"},
                         )
                         if response.status_code == 200:
+                            generation = response.headers.get(
+                                "X-SGLang-Bootstrap-Generation"
+                            )
+                            if generation:
+                                self._observe_bootstrap_generation(
+                                    bootstrap_addr, generation
+                                )
                             self.heartbeat_failures[bootstrap_addr] = 0
                             self._on_heartbeat_success(bootstrap_addr)
                         else:
@@ -931,6 +944,45 @@ class CommonKVManager(BaseKVManager):
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
+
+    def _observe_bootstrap_generation(
+        self, bootstrap_addr: str, generation: str
+    ) -> None:
+        previous_generation = self.bootstrap_generations.get(bootstrap_addr)
+        self.bootstrap_generations[bootstrap_addr] = generation
+        if previous_generation is None or previous_generation == generation:
+            return
+
+        with self.connection_lock:
+            keys_to_remove = [
+                key
+                for key in self.connection_pool
+                if key.startswith(bootstrap_addr)
+            ]
+            stale_endpoints = set()
+            for key in keys_to_remove:
+                for info in self.connection_pool[key]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        stale_endpoints.add(
+                            NetworkAddress(ip, int(port)).to_tcp()
+                        )
+            for key in keys_to_remove:
+                del self.connection_pool[key]
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
+
+        logger.warning(
+            "Prefill bootstrap generation changed for %s (%s -> %s); "
+            "invalidated %d cached route entries and %d ZMQ endpoints",
+            bootstrap_addr,
+            previous_generation,
+            generation,
+            len(keys_to_remove),
+            len(stale_endpoints),
+        )
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Handle failure of a prefill node."""
@@ -1490,6 +1542,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
+        self._instance_id = uuid.uuid4().hex
+        self._route_revision = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -1522,7 +1576,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.Response(
+            text="OK",
+            status=200,
+            headers={
+                "X-SGLang-Bootstrap-Generation": (
+                    f"{self._instance_id}:{self._route_revision}"
+                )
+            },
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1602,6 +1664,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
             self._registered_count += 1
+            self._route_revision += 1
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(
