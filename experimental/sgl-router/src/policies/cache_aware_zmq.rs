@@ -244,6 +244,35 @@ impl Policy for CacheAwareZmqPolicy {
         true
     }
 
+    fn estimated_cached_prefix_tokens(&self, worker: &Worker, ctx: &SelectionContext<'_>) -> usize {
+        let Some(tokens) = ctx.request_tokens().filter(|tokens| !tokens.is_empty()) else {
+            return 0;
+        };
+        let Some(block_size) = self.block_size_oracle.get() else {
+            return 0;
+        };
+        let block_hashes = if self.block_size_oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
+        };
+        if block_hashes.is_empty() {
+            return 0;
+        }
+        let matched = self.tree.match_prefix(None, &block_hashes);
+        if !matched
+            .workers
+            .iter()
+            .any(|cached_worker| cached_worker.url.as_str() == worker.url.as_str())
+        {
+            return 0;
+        }
+        matched
+            .matched_blocks
+            .saturating_mul(block_size as usize)
+            .min(tokens.len())
+    }
+
     fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
         let _ = self.metrics.set(metrics);
     }

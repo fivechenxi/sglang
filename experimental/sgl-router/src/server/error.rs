@@ -106,6 +106,15 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
+    /// Fail-fast PD admission rejection. This is emitted by the router before
+    /// either P or D is dispatched, allowing the upstream gateway to route the
+    /// request to another serving backend without accumulating local TTFT.
+    #[error("prefill admission limited for model {model}")]
+    PrefillAdmissionLimited {
+        model: String,
+        retry_after_secs: u64,
+    },
+
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -141,6 +150,9 @@ impl ApiError {
             ApiError::WorkerMisconfigured { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "worker_misconfigured")
             }
+            ApiError::PrefillAdmissionLimited { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "prefill_admission_limited")
+            }
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }
@@ -170,6 +182,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
         let typ = match status.as_u16() {
+            429 => "rate_limit_error",
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
@@ -245,6 +258,18 @@ impl IntoResponse for ApiError {
                 );
                 "service unavailable".to_string()
             }
+            ApiError::PrefillAdmissionLimited {
+                model,
+                retry_after_secs,
+            } => {
+                tracing::warn!(
+                    model = %model,
+                    retry_after_secs,
+                    reason = "prefill_admission_limited",
+                    "prefill admission rejected request before PD dispatch",
+                );
+                "prefill capacity is temporarily unavailable; retry on another backend".to_string()
+            }
             ApiError::BadRequest(_) | ApiError::ModelNotFound(_) => self.to_string(),
         };
         let mut resp = (
@@ -256,6 +281,14 @@ impl IntoResponse for ApiError {
             .into_response();
         resp.headers_mut()
             .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        if let ApiError::PrefillAdmissionLimited {
+            retry_after_secs, ..
+        } = &self
+        {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut().insert("retry-after", value);
+            }
+        }
         resp
     }
 }
@@ -302,6 +335,24 @@ mod tests {
         let env: ErrEnv = serde_json::from_str(&body_str)
             .unwrap_or_else(|e| panic!("envelope did not match expected shape: {e}: {body_str}"));
         (status, code_header, env)
+    }
+
+    #[test]
+    fn prefill_admission_is_429_with_retry_metadata() {
+        let resp = ApiError::PrefillAdmissionLimited {
+            model: "tiny".into(),
+            retry_after_secs: 2,
+        }
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(X_ROUTER_ERROR_CODE).unwrap(),
+            "prefill_admission_limited"
+        );
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "2");
+        let body = collect_body(resp);
+        assert!(body.contains("\"type\":\"rate_limit_error\""));
+        assert!(body.contains("\"code\":\"prefill_admission_limited\""));
     }
 
     #[test]

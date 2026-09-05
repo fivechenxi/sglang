@@ -224,6 +224,14 @@ pub async fn chat_completions(
     } else {
         None
     };
+    // Evaluate the cache-directory estimate while `selection_ctx` may still
+    // borrow the original request headers through the sticky routing key.
+    // After this point the headers can be moved into the forwarded request.
+    let policy_cached_prefix_tokens = if worker.mode() == WorkerMode::Prefill {
+        policy.estimated_cached_prefix_tokens(&worker, &selection_ctx)
+    } else {
+        0
+    };
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {
@@ -269,6 +277,47 @@ pub async fn chat_completions(
         .as_ref()
         .map(|t| t.ids.len().max(1))
         .unwrap_or_else(|| estimate_prefill_tokens(&body));
+    // Admission applies only to PD prefill workers and happens before either
+    // side is dispatched. Cache-aware policy state gives a best-effort prefix
+    // hit for the selected worker; unknown/stale-negative state is treated as
+    // a miss so the gate fails conservatively. The guard moves into the
+    // detached P task below and is released when prefill + KV transfer ends.
+    let estimated_cached_tokens = if worker.mode() == WorkerMode::Prefill {
+        policy_cached_prefix_tokens.min(prefill_load)
+    } else {
+        0
+    };
+    let estimated_cold_tokens = prefill_load.saturating_sub(estimated_cached_tokens);
+    let prefill_admission_guard =
+        if worker.mode() == WorkerMode::Prefill && ctx.prefill_admission.enabled() {
+            match ctx.prefill_admission.try_acquire(
+                worker.id.clone(),
+                &worker.url,
+                estimated_cold_tokens,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(rejected) => {
+                    tracing::warn!(
+                        model = %model_str,
+                        worker = %worker.url,
+                        request_tokens = prefill_load,
+                        estimated_cached_tokens,
+                        estimated_cold_tokens,
+                        current_cold_tokens = rejected.current_cold_tokens,
+                        max_cold_tokens = ?rejected.max_cold_tokens,
+                        current_cold_requests = rejected.current_cold_requests,
+                        max_cold_requests = ?rejected.max_cold_requests,
+                        "rejecting request at cold-prefill admission before PD dispatch",
+                    );
+                    return Err(ApiError::PrefillAdmissionLimited {
+                        model: model_str,
+                        retry_after_secs: ctx.config.active_load.prefill_admission_retry_after_secs,
+                    });
+                }
+            }
+        } else {
+            None
+        };
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -403,7 +452,7 @@ pub async fn chat_completions(
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
-        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        let prefill_holds: (LoadGuard, _, _) = (guard, active_guard, prefill_admission_guard);
         tokio::spawn(async move {
             // The tuple binding extends both guards' lifetime to the
             // end of this async block, which lasts until the prefill

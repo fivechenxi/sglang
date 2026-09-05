@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::prefill_admission::PrefillAdmissionRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
@@ -24,6 +25,9 @@ pub struct AppContext {
     /// policy (which reads per-worker load when scoring candidates), and
     /// the stale-request janitor (which sweeps expired entries).
     pub active_load: Arc<ActiveLoadRegistry>,
+    /// Fail-fast PD prefill admission. Reservations are held by the detached
+    /// prefill task until prefill plus KV transfer finishes.
+    pub prefill_admission: Arc<PrefillAdmissionRegistry>,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the chat handler (requests_total),
     /// cache-aware-zmq policy (overlap_blocks), active-load registry
@@ -63,12 +67,14 @@ impl AppContext {
         policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
     ) -> Self {
+        let prefill_admission = PrefillAdmissionRegistry::from_config(&config.active_load);
         let metrics = MetricsRegistry::new();
         // Wire the per-worker active-load gauge so `sgl_router_active_load`
         // mirrors the live counter on every register / drop / sweep.
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
+        prefill_admission.attach_metrics(Arc::clone(&metrics));
         // Same rationale for the cache-aware-zmq policy's
         // `sgl_router_overlap_blocks`: the metrics registry is built here,
         // after the policy registry, so inject it now. No-op for policies
@@ -81,6 +87,7 @@ impl AppContext {
             registry,
             policies,
             active_load,
+            prefill_admission,
             metrics,
             ready: AtomicBool::new(false),
         }
@@ -126,6 +133,9 @@ impl AppContext {
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
+            prefill_admission: PrefillAdmissionRegistry::from_config(
+                &crate::config::ActiveLoadConfig::default(),
+            ),
             metrics: MetricsRegistry::new(),
             ready: AtomicBool::new(false),
         }
