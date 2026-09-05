@@ -1432,6 +1432,12 @@ class MooncakeKVManager(CommonKVManager):
                                 prefill_unique_rank,
                             )
                             if deferred:
+                                if retrying_failed_session:
+                                    # No transport was attempted. Release the
+                                    # single-flight retry lease and back off.
+                                    self._on_session_transfer_failure(
+                                        req.mooncake_session_id
+                                    )
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
