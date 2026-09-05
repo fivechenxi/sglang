@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+import uuid
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -213,6 +214,11 @@ class CommonKVManager(BaseKVManager):
             self.required_prefill_response_num_table: Dict[int, int] = {}
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
+            # A bootstrap HTTP address can survive a prefill restart while the
+            # ephemeral per-rank ZMQ ports behind it change.  Track the server's
+            # route-table generation so heartbeat success cannot leave stale
+            # rank metadata cached indefinitely.
+            self.bootstrap_generations: Dict[str, str] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
@@ -899,6 +905,13 @@ class CommonKVManager(BaseKVManager):
                             headers={"Connection": "keep-alive"},
                         )
                         if response.status_code == 200:
+                            generation = response.headers.get(
+                                "X-SGLang-Bootstrap-Generation"
+                            )
+                            if generation:
+                                self._observe_bootstrap_generation(
+                                    bootstrap_addr, generation
+                                )
                             self.heartbeat_failures[bootstrap_addr] = 0
                             self._on_heartbeat_success(bootstrap_addr)
                         else:
@@ -931,6 +944,41 @@ class CommonKVManager(BaseKVManager):
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
         pass
+
+    def _observe_bootstrap_generation(
+        self, bootstrap_addr: str, generation: str
+    ) -> None:
+        previous_generation = self.bootstrap_generations.get(bootstrap_addr)
+        self.bootstrap_generations[bootstrap_addr] = generation
+        if previous_generation is None or previous_generation == generation:
+            return
+
+        with self.connection_lock:
+            keys_to_remove = [
+                key for key in self.connection_pool if key.startswith(bootstrap_addr)
+            ]
+            stale_endpoints = set()
+            for key in keys_to_remove:
+                for info in self.connection_pool[key]:
+                    ip = info.get("rank_ip")
+                    port = info.get("rank_port")
+                    if ip and port:
+                        stale_endpoints.add(NetworkAddress(ip, int(port)).to_tcp())
+            for key in keys_to_remove:
+                del self.connection_pool[key]
+
+        for endpoint in stale_endpoints:
+            CommonKVReceiver.disconnect_endpoint(endpoint)
+
+        logger.warning(
+            "Prefill bootstrap generation changed for %s (%s -> %s); "
+            "invalidated %d cached route entries and %d ZMQ endpoints",
+            bootstrap_addr,
+            previous_generation,
+            generation,
+            len(keys_to_remove),
+            len(stale_endpoints),
+        )
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
         """Handle failure of a prefill node."""
@@ -1179,6 +1227,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
         self.abort_notified: bool = False
+        self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1225,7 +1274,10 @@ class CommonKVReceiver(BaseKVReceiver):
         for target_cp_rank in self.target_cp_ranks:
             bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
 
-            if bootstrap_key not in self.kv_mgr.connection_pool:
+            with self.kv_mgr.connection_lock:
+                cached_bootstrap_infos = self.kv_mgr.connection_pool.get(bootstrap_key)
+
+            if cached_bootstrap_infos is None:
                 bootstrap_infos = []
                 for target_tp_rank in self.target_tp_ranks:
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
@@ -1260,20 +1312,42 @@ class CommonKVReceiver(BaseKVReceiver):
                                 self.bootstrap_room, KVPoll.Failed
                             )
                             self.bootstrap_infos = None
+                            self.invalidate_cached_bootstrap_infos()
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
+                self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+                # Register kv_args only once to prefill KVManager according to the info fetched
+                # from the bootstrap server. Do this before caching in connection_pool so a failed
+                # registration does not leave a stale entry that later requests would reuse.
+                if not self._register_kv_args():
+                    self.invalidate_cached_bootstrap_infos()
+                    return
+
+                with self.kv_mgr.connection_lock:
+                    cached_bootstrap_infos = self.kv_mgr.connection_pool.setdefault(
+                        bootstrap_key, self.bootstrap_infos
+                    )
+
+                if cached_bootstrap_infos is not self.bootstrap_infos:
+                    self.bootstrap_infos = cached_bootstrap_infos
             else:
-                self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
+                self.bootstrap_infos = cached_bootstrap_infos
+
+            self._connection_pool_entries[bootstrap_key] = self.bootstrap_infos
 
             assert len(self.bootstrap_infos) > 0
             all_bootstrap_infos.extend(self.bootstrap_infos)
 
         self.bootstrap_infos = all_bootstrap_infos
+
+    def invalidate_cached_bootstrap_infos(self) -> None:
+        with self.kv_mgr.connection_lock:
+            for bootstrap_key, bootstrap_infos in self._connection_pool_entries.items():
+                if self.kv_mgr.connection_pool.get(bootstrap_key) is bootstrap_infos:
+                    del self.kv_mgr.connection_pool[bootstrap_key]
+            self._connection_pool_entries.clear()
 
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
@@ -1326,6 +1400,11 @@ class CommonKVReceiver(BaseKVReceiver):
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
@@ -1352,8 +1431,8 @@ class CommonKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
-    def _register_kv_args(self):
-        pass
+    def _register_kv_args(self) -> bool:
+        return True
 
     def send_metadata(
         self,
@@ -1380,6 +1459,7 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.invalidate_cached_bootstrap_infos()
         if (
             not self.abort_notified
             and hasattr(self, "bootstrap_infos")
@@ -1458,6 +1538,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
         self._registered_count = 0
+        self._instance_id = uuid.uuid4().hex
+        self._route_revision = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
@@ -1490,7 +1572,15 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.Response(
+            text="OK",
+            status=200,
+            headers={
+                "X-SGLang-Bootstrap-Generation": (
+                    f"{self._instance_id}:{self._route_revision}"
+                )
+            },
+        )
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -1570,6 +1660,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
             self._registered_count += 1
+            self._route_revision += 1
 
         expected = self.dp_size * self.attn_cp_size * self.attn_tp_size * self.pp_size
         logger.debug(

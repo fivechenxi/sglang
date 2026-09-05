@@ -12,6 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
@@ -62,7 +63,11 @@ logger = logging.getLogger(__name__)
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
-    "Number of mooncake_session_ids un-blacklisted via probe.",
+    "Number of mooncake_session_ids un-blacklisted via probe or real transfer.",
+)
+FAILED_SESSION_RETRY_ATTEMPTS = Counter(
+    "sglang:failed_session_retry_attempts_total",
+    "Number of real KV transfer retries attempted for blacklisted sessions.",
 )
 
 
@@ -274,6 +279,19 @@ class MooncakeKVManager(CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+
+    def _claim_failed_session_retry(self, session_id: str) -> bool:
+        """Return whether this request may retry a blacklisted session."""
+        return False
+
+    def _on_session_transfer_failure(self, session_id: str) -> None:
+        """Backend hook invoked after a real KV transfer fails."""
+
+    def _on_failed_session_retry_success(self, session_id: str) -> None:
+        """Backend hook invoked after a blacklisted session transfers KV."""
+
+    def _on_session_registered(self, session_id: str) -> None:
+        """Backend hook invoked when decode registers a fresh session."""
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1325,23 +1343,6 @@ class MooncakeKVManager(CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
-                        # Early exit if the request has failed
-                        with self.session_lock:
-                            if req.mooncake_session_id in self.failed_sessions:
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
-                                )
-                                break
-
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
@@ -1362,6 +1363,44 @@ class MooncakeKVManager(CommonKVManager):
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
                         )
+                        has_real_kv_transfer = (
+                            len(kv_chunk.prefill_kv_indices) > 0 and not skip_kv
+                        )
+                        retrying_failed_session = False
+                        with self.session_lock:
+                            session_failed = (
+                                req.mooncake_session_id in self.failed_sessions
+                            )
+                        if session_failed and has_real_kv_transfer:
+                            retrying_failed_session = self._claim_failed_session_retry(
+                                req.mooncake_session_id
+                            )
+                            if not retrying_failed_session:
+                                # A concurrent retry may have recovered the session.
+                                with self.session_lock:
+                                    session_failed = (
+                                        req.mooncake_session_id in self.failed_sessions
+                                    )
+                        if session_failed and not retrying_failed_session:
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            break
+                        if retrying_failed_session:
+                            FAILED_SESSION_RETRY_ATTEMPTS.inc()
+                            logger.info(
+                                "Retrying blacklisted session %s with a real KV transfer",
+                                req.mooncake_session_id,
+                            )
                         if len(kv_chunk.prefill_kv_indices) == 0 or skip_kv:
                             ret = 0
                         elif (
@@ -1393,6 +1432,12 @@ class MooncakeKVManager(CommonKVManager):
                                 prefill_unique_rank,
                             )
                             if deferred:
+                                if retrying_failed_session:
+                                    # No transport was attempted. Release the
+                                    # single-flight retry lease and back off.
+                                    self._on_session_transfer_failure(
+                                        req.mooncake_session_id
+                                    )
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
@@ -1416,6 +1461,7 @@ class MooncakeKVManager(CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
+                            self._on_session_transfer_failure(req.mooncake_session_id)
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
@@ -1430,6 +1476,16 @@ class MooncakeKVManager(CommonKVManager):
                                 prefill_unique_rank,
                             )
                             break
+
+                        if retrying_failed_session:
+                            self._on_failed_session_retry_success(
+                                req.mooncake_session_id
+                            )
+                            FAILED_SESSION_RECOVERIES.inc()
+                            logger.info(
+                                "Session %s recovered via real KV transfer; un-blacklisted",
+                                req.mooncake_session_id,
+                            )
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
@@ -1571,6 +1627,7 @@ class MooncakeKVManager(CommonKVManager):
                             self.failed_sessions.remove(mooncake_session_id)
                         if mooncake_session_id in self.session_failures:
                             del self.session_failures[mooncake_session_id]
+                    self._on_session_registered(mooncake_session_id)
                     logger.debug(
                         f"Register KVArgs from {mooncake_session_id} successfully"
                     )
@@ -1887,7 +1944,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
-    def _register_kv_args(self):
+    def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -1921,26 +1978,36 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 packed_staging_base_ptr = b""
                 staging_total_size_str = b""
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                    ]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            packed_state_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                            packed_state_item_lens,
+                            packed_state_dim_per_tensor,
+                            packed_staging_base_ptr,
+                            staging_total_size_str,
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return False
+        return True
 
     def send_metadata(
         self,
@@ -1967,27 +2034,36 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
 
         for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            pack_int_lists(state_indices, "i")
-                            if not is_dummy and state_indices
-                            else b""
-                        ),
-                        str(self.required_dst_info_num).encode("ascii"),
-                        str(decode_prefix_len or 0).encode("ascii"),
-                    ]
+            try:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii") if not is_dummy else b"",
+                            (
+                                pack_int_lists(state_indices, "i")
+                                if not is_dummy and state_indices
+                                else b""
+                            ),
+                            str(self.required_dst_info_num).encode("ascii"),
+                            str(decode_prefix_len or 0).encode("ascii"),
+                        ]
+                    )
+            except zmq.ZMQError:
+                self.invalidate_cached_bootstrap_infos()
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
+                self.conclude_state = KVPoll.Failed
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
