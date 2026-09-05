@@ -1379,8 +1379,7 @@ class MooncakeKVManager(CommonKVManager):
                                 # A concurrent retry may have recovered the session.
                                 with self.session_lock:
                                     session_failed = (
-                                        req.mooncake_session_id
-                                        in self.failed_sessions
+                                        req.mooncake_session_id in self.failed_sessions
                                     )
                         if session_failed and not retrying_failed_session:
                             self.record_failure(
@@ -1456,9 +1455,7 @@ class MooncakeKVManager(CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
-                            self._on_session_transfer_failure(
-                                req.mooncake_session_id
-                            )
+                            self._on_session_transfer_failure(req.mooncake_session_id)
                             self.record_failure(
                                 kv_chunk.room,
                                 f"Failed to send kv chunk of {kv_chunk.room} to "
