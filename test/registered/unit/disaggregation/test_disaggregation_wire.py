@@ -167,9 +167,7 @@ class TestAscendFailedSessionRetry(unittest.TestCase):
         manager._on_failed_session_retry_success("decode-session")
         self.assertNotIn("decode-session", manager.failed_sessions)
         self.assertNotIn("decode-session", manager.session_failures)
-        self.assertNotIn(
-            "decode-session", manager._failed_session_retry_inflight
-        )
+        self.assertNotIn("decode-session", manager._failed_session_retry_inflight)
         self.assertNotIn("decode-session", manager._failed_session_retry_after)
 
     def test_failed_retry_rearms_cooldown(self):
@@ -179,9 +177,7 @@ class TestAscendFailedSessionRetry(unittest.TestCase):
 
         manager._on_session_transfer_failure("decode-session")
         self.assertFalse(manager._claim_failed_session_retry("decode-session"))
-        self.assertNotIn(
-            "decode-session", manager._failed_session_retry_inflight
-        )
+        self.assertNotIn("decode-session", manager._failed_session_retry_inflight)
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
