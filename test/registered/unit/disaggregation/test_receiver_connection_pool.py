@@ -82,9 +82,7 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         manager._observe_bootstrap_generation("prefill:8998", "new:4")
 
-        self.assertEqual(
-            manager.connection_pool, {"other:8998_0_0_0": retained}
-        )
+        self.assertEqual(manager.connection_pool, {"other:8998_0_0_0": retained})
         self.assertEqual(manager.bootstrap_generations["prefill:8998"], "new:4")
         self.assertCountEqual(
             [call.args[0] for call in mock_disconnect.call_args_list],
@@ -102,9 +100,7 @@ class TestReceiverConnectionPool(CustomTestCase):
         manager._observe_bootstrap_generation("prefill:8998", "current:4")
         manager._observe_bootstrap_generation("prefill:8998", "current:4")
 
-        self.assertEqual(
-            manager.connection_pool, {"prefill:8998_0_0_0": cached}
-        )
+        self.assertEqual(manager.connection_pool, {"prefill:8998_0_0_0": cached})
         mock_disconnect.assert_not_called()
 
     def test_invalidate_removes_matching_generation(self):

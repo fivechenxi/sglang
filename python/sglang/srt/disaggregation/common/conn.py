@@ -955,9 +955,7 @@ class CommonKVManager(BaseKVManager):
 
         with self.connection_lock:
             keys_to_remove = [
-                key
-                for key in self.connection_pool
-                if key.startswith(bootstrap_addr)
+                key for key in self.connection_pool if key.startswith(bootstrap_addr)
             ]
             stale_endpoints = set()
             for key in keys_to_remove:
@@ -965,9 +963,7 @@ class CommonKVManager(BaseKVManager):
                     ip = info.get("rank_ip")
                     port = info.get("rank_port")
                     if ip and port:
-                        stale_endpoints.add(
-                            NetworkAddress(ip, int(port)).to_tcp()
-                        )
+                        stale_endpoints.add(NetworkAddress(ip, int(port)).to_tcp())
             for key in keys_to_remove:
                 del self.connection_pool[key]
 
