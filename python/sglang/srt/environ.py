@@ -472,6 +472,10 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # Ascend MemFabric has no side-effect-free session probe. After this
+    # cooldown, allow one real KV transfer to test and recover a failed session.
+    # Set to 0 to keep failed sessions permanently blacklisted.
+    SGLANG_ASCEND_FAILED_SESSION_RETRY_INTERVAL_S = EnvFloat(30.0)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)

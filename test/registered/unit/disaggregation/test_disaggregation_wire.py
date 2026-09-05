@@ -6,8 +6,8 @@ import numpy as np
 import torch
 import zmq
 
+from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 from sglang.srt.disaggregation.common.utils import (
     group_concurrent_contiguous,
     pack_int_lists,
@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVReceiver
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
@@ -138,6 +139,49 @@ class TestMooncakeMetadataSendFailure(unittest.TestCase):
         self.assertEqual(failures[0][0], 7)
         self.assertIn("send_metadata to prefill", failures[0][1])
         self.assertIsNone(receiver.init_time)
+
+
+class TestAscendFailedSessionRetry(unittest.TestCase):
+    @staticmethod
+    def _make_manager():
+        manager = object.__new__(AscendKVManager)
+        manager.failed_session_retry_interval = 30.0
+        manager._failed_session_retry_lock = threading.Lock()
+        manager._failed_session_retry_after = {}
+        manager._failed_session_retry_inflight = set()
+        manager.session_lock = threading.Lock()
+        manager.failed_sessions = {"decode-session"}
+        manager.session_failures = {"decode-session": 1}
+        return manager
+
+    def test_retry_uses_cooldown_and_single_flight_then_recovers(self):
+        manager = self._make_manager()
+
+        manager._on_session_transfer_failure("decode-session")
+        self.assertFalse(manager._claim_failed_session_retry("decode-session"))
+
+        manager._failed_session_retry_after["decode-session"] = 0.0
+        self.assertTrue(manager._claim_failed_session_retry("decode-session"))
+        self.assertFalse(manager._claim_failed_session_retry("decode-session"))
+
+        manager._on_failed_session_retry_success("decode-session")
+        self.assertNotIn("decode-session", manager.failed_sessions)
+        self.assertNotIn("decode-session", manager.session_failures)
+        self.assertNotIn(
+            "decode-session", manager._failed_session_retry_inflight
+        )
+        self.assertNotIn("decode-session", manager._failed_session_retry_after)
+
+    def test_failed_retry_rearms_cooldown(self):
+        manager = self._make_manager()
+        manager._failed_session_retry_after["decode-session"] = 0.0
+        self.assertTrue(manager._claim_failed_session_retry("decode-session"))
+
+        manager._on_session_transfer_failure("decode-session")
+        self.assertFalse(manager._claim_failed_session_retry("decode-session"))
+        self.assertNotIn(
+            "decode-session", manager._failed_session_retry_inflight
+        )
 
 
 class TestEagleDsaSeedTransfer(unittest.TestCase):
