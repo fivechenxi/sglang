@@ -10,7 +10,7 @@ ARG BUILD_WORKFLOW_URL=""
 # Pin the official ARM64 wheel by digest so the runtime remains reproducible.
 RUN python3 -m pip install --no-cache-dir --upgrade \
     "https://files.pythonhosted.org/packages/d4/6b/750a2f834e4f3bc9d2066d534ba53468ff7ed49c85d0c44802c79d2d45b4/memfabric_hybrid-1.2.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl#sha256=5213be7e6384923612447d79828dd6c45500525449f0849a200337a7cf20f442" && \
-    python3 -c "import memfabric_hybrid; print(memfabric_hybrid.__file__)"
+    python3 -m pip show memfabric-hybrid | grep -q '^Version: 1.2.0$'
 
 RUN test -n "$SGLANG_REPOSITORY" && test -n "$SGLANG_COMMIT" && \
     rm -rf /sgl-workspace/sglang && \
