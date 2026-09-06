@@ -1,5 +1,7 @@
 import concurrent.futures
 import logging
+import threading
+import time
 from typing import List, Tuple
 
 import numpy as np
@@ -13,12 +15,62 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
 
 class AscendKVManager(MooncakeKVManager):
+    def __init__(self, *args, **kwargs):
+        self.failed_session_retry_interval = (
+            envs.SGLANG_ASCEND_FAILED_SESSION_RETRY_INTERVAL_S.get()
+        )
+        self._failed_session_retry_lock = threading.Lock()
+        self._failed_session_retry_after: dict[str, float] = {}
+        self._failed_session_retry_inflight: set[str] = set()
+        super().__init__(*args, **kwargs)
+
+    def _claim_failed_session_retry(self, session_id: str) -> bool:
+        if self.failed_session_retry_interval <= 0:
+            return False
+        now = time.monotonic()
+        # Keep the blacklist and retry lease check atomic. A successful retry
+        # clears the blacklist before another request can claim the same session.
+        with self.session_lock:
+            if session_id not in self.failed_sessions:
+                return False
+            with self._failed_session_retry_lock:
+                if session_id in self._failed_session_retry_inflight:
+                    return False
+                retry_after = self._failed_session_retry_after.get(session_id)
+                if retry_after is None or now < retry_after:
+                    return False
+                self._failed_session_retry_inflight.add(session_id)
+                return True
+
+    def _on_session_transfer_failure(self, session_id: str) -> None:
+        if self.failed_session_retry_interval <= 0:
+            return
+        with self._failed_session_retry_lock:
+            self._failed_session_retry_inflight.discard(session_id)
+            self._failed_session_retry_after[session_id] = (
+                time.monotonic() + self.failed_session_retry_interval
+            )
+
+    def _on_failed_session_retry_success(self, session_id: str) -> None:
+        with self.session_lock:
+            self.failed_sessions.discard(session_id)
+            self.session_failures.pop(session_id, None)
+            with self._failed_session_retry_lock:
+                self._failed_session_retry_inflight.discard(session_id)
+                self._failed_session_retry_after.pop(session_id, None)
+
+    def _on_session_registered(self, session_id: str) -> None:
+        with self._failed_session_retry_lock:
+            self._failed_session_retry_inflight.discard(session_id)
+            self._failed_session_retry_after.pop(session_id, None)
+
     def init_engine(self):
         # TransferEngine initialized on ascend.
         local_ip = get_local_ip_auto()

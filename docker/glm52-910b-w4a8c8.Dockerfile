@@ -4,6 +4,21 @@ ARG SGLANG_REPOSITORY
 ARG SGLANG_COMMIT
 ARG BUILD_WORKFLOW_URL=""
 
+# MemFabric 1.0.8 builds a fixed transfer world and cannot safely recover when
+# P/D ranks restart independently. 1.2.0 adds dynamic join, background HCOM
+# reconnect, and the A2/PD reliability fixes required by this deployment.
+# Pin the official ARM64 wheel by digest so the runtime remains reproducible.
+RUN python3 -m pip install --no-cache-dir --upgrade \
+    "https://files.pythonhosted.org/packages/d4/6b/750a2f834e4f3bc9d2066d534ba53468ff7ed49c85d0c44802c79d2d45b4/memfabric_hybrid-1.2.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl#sha256=5213be7e6384923612447d79828dd6c45500525449f0849a200337a7cf20f442" && \
+    python3 -m pip show memfabric-hybrid | grep -q '^Version: 1.2.0$'
+
+# MemFabric loads HCOM again by its bare filename when it creates a lazy
+# device-RDMA connection. The wheel preloads the absolute file, but its SONAME
+# is libhcom.so.0, so that preload does not satisfy a later dlopen("libhcom.so").
+# Keep the wheel's private lib directory in the process startup search path.
+ENV LD_LIBRARY_PATH=/usr/local/python3.11.15/lib/python3.11/site-packages/memfabric_hybrid/lib:${LD_LIBRARY_PATH}
+RUN python3 -c "import ctypes; ctypes.CDLL('libhcom.so'); print('libhcom.so load verified')"
+
 RUN test -n "$SGLANG_REPOSITORY" && test -n "$SGLANG_COMMIT" && \
     rm -rf /sgl-workspace/sglang && \
     git clone "$SGLANG_REPOSITORY" /sgl-workspace/sglang && \

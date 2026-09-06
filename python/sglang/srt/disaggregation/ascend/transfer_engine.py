@@ -48,10 +48,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
         else:
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
-        self.session_id = NetworkAddress(
-            self.hostname, self.engine.get_rpc_port()
-        ).to_host_port_str()
+        rpc_port = self.engine.get_rpc_port()
+        self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
         self.initialize()
+        if rpc_port == 0:
+            rpc_port = self.engine.get_rpc_port()
+            self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
 
     def initialize(self) -> None:
         from sglang.srt.distributed.parallel_state import (
@@ -89,6 +91,34 @@ class AscendTransferEngine(MooncakeTransferEngine):
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+
+    def _bind_transfer_thread_to_npu(self) -> None:
+        """Bind a background transfer/probe thread to this engine's NPU."""
+        if torch.npu.current_device() != self.npu_id:
+            torch.npu.set_device(self.npu_id)
+
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        # Transfers can run in ThreadPoolExecutor workers.  The NPU current
+        # device is thread-local and a fresh worker defaults to device 0.  The
+        # MemFabric 1.2 lazy connection path consults that current device while
+        # creating its RDev, so an unbound TP worker can initialize the wrong
+        # physical device even though initialize() received the correct npu_id.
+        self._bind_transfer_thread_to_npu()
+        return super().batch_transfer_sync(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
+
+    def send_probe(self, peer_session_id: str) -> int:
+        # Failed-session recovery probes run in their own background thread and
+        # may cause MemFabric to reconnect lazily as well.
+        self._bind_transfer_thread_to_npu()
+        return super().send_probe(peer_session_id)
 
     @staticmethod
     def _get_transfer_protocol():
