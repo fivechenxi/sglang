@@ -1367,8 +1367,8 @@ class CommonKVReceiver(BaseKVReceiver):
                         cached_bootstrap_infos = self.kv_mgr.connection_pool.get(
                             bootstrap_key
                         )
-                        cached_generation = (
-                            self.kv_mgr.connection_pool_generations.get(bootstrap_key)
+                        cached_generation = self.kv_mgr.connection_pool_generations.get(
+                            bootstrap_key
                         )
                         if cached_bootstrap_infos is None or (
                             current_generation is not None
