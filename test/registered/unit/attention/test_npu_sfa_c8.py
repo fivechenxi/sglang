@@ -41,6 +41,15 @@ class TestNPUSFAC8(unittest.TestCase):
         common["disaggregation_mode"] = "decode"
         self.assertEqual([], get_sfa_c8_incompatibilities(**common))
 
+        common["hierarchical_cache_enabled"] = True
+        self.assertEqual(
+            ["hierarchical cache outside prefill mode"],
+            get_sfa_c8_incompatibilities(**common),
+        )
+        common["disaggregation_mode"] = "prefill"
+        self.assertEqual([], get_sfa_c8_incompatibilities(**common))
+        common["hierarchical_cache_enabled"] = False
+
         common["prefill_graph_enabled"] = True
         self.assertEqual(
             ["prefill graph capture/replay"],
@@ -53,7 +62,7 @@ class TestNPUSFAC8(unittest.TestCase):
                 "SGLANG_NPU_USE_MLAPO",
                 "decode context parallelism/DCP",
                 "DSA prefill context parallelism",
-                "hierarchical cache",
+                "hierarchical cache outside prefill mode",
                 "CPU offload",
                 "speculative algorithm DSPARK (only NEXTN/EAGLE is supported)",
                 "prefill graph capture/replay",

@@ -1526,6 +1526,14 @@ class HostPoolGroup:
     def get_page_buffer_meta(self, indices):
         return self.anchor_entry.host_pool.get_page_buffer_meta(indices)
 
+    def get_hybrid_pool_buffer(self):
+        anchor = self.anchor_entry.host_pool
+        if hasattr(anchor, "get_logical_page_buffer_meta"):
+            return anchor.get_hybrid_pool_buffer()
+        # Preserve the pre-existing registration behavior for every ordinary
+        # HostPoolGroup; only logical multi-buffer anchors opt into expansion.
+        return [anchor.kv_buffer]
+
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         return self.anchor_entry.host_pool.is_stride_page_aligned(page_size_bytes)
 

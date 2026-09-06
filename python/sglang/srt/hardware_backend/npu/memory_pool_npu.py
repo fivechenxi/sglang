@@ -460,6 +460,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.packed_kv_buffer[layer_id - self.start_layer]
 
+    def get_sfa_c8_page_payload_descriptor(self):
+        """Describe the physical page regions without reconstructing layout."""
+        if not self.sfa_c8_enabled:
+            raise RuntimeError("SFA C8 packed KV cache is not enabled")
+        payloads = [
+            {
+                "name": "sfa",
+                "buffer": self.packed_kv_buffer,
+                "dtype": self.packed_kv_buffer.dtype,
+                "layers": self.layer_num,
+                "page_bytes": self.packed_kv_buffer[0, 0].nbytes,
+            }
+        ]
+        if self.index_k_buffer is not None:
+            payloads.append(
+                {
+                    "name": "lightning_indexer",
+                    "buffer": self.index_k_buffer,
+                    "dtype": self.index_k_buffer.dtype,
+                    "layers": self.indexer_layer_num,
+                    "page_bytes": self.index_k_buffer[0, 0].nbytes,
+                }
+            )
+        return tuple(payloads)
+
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
             return [], [], []

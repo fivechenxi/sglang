@@ -98,6 +98,7 @@ def maybe_register_hicache_draft(
     )
     from sglang.srt.mem_cache.pool_host.mha import get_mha_host_pool_cls
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+    from sglang.srt.mem_cache.pool_host.sfa_c8 import NPUSFAC8TokenToKVPoolHost
 
     pool = draft_kv_pool
     if isinstance(pool, HybridLinearKVPool):
@@ -113,7 +114,17 @@ def maybe_register_hicache_draft(
         layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
-    if isinstance(pool, MHATokenToKVPool):
+    if getattr(pool, "sfa_c8_enabled", False):
+        # The draft shares the target logical page ids.  Pick a token budget
+        # in the middle of the final target page.  HostKVCache currently uses
+        # `page_num = raw_tokens // page_size + 1`, so any value in that page
+        # produces exactly the target page count.  The midpoint avoids a float
+        # round-trip near either boundary; attach_draft_host_pool() then asserts
+        # the final target/draft page counts and token capacities are identical.
+        raw_draft_tokens = max(primary.size - max(1, page_size // 2), 0)
+        kw["host_to_device_ratio"] = raw_draft_tokens / pool.size
+        draft_host_pool = NPUSFAC8TokenToKVPoolHost(pool, **kw)
+    elif isinstance(pool, MHATokenToKVPool):
         draft_host_pool = get_mha_host_pool_cls(pool)(pool, **kw)
     elif isinstance(pool, MLATokenToKVPool):
         draft_host_pool = MLATokenToKVPoolHost(pool, **kw)

@@ -648,9 +648,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+        anchor = anchor.host_pool if anchor is not None else self.mem_pool_host
+        if hasattr(anchor, "get_logical_page_buffer_meta"):
+            if not self.extra_backend_tag:
+                raise ValueError(
+                    "SFA C8 logical-page L3 requires a non-empty "
+                    "extra_backend_tag identifying the exact model, tokenizer, "
+                    "and serving release"
+                )
+            required = (
+                "batch_put_from_multi_buffers",
+                "batch_get_into_multi_buffers",
+            )
+            missing = [name for name in required if not hasattr(self.store, name)]
+            if missing or self._replicate_config_cls is None:
+                raise RuntimeError(
+                    "SFA C8 logical-page L3 requires Mooncake multi-buffer "
+                    f"atomic page IO; missing={missing}, "
+                    f"replicate_config={self._replicate_config_cls is not None}"
+                )
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+                self._register_host_buffer_once(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -675,12 +695,65 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
-            super().register_buffer(buf)
+            self._register_host_buffer_once(buf)
+
+    def _register_host_buffer_once(self, buffer) -> None:
+        size = buffer.numel() * buffer.element_size()
+        if size == 0:
+            # Empty optional regions carry no payload and Mooncake cannot make
+            # a useful registration for their sentinel data_ptr().
+            return
+        registered = getattr(self, "_registered_host_buffer_sizes", None)
+        if registered is None:
+            registered = self._registered_host_buffer_sizes = {}
+        ptr = buffer.data_ptr()
+        if ptr in registered:
+            if registered[ptr] != size:
+                raise RuntimeError(
+                    "Mooncake host buffers share a start address but expose "
+                    f"different extents: ptr={ptr}, "
+                    f"registered={registered[ptr]}, requested={size}"
+                )
+            return
+        super().register_buffer(buffer)
+        registered[ptr] = size
+
+    def register_logical_page_pool_extension(self, host_pool: HostKVCache):
+        """Register extra regions folded into the anchor's single page key."""
+        anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+        anchor = anchor.host_pool if anchor is not None else self.mem_pool_host
+        attached_draft = getattr(anchor, "draft_host_pool", None)
+        if attached_draft is not host_pool:
+            raise ValueError(
+                "Mooncake logical-page extension must be the draft pool already "
+                "attached to the registered SFA C8 anchor"
+            )
+        for buf in self._iter_host_pool_buffers(host_pool):
+            self._register_host_buffer_once(buf)
+        # The anchor is registered before the draft pool is attached.  Refresh
+        # the metric denominator now that one logical page includes both target
+        # and draft regions; no storage operation is issued during this setup.
+        bytes_per_page = (
+            self.mem_pool_host.get_ksize_per_token() * self.mem_pool_host.page_size
+        )
+        self.gb_per_page = bytes_per_page / (1 << 30)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
             return keys
         return [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+    def _mla_page_key(self, key: str) -> str:
+        suffix = getattr(self.mem_pool_host, "storage_key_suffix", None)
+        if suffix is None:
+            anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+            suffix = getattr(
+                anchor.host_pool if anchor is not None else None,
+                "storage_key_suffix",
+                None,
+            )
+        base = f"{key}_{self.mla_suffix}_k"
+        return f"{base}_{suffix}" if suffix else base
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
@@ -910,12 +983,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ptr_list: List[int],
         element_size_list: List[int],
     ) -> Tuple[List[Any], List[Any]]:
+        if not key_strs:
+            raise ValueError("Mooncake multi-buffer metadata requires at least one key")
+        if len(ptr_list) != len(element_size_list):
+            raise ValueError(
+                "Mooncake multi-buffer pointer and size counts differ: "
+                f"{len(ptr_list)} != {len(element_size_list)}"
+            )
         if len(ptr_list) == len(key_strs):
             return ptr_list, element_size_list
-
-        assert len(key_strs) > 0
-        assert len(ptr_list) == len(element_size_list)
-        assert len(ptr_list) % len(key_strs) == 0
+        if len(ptr_list) % len(key_strs) != 0:
+            raise ValueError(
+                "Mooncake multi-buffer regions cannot be evenly grouped by key: "
+                f"regions={len(ptr_list)}, keys={len(key_strs)}"
+            )
 
         nbuf = len(ptr_list) // len(key_strs)
         return [ptr_list[i : i + nbuf] for i in range(0, len(ptr_list), nbuf)], [
@@ -940,11 +1021,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
         for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+            key_list.append(self._mla_page_key(key_))
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
-        assert len(key_list) == len(ptr_list)
+        if len(key_list) != len(ptr_list):
+            raise RuntimeError(
+                "Mooncake MLA metadata must contain one pointer group per key: "
+                f"{len(ptr_list)} != {len(key_list)}"
+            )
         return key_list, ptr_list, element_size_list
 
     def _batch_preprocess(self, keys, host_indices):
@@ -1033,11 +1118,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
-        group_ids = (
-            self._expand_group_ids(keys, key_multiplier)
-            if self._can_use_group_semantics()
-            else None
-        )
+        if self._can_use_group_semantics():
+            anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+            anchor = anchor.host_pool if anchor is not None else self.mem_pool_host
+            if hasattr(anchor, "get_logical_page_buffer_meta"):
+                # SFA C8 must include its final layout-qualified object key in
+                # group identity.  Keep the established group-id behavior for
+                # ordinary MLA/MHA pools unchanged.
+                group_ids = [self._make_group_id(key) for key in key_strs]
+            else:
+                group_ids = self._expand_group_ids(keys, key_multiplier)
+        else:
+            group_ids = None
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
@@ -1206,7 +1298,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            query_keys = [self._mla_page_key(key) for key in keys]
             key_multiplier = 1
         else:
             query_keys = []
@@ -1255,9 +1347,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
+            results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
+            # Mooncake's multi-buffer API returns one status per key (not one
+            # status per constituent buffer).  This validation intentionally
+            # protects every multi-buffer caller, including ordinary MLA pools.
+            if len(results) != len(key_strs):
+                raise RuntimeError(
+                    "Mooncake multi-buffer put returned an unexpected result "
+                    f"count: {len(results)} != {len(key_strs)}"
+                )
+            return results
         elif config is not None:
             return self.store.batch_put_from(
                 key_strs, buffer_ptrs, buffer_sizes, config
@@ -1269,9 +1370,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
+            results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
+            # The API returns one byte count per key.  A logical page is atomic,
+            # so a non-negative short read must not be published as a cache hit.
+            if len(results) != len(key_strs):
+                raise RuntimeError(
+                    "Mooncake multi-buffer get returned an unexpected result "
+                    f"count: {len(results)} != {len(key_strs)}"
+                )
+            for key, result, sizes in zip(key_strs, results, buffer_sizes):
+                expected_bytes = sum(sizes)
+                if result >= 0 and result != expected_bytes:
+                    raise RuntimeError(
+                        "Mooncake multi-buffer get returned a partial logical "
+                        f"page for {key!r}: {result} != {expected_bytes} bytes"
+                    )
+            return results
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
