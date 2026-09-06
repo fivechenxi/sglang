@@ -88,3 +88,25 @@ def test_batch_transfer_does_not_rebind_correct_npu():
         engine.batch_transfer_sync("peer:1", [1], [2], [3])
 
     set_device.assert_not_called()
+
+
+def test_send_probe_binds_probe_thread_to_engine_npu():
+    engine = _build_engine_with_ports([12345])
+    engine.npu_id = 7
+
+    with (
+        patch.object(
+            ascend_transfer_engine.torch.npu, "current_device", return_value=0
+        ),
+        patch.object(ascend_transfer_engine.torch.npu, "set_device") as set_device,
+        patch.object(
+            ascend_transfer_engine.MooncakeTransferEngine,
+            "send_probe",
+            return_value=0,
+        ) as parent_send_probe,
+    ):
+        ret = engine.send_probe("peer:1")
+
+    assert ret == 0
+    set_device.assert_called_once_with(7)
+    parent_send_probe.assert_called_once_with("peer:1")

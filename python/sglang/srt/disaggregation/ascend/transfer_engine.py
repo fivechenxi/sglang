@@ -92,6 +92,11 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
+    def _bind_transfer_thread_to_npu(self) -> None:
+        """Bind a background transfer/probe thread to this engine's NPU."""
+        if torch.npu.current_device() != self.npu_id:
+            torch.npu.set_device(self.npu_id)
+
     def batch_transfer_sync(
         self,
         session_id: str,
@@ -104,11 +109,16 @@ class AscendTransferEngine(MooncakeTransferEngine):
         # MemFabric 1.2 lazy connection path consults that current device while
         # creating its RDev, so an unbound TP worker can initialize the wrong
         # physical device even though initialize() received the correct npu_id.
-        if torch.npu.current_device() != self.npu_id:
-            torch.npu.set_device(self.npu_id)
+        self._bind_transfer_thread_to_npu()
         return super().batch_transfer_sync(
             session_id, buffers, peer_buffer_addresses, lengths
         )
+
+    def send_probe(self, peer_session_id: str) -> int:
+        # Failed-session recovery probes run in their own background thread and
+        # may cause MemFabric to reconnect lazily as well.
+        self._bind_transfer_thread_to_npu()
+        return super().send_probe(peer_session_id)
 
     @staticmethod
     def _get_transfer_protocol():
