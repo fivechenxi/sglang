@@ -5,7 +5,7 @@ description: "为昇腾 GLM-5.2 SFA C8 增加原生布局的主机 L2 和可选�
 
 # SFA C8 HiCache L2/L3 设计
 
-状态：设计稿；不包含运行时代码。
+状态：第一版候选实现；尚未部署到生产。
 
 基线：`glm52-910b-w4a8c8-sfa-c8-pd-20260905`
 （`bcd4b0a39ced7293c7005c63684f8677170ed2a8`）。
@@ -122,7 +122,7 @@ Mooncake 只是首个 L3 backend。不开 L3 时，SFA C8 L2 仍可独立运行�
 
 ### 容量
 
-`--hicache-size` 或 `--hicache-ratio` 只产生一个逻辑页预算：
+最终实现中，`--hicache-size` 或 `--hicache-ratio` 只产生一个逻辑页预算：
 
 ```text
 num_host_pages = floor(host_budget_bytes / 7,354,368)
@@ -131,6 +131,13 @@ host_token_slots = num_host_pages * 128
 
 启动前按每 rank 和每节点检查总 Host 内存，并预留 allocator、传输引擎和系统内存。
 显式容量无法分配时启动失败，不静默缩容。
+
+第一版运行时代码先支持 `--hicache-ratio`：target 与 late-created draft 使用相同
+logical page 数，因此 Host/L1 的四段 payload 总字节比例仍等于该 ratio。固定
+`--hicache-size` 在 draft 创建前无法正确按四段总字节计算，第一版会显式拒绝，后续
+改为延迟构造 logical pool 后再支持，不能把该值错误地分别用于 target 和 draft。
+Mooncake `standalone_storage` 同样在 draft 创建前固定 segment 大小，第一版会显式
+拒绝该组合；外部 Mooncake Store 的注册内存模式不受此限制。
 
 ### 代码边界
 
@@ -143,8 +150,10 @@ host_token_slots = num_host_pages * 128
 5. 为 storage backend 增加单 key multi-buffer logical-page 接口。
 6. Mooncake backend 使用现有 multi-buffer zero-copy API。
 
-第一阶段不修改 D 侧缓存、retract/rebootstrap、SFA 算子、P-to-D packed C8 传输、
-CUDA/NPU Graph 或调度策略。
+第一版复用 `transfer_kv_dim_exchange` 的 `aclrtMemcpy2dAsync` 路径：packed C8
+作为 K region，V 为空，LI 作为 index region；target 与 draft 的四个 region 由同一
+logical page key 通过 Mooncake multi-buffer API 读写。第一阶段不修改 D 侧缓存、
+retract/rebootstrap、SFA 算子、P-to-D packed C8 传输、CUDA/NPU Graph 或调度策略。
 
 ## 验证
 

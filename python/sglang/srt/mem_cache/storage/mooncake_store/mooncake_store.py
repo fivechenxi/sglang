@@ -648,9 +648,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+        anchor = anchor.host_pool if anchor is not None else self.mem_pool_host
+        if hasattr(anchor, "get_logical_page_buffer_meta"):
+            required = (
+                "batch_put_from_multi_buffers",
+                "batch_get_into_multi_buffers",
+            )
+            missing = [name for name in required if not hasattr(self.store, name)]
+            if missing or self._replicate_config_cls is None:
+                raise RuntimeError(
+                    "SFA C8 logical-page L3 requires Mooncake multi-buffer "
+                    f"atomic page IO; missing={missing}, "
+                    f"replicate_config={self._replicate_config_cls is not None}"
+                )
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+                self._register_host_buffer_once(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -675,12 +689,43 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
-            super().register_buffer(buf)
+            self._register_host_buffer_once(buf)
+
+    def _register_host_buffer_once(self, buffer) -> None:
+        registered = getattr(self, "_registered_host_buffer_ptrs", None)
+        if registered is None:
+            registered = self._registered_host_buffer_ptrs = set()
+        ptr = buffer.data_ptr()
+        if ptr in registered:
+            return
+        super().register_buffer(buffer)
+        registered.add(ptr)
+
+    def register_logical_page_pool_extension(self, host_pool: HostKVCache):
+        """Register extra regions folded into the anchor's single page key."""
+        for buf in self._iter_host_pool_buffers(host_pool):
+            self._register_host_buffer_once(buf)
+        bytes_per_page = (
+            self.mem_pool_host.get_ksize_per_token() * self.mem_pool_host.page_size
+        )
+        self.gb_per_page = bytes_per_page / (1 << 30)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
             return keys
         return [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+    def _mla_page_key(self, key: str) -> str:
+        suffix = getattr(self.mem_pool_host, "storage_key_suffix", None)
+        if suffix is None:
+            anchor = getattr(self.mem_pool_host, "anchor_entry", None)
+            suffix = getattr(
+                anchor.host_pool if anchor is not None else None,
+                "storage_key_suffix",
+                None,
+            )
+        base = f"{key}_{self.mla_suffix}_k"
+        return f"{base}_{suffix}" if suffix else base
 
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
@@ -940,7 +985,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []
         for key_ in keys:
-            key_list.append(f"{key_}_{self.mla_suffix}_k")
+            key_list.append(self._mla_page_key(key_))
         ptr_list, element_size_list = self._pack_multi_buffer_meta(
             key_list, ptr_list, element_size_list
         )
@@ -1206,7 +1251,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
+            query_keys = [self._mla_page_key(key) for key in keys]
             key_multiplier = 1
         else:
             query_keys = []

@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.sfa_c8 import NPUSFAC8TokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 if TYPE_CHECKING:
@@ -1005,6 +1006,88 @@ class _DsaStrategy(StackStrategy):
         )
 
 
+class _NPUSFAC8Strategy(StackStrategy):
+    def matches(self, kvcache, components):
+        return (
+            getattr(kvcache, "sfa_c8_enabled", False)
+            and components == {ComponentType.FULL}
+        )
+
+    def build(
+        self,
+        *,
+        cache,
+        kvcache,
+        params,
+        server_args,
+        load_cache_event,
+        attn_cp_group=None,
+        attn_tp_group=None,
+        storage_backend=None,
+        storage_backend_extra_config=None,
+        prefetch_threshold=256,
+        model_name=None,
+        enable_storage_metrics=False,
+    ):
+        if server_args.disaggregation_mode != "prefill":
+            raise ValueError("SFA C8 HiCache is currently supported on Prefill only")
+        if server_args.hicache_size > 0:
+            raise ValueError(
+                "SFA C8 HiCache currently requires --hicache-ratio; fixed "
+                "--hicache-size cannot include the late-created draft pool yet"
+            )
+        if storage_backend not in (None, "mooncake"):
+            raise ValueError(
+                "SFA C8 logical-page L3 currently requires Mooncake Store"
+            )
+        full_layer_mapping = {i: i for i in range(kvcache.layer_num)}
+        host_pool = NPUSFAC8TokenToKVPoolHost(
+            kvcache,
+            server_args.hicache_ratio,
+            server_args.hicache_size,
+            cache.page_size,
+            server_args.hicache_mem_layout,
+            allocator_type=server_args.hicache_storage_backend,
+        )
+        host_pool_group = HostPoolGroup(
+            [
+                build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=host_pool,
+                    device_pool=kvcache,
+                    layer_mapping=full_layer_mapping,
+                    transfer_layer_num=kvcache.layer_num,
+                    is_anchor=True,
+                )
+            ]
+        )
+        cache_controller = HybridCacheController(
+            params.token_to_kv_pool_allocator,
+            host_pool_group,
+            cache.page_size,
+            params.tp_cache_group,
+            load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
+            pp_group=params.pp_cache_group,
+            write_policy=server_args.hicache_write_policy,
+            io_backend=server_args.hicache_io_backend,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            transfer_layer_num=kvcache.layer_num,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        return StackBuildResult(
+            host_pool_group=host_pool_group,
+            cache_controller=cache_controller,
+            component_host_pools={ComponentType.FULL: host_pool},
+            transfer_layer_num=kvcache.layer_num,
+            pools_desc="SFA C8 + INDEXER",
+        )
+
+
 class _MiniMaxSparseStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -1148,6 +1231,7 @@ _STRATEGIES: list[StackStrategy] = [
     _DeepSeekV4Strategy(),
     _MambaStrategy(),
     _SwaStrategy(),
+    _NPUSFAC8Strategy(),
     _DsaStrategy(),
     _MiniMaxSparseStrategy(),
     _PlainKvStrategy(),
