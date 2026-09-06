@@ -279,6 +279,7 @@ class MooncakeKVManager(CommonKVManager):
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
                 self.connection_pool.clear()
+                self.connection_pool_generations.clear()
 
     def _claim_failed_session_retry(self, session_id: str) -> bool:
         """Return whether this request may retry a blacklisted session."""

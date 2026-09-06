@@ -27,6 +27,7 @@ def _receiver(connection_pool, entries):
     receiver = object.__new__(_ConcreteReceiver)
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
+        connection_pool_generations={key: "current:4" for key in connection_pool},
         connection_lock=threading.Lock(),
     )
     receiver._connection_pool_entries = entries
@@ -48,8 +49,12 @@ def _fetching_receiver(connection_pool):
     receiver = object.__new__(_FetchingReceiver)
     receiver.kv_mgr = SimpleNamespace(
         connection_pool=connection_pool,
+        connection_pool_generations={},
         connection_lock=threading.Lock(),
         is_mla_backend=False,
+        bootstrap_generations={},
+        record_failure=Mock(),
+        update_status=Mock(),
     )
     receiver.bootstrap_addr = "prefill:8998"
     receiver.bootstrap_room = 1
@@ -59,6 +64,7 @@ def _fetching_receiver(connection_pool):
     receiver.target_tp_ranks = [0]
     receiver.target_pp_ranks = [0]
     receiver._connection_pool_entries = {}
+    receiver._fetched_bootstrap_generation = None
     receiver.fetch_count = 0
     return receiver
 
@@ -79,6 +85,11 @@ class TestReceiverConnectionPool(CustomTestCase):
         }
         manager.connection_lock = threading.Lock()
         manager.bootstrap_generations = {"prefill:8998": "old:4"}
+        manager.connection_pool_generations = {
+            "prefill:8998_0_0_0": "old:4",
+            "prefill:8998_0_0_1": "old:4",
+            "other:8998_0_0_0": "other:4",
+        }
 
         manager._observe_bootstrap_generation("prefill:8998", "new:4")
 
@@ -90,14 +101,33 @@ class TestReceiverConnectionPool(CustomTestCase):
         )
 
     @patch.object(CommonKVReceiver, "disconnect_endpoint")
-    def test_same_or_initial_generation_keeps_cached_routes(self, mock_disconnect):
+    def test_initial_generation_invalidates_untagged_cached_routes(
+        self, mock_disconnect
+    ):
         cached = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         manager = object.__new__(CommonKVManager)
         manager.connection_pool = {"prefill:8998_0_0_0": cached}
+        manager.connection_pool_generations = {}
         manager.connection_lock = threading.Lock()
         manager.bootstrap_generations = {}
 
         manager._observe_bootstrap_generation("prefill:8998", "current:4")
+
+        self.assertEqual(manager.connection_pool, {})
+        self.assertEqual(manager.connection_pool_generations, {})
+        mock_disconnect.assert_called_once_with("tcp://10.0.0.1:1001")
+
+    @patch.object(CommonKVReceiver, "disconnect_endpoint")
+    def test_same_generation_keeps_tagged_cached_routes(self, mock_disconnect):
+        cached = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        manager = object.__new__(CommonKVManager)
+        manager.connection_pool = {"prefill:8998_0_0_0": cached}
+        manager.connection_pool_generations = {
+            "prefill:8998_0_0_0": "current:4"
+        }
+        manager.connection_lock = threading.Lock()
+        manager.bootstrap_generations = {"prefill:8998": "current:4"}
+
         manager._observe_bootstrap_generation("prefill:8998", "current:4")
 
         self.assertEqual(manager.connection_pool, {"prefill:8998_0_0_0": cached})
@@ -117,6 +147,9 @@ class TestReceiverConnectionPool(CustomTestCase):
         receiver.invalidate_cached_bootstrap_infos()
 
         self.assertEqual(receiver.kv_mgr.connection_pool, {"retained": retained})
+        self.assertEqual(
+            receiver.kv_mgr.connection_pool_generations, {"retained": "current:4"}
+        )
         self.assertEqual(receiver._connection_pool_entries, {})
 
     def test_invalidate_preserves_concurrent_replacement_generation(self):
@@ -130,6 +163,9 @@ class TestReceiverConnectionPool(CustomTestCase):
         receiver.invalidate_cached_bootstrap_infos()
 
         self.assertEqual(receiver.kv_mgr.connection_pool, {"key": replacement})
+        self.assertEqual(
+            receiver.kv_mgr.connection_pool_generations, {"key": "current:4"}
+        )
 
     def test_invalidate_removes_all_matching_cp_entries(self):
         stale_cp0 = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
@@ -162,6 +198,21 @@ class TestReceiverConnectionPool(CustomTestCase):
             receiver._connection_pool_entries["prefill:8998_0_0_0"],
         )
 
+    def test_cached_route_with_wrong_generation_is_refetched(self):
+        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1000}]
+        key = "prefill:8998_0_0_0"
+        receiver = _fetching_receiver({key: stale})
+        receiver.kv_mgr.bootstrap_generations = {"prefill:8998": "new:4"}
+        receiver.kv_mgr.connection_pool_generations = {key: "old:4"}
+
+        receiver._setup_bootstrap_infos()
+
+        self.assertEqual(receiver.fetch_count, 1)
+        self.assertEqual(receiver.bootstrap_infos[0]["rank_port"], 2001)
+        self.assertEqual(
+            receiver.kv_mgr.connection_pool_generations[key], "new:4"
+        )
+
     @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=3.0)
     def test_waiting_timeout_invalidates_cached_generation(self, _mock_time):
         stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
@@ -176,6 +227,21 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         self.assertEqual(receiver._check_waiting_timeout(), KVPoll.Failed)
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
+
+    def test_abort_invalidates_route_for_next_request(self):
+        stale = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
+        receiver = _receiver({"key": stale}, {"key": stale})
+        receiver.bootstrap_room = 1
+        receiver.bootstrap_infos = stale
+        receiver.abort_notified = True
+        receiver.conclude_state = KVPoll.Bootstrapping
+        receiver.kv_mgr.record_failure = Mock()
+        receiver.kv_mgr.update_status = Mock()
+
+        receiver.abort()
+
+        self.assertEqual(receiver.kv_mgr.connection_pool, {})
+        self.assertEqual(receiver.kv_mgr.connection_pool_generations, {})
 
 
 if __name__ == "__main__":
