@@ -122,9 +122,7 @@ class TestReceiverConnectionPool(CustomTestCase):
         cached = [{"rank_ip": "10.0.0.1", "rank_port": 1001}]
         manager = object.__new__(CommonKVManager)
         manager.connection_pool = {"prefill:8998_0_0_0": cached}
-        manager.connection_pool_generations = {
-            "prefill:8998_0_0_0": "current:4"
-        }
+        manager.connection_pool_generations = {"prefill:8998_0_0_0": "current:4"}
         manager.connection_lock = threading.Lock()
         manager.bootstrap_generations = {"prefill:8998": "current:4"}
 
@@ -209,9 +207,7 @@ class TestReceiverConnectionPool(CustomTestCase):
 
         self.assertEqual(receiver.fetch_count, 1)
         self.assertEqual(receiver.bootstrap_infos[0]["rank_port"], 2001)
-        self.assertEqual(
-            receiver.kv_mgr.connection_pool_generations[key], "new:4"
-        )
+        self.assertEqual(receiver.kv_mgr.connection_pool_generations[key], "new:4")
 
     @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=3.0)
     def test_waiting_timeout_invalidates_cached_generation(self, _mock_time):
