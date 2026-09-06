@@ -862,7 +862,39 @@ class HiCacheController:
         """Pick the draft L3 IO implementation."""
         self.draft_page_get_func = None
         self.draft_page_set_func = None
-        if not self.has_draft or not self.enable_storage:
+        if not self.has_draft:
+            return
+
+        anchor_pool = getattr(
+            self.mem_pool_host,
+            "anchor_entry",
+            None,
+        )
+        anchor_pool = (
+            anchor_pool.host_pool if anchor_pool is not None else self.mem_pool_host
+        )
+        attach_draft = getattr(anchor_pool, "attach_draft_host_pool", None)
+        if attach_draft is not None:
+            # SFA C8 target and draft are payload regions of the same logical
+            # page.  They deliberately bypass the legacy draft sidecar keys.
+            attach_draft(self.mem_pool_host_draft)
+            if not self.enable_storage:
+                return
+            if self.storage_backend_type != "mooncake":
+                raise ValueError(
+                    "SFA C8 logical-page L3 currently requires Mooncake Store"
+                )
+            if getattr(self.storage_backend.config, "standalone_storage", False):
+                raise ValueError(
+                    "SFA C8 draft L3 does not support Mooncake standalone_storage; "
+                    "its dummy segment is sized before the draft pool exists"
+                )
+            self.storage_backend.register_logical_page_pool_extension(
+                self.mem_pool_host_draft
+            )
+            return
+
+        if not self.enable_storage:
             return
 
         backend = self.storage_backend_type

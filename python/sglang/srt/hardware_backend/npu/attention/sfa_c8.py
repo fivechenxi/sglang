@@ -49,8 +49,8 @@ def get_sfa_c8_incompatibilities(
     # native 656-byte representation without reconstructing BF16 K/V tensors.
     # Keep the argument in this validation surface so all three roles are
     # covered by the same phase-boundary tests.
-    if hierarchical_cache_enabled:
-        incompatible.append("hierarchical cache")
+    if hierarchical_cache_enabled and disaggregation_mode != "prefill":
+        incompatible.append("hierarchical cache outside prefill mode")
     if cpu_offload_gb > 0:
         incompatible.append("CPU offload")
     if speculative_algorithm not in ("NONE", "EAGLE"):
