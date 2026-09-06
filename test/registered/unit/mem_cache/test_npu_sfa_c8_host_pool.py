@@ -14,17 +14,22 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-def _device_pool():
+def _device_pool(*, indexer_layer_ids=None):
     page_size = 4
     size = 8
+    if indexer_layer_ids is None:
+        indexer_layer_ids = [0]
     pool = SimpleNamespace(
         sfa_c8_enabled=True,
         sfa_c8_packed_head_dim=6,
         index_head_dim=2,
-        indexer_layer_num=1,
-        indexer_layer_ids=[0],
-        indexer_layer_id_to_slot={0: 0},
+        indexer_layer_num=len(indexer_layer_ids),
+        indexer_layer_ids=indexer_layer_ids,
+        indexer_layer_id_to_slot={
+            layer_id: slot for slot, layer_id in enumerate(indexer_layer_ids)
+        },
         layer_num=2,
+        page_size=page_size,
         layer_shard_enabled=False,
         start_layer=0,
         end_layer=2,
@@ -35,12 +40,29 @@ def _device_pool():
             2, size // page_size + 1, page_size, 1, 6, dtype=torch.int8
         ),
         index_k_buffer=torch.zeros(
-            1, size // page_size + 1, page_size, 1, 2, dtype=torch.bfloat16
+            len(indexer_layer_ids),
+            size // page_size + 1,
+            page_size,
+            1,
+            2,
+            dtype=torch.bfloat16,
         ),
     )
     pool.get_sfa_c8_page_payload_descriptor = lambda: (
-        {"name": "sfa", "buffer": pool.packed_kv_buffer},
-        {"name": "lightning_indexer", "buffer": pool.index_k_buffer},
+        {
+            "name": "sfa",
+            "buffer": pool.packed_kv_buffer,
+            "dtype": pool.packed_kv_buffer.dtype,
+            "layers": pool.layer_num,
+            "page_bytes": pool.packed_kv_buffer[0, 0].nbytes,
+        },
+        {
+            "name": "lightning_indexer",
+            "buffer": pool.index_k_buffer,
+            "dtype": pool.index_k_buffer.dtype,
+            "layers": pool.indexer_layer_num,
+            "page_bytes": pool.index_k_buffer[0, 0].nbytes,
+        },
     )
     return pool
 
@@ -67,7 +89,7 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
                 patch.object(sfa_c8_host, "TransferDirection", directions, create=True)
             )
             host.backup_from_device_all_layer(
-                device, torch.arange(4), torch.arange(4), "kernel_ascend"
+                device, torch.arange(4), torch.arange(4, 8), "kernel_ascend"
             )
 
         kwargs = transfer.call_args.kwargs
@@ -148,7 +170,7 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         store.mem_pool_host = wrapper
         store.mla_suffix = ""
         keys, ptrs, sizes = store._get_mla_buffer_meta(["prefix"], torch.arange(4))
-        self.assertEqual(["prefix__k_sfa_c8_logical_v1_p4_m2x6_i1x2_dm2x6_di1x2"], keys)
+        self.assertEqual([f"prefix__k_{target.storage_key_suffix}"], keys)
         self.assertEqual(1, len(ptrs))
         self.assertEqual(4, len(ptrs[0]))
         self.assertEqual(4, len(sizes[0]))
@@ -176,6 +198,178 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         )
         self.assertIsNone(controller.draft_page_get_func)
         self.assertIsNone(controller.draft_page_set_func)
+
+    def test_layout_fingerprint_covers_indexer_mapping_and_draft(self):
+        target = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(indexer_layer_ids=[0]),
+            1,
+            0,
+            4,
+            "page_first_kv_split",
+            pin_memory=False,
+        )
+        other_mapping = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(indexer_layer_ids=[1]),
+            1,
+            0,
+            4,
+            "page_first_kv_split",
+            pin_memory=False,
+        )
+        before_draft = target.storage_key_suffix
+
+        self.assertNotEqual(before_draft, other_mapping.storage_key_suffix)
+        self.assertTrue(before_draft.startswith("sfa_c8_logical_v2_p4_"))
+
+        target.attach_draft_host_pool(other_mapping)
+        self.assertNotEqual(before_draft, target.storage_key_suffix)
+
+    def test_device_payload_descriptor_is_validated(self):
+        device = _device_pool()
+        payloads = list(device.get_sfa_c8_page_payload_descriptor())
+        payloads[0] = {**payloads[0], "page_bytes": payloads[0]["page_bytes"] + 1}
+        device.get_sfa_c8_page_payload_descriptor = lambda: tuple(payloads)
+
+        with self.assertRaisesRegex(ValueError, "page bytes mismatch"):
+            NPUSFAC8TokenToKVPoolHost(
+                device, 1, 0, 4, "page_first_kv_split", pin_memory=False
+            )
+
+        with self.assertRaisesRegex(ValueError, "page sizes differ"):
+            NPUSFAC8TokenToKVPoolHost(
+                _device_pool(), 1, 0, 8, "page_first_kv_split", pin_memory=False
+            )
+
+    def test_page_indices_must_be_aligned_contiguous_and_in_range(self):
+        device = _device_pool()
+        host = NPUSFAC8TokenToKVPoolHost(
+            device, 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            host.get_logical_page_buffer_meta(torch.tensor([0, 1, 3, 4]))
+        with self.assertRaisesRegex(ValueError, "page boundary"):
+            host.get_logical_page_buffer_meta(torch.tensor([1, 2, 3, 4]))
+        with self.assertRaisesRegex(ValueError, "out-of-range"):
+            host.get_logical_page_buffer_meta(torch.arange(12, 16))
+        with self.assertRaisesRegex(ValueError, "duplicate pages"):
+            host.get_logical_page_buffer_meta(torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]))
+        with self.assertRaisesRegex(TypeError, "integer dtype"):
+            host.get_logical_page_buffer_meta(torch.arange(4, dtype=torch.float32))
+        with self.assertRaisesRegex(ValueError, "out-of-range"):
+            host.backup_from_device_all_layer(
+                device, torch.arange(4), torch.arange(4), "kernel_ascend"
+            )
+
+    def test_draft_attachment_rejects_ambiguous_ownership(self):
+        target = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        draft = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        other = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+
+        with self.assertRaisesRegex(ValueError, "cannot attach itself"):
+            target.attach_draft_host_pool(target)
+        target.attach_draft_host_pool(draft)
+        target.attach_draft_host_pool(draft)
+        with self.assertRaisesRegex(ValueError, "different draft"):
+            target.attach_draft_host_pool(other)
+        with self.assertRaisesRegex(ValueError, "cannot own another"):
+            draft.attach_draft_host_pool(other)
+
+        smaller_device = _device_pool()
+        smaller_device.size = 4
+        smaller_device.packed_kv_buffer = torch.zeros(2, 2, 4, 1, 6, dtype=torch.int8)
+        smaller_device.index_k_buffer = torch.zeros(1, 2, 4, 1, 2, dtype=torch.bfloat16)
+        smaller = NPUSFAC8TokenToKVPoolHost(
+            smaller_device, 2, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        fresh_target = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        with self.assertRaisesRegex(ValueError, "device capacities differ"):
+            fresh_target.attach_draft_host_pool(smaller)
+
+    def test_mooncake_l3_requires_explicit_cache_identity(self):
+        host = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        backend = SimpleNamespace(
+            batch_put_from_multi_buffers=lambda *args: [0],
+            batch_get_into_multi_buffers=lambda *args: [1],
+            register_buffer=lambda *args: 0,
+        )
+        store = object.__new__(MooncakeStore)
+        store.store = backend
+        store.extra_backend_tag = None
+        store._replicate_config_cls = SimpleNamespace
+
+        with self.assertRaisesRegex(ValueError, "extra_backend_tag"):
+            store.register_mem_pool_host(host)
+
+        store.extra_backend_tag = "model-tokenizer-release"
+        store.register_mem_pool_host(host)
+        self.assertGreater(store.gb_per_page, 0)
+
+    def test_mooncake_multi_buffer_result_count_is_validated(self):
+        store = object.__new__(MooncakeStore)
+        store._use_group_semantics = False
+        store._replicate_config_cls = SimpleNamespace
+        store.store = SimpleNamespace(
+            batch_put_from_multi_buffers=lambda *args: [],
+            batch_get_into_multi_buffers=lambda *args: [],
+        )
+        keys = ["page"]
+        ptrs = [[1, 2]]
+        sizes = [[8, 16]]
+
+        with self.assertRaisesRegex(RuntimeError, "put returned"):
+            store._put_batch_zero_copy_impl(keys, ptrs, sizes)
+        with self.assertRaisesRegex(RuntimeError, "get returned"):
+            store._get_batch_zero_copy_impl(keys, ptrs, sizes)
+
+        store.store.batch_get_into_multi_buffers = lambda *args: [8]
+        with self.assertRaisesRegex(RuntimeError, "partial logical page"):
+            store._get_batch_zero_copy_impl(keys, ptrs, sizes)
+
+        store.store.batch_get_into_multi_buffers = lambda *args: [24]
+        self.assertEqual(store._get_batch_zero_copy_impl(keys, ptrs, sizes), [24])
+
+        with self.assertRaisesRegex(ValueError, "pointer and size counts differ"):
+            store._pack_multi_buffer_meta(["page"], [1], [])
+
+    def test_mooncake_group_identity_includes_sfa_layout(self):
+        host = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        calls = []
+
+        def put(keys, ptrs, sizes, config):
+            calls.append((keys, ptrs, sizes, config))
+            return [0] * len(keys)
+
+        store = object.__new__(MooncakeStore)
+        store.mem_pool_host = host
+        store.extra_backend_tag = "model-release"
+        store.mla_suffix = ""
+        store.is_mla_backend = True
+        store.should_split_heads = False
+        store.enable_storage_metrics = False
+        store._use_group_semantics = True
+        store._replicate_config_cls = SimpleNamespace
+        store.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [0] * len(keys),
+            batch_put_from_multi_buffers=put,
+        )
+
+        self.assertEqual(store.batch_set_v1(["page"], torch.arange(4)), [True])
+        keys, _, _, config = calls[0]
+        self.assertEqual(keys, [f"model-release_page__k_{host.storage_key_suffix}"])
+        self.assertEqual(config.group_ids, [f"sglang-hicache:{keys[0]}"])
 
 
 if __name__ == "__main__":

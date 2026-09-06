@@ -28,8 +28,9 @@ payload：
 | draft Lightning Indexer | BF16 | 32,768 |
 | 合计 |  | 7,354,368 |
 
-四段 payload 共用 logical page ID、allocator 和有效性状态。它们不是四个独立缓存，
-也不分别做 prefix 匹配。
+四段 payload 共用 logical page ID 和有效性状态。target host pool 的 allocator 是唯一
+权威分配器；draft host pool 只按同一 logical page ID 提供 payload，不独立参与分配、
+命中或释放。它们不是四个独立缓存，也不分别做 prefix 匹配。
 
 ## 为什么
 
@@ -62,9 +63,11 @@ L1 NPU <-> L2 Host <-> optional L3 storage
 
 ### 匹配与身份
 
-匹配 key 由 token page hash、现有 `extra_key` 和 cache identity 组成。cache
-identity 至少覆盖模型权重、tokenizer、SFA 布局版本、页大小、物理层映射和并行
-拓扑。
+匹配 key 由 token page hash、现有 `extra_key` 和 cache identity 组成。启用 SFA C8
+L3 时必须显式配置非空的 Mooncake `extra_backend_tag`，用于区分准确的模型权重、
+tokenizer 和服务 release。代码生成的布局指纹另行覆盖 target/draft、dtype、页大小、
+物理层范围、Indexer layer-to-slot mapping 和每行宽度；两层身份共同进入最终 key，
+不能用布局指纹替代模型版本隔离。
 
 Radix tree 只匹配该 key。SFA main 可作为逻辑页的 anchor，但不会通过比较 SFA
 字节判断命中。四段 payload 只有一个 `valid` 状态；全部完成前不得发布 host node。
@@ -81,8 +84,9 @@ draft_sfa[page]
 draft_li[page]
 ```
 
-四个 region 使用同一个 logical page allocator。设备池提供真实 dtype、row bytes、
-layer-to-slot mapping 和 buffer 地址，其他模块不得从模型常量重建布局。
+target allocator 为四个 region 分配同一个 logical page ID；draft 自身的分配状态不进入
+缓存生命周期。设备池提供真实 dtype、row bytes、layer-to-slot mapping 和 buffer 地址，
+其他模块不得从模型常量重建布局。
 
 D2H/H2D 按 source/destination physical page index 直接复制原始行：
 
@@ -115,6 +119,9 @@ key 对应四个已注册地址，不需要把数据拼成连续临时 buffer。
 
 L3 对每页只执行一次 exists、put 或 get。实现必须把一次成功定义为四段 payload
 全部完成；若当前 Mooncake 版本不能提供该语义，则启动失败，不能退化为部分成功。
+Mooncake 返回的结果数必须与提交的逻辑 key 数相等，读取成功的字节数也必须等于该
+逻辑页四段 payload 的总字节数；否则本次操作整体报错，不能把缺失或部分读取误判为
+成功。
 读取失败时整页 miss 并重新计算。不创建 main/indexer/draft sidecar key，不需要
 commit marker、多对象写入顺序或最小命中长度合并。
 
@@ -145,7 +152,7 @@ Mooncake `standalone_storage` 同样在 draft 创建前固定 segment 大小，�
 
 1. 为 device pool 增加 SFA C8 page payload descriptor。
 2. 在 HiCache assembler 中增加 P-only SFA C8 strategy，阻止进入 BF16 MLA pool。
-3. 实现单 allocator、四 region、单 valid 状态的 host pool。
+3. 实现 target 权威 allocator、四 region、单 valid 状态的 host pool。
 4. 实现四段 payload 的 indexed D2H/H2D 路径。
 5. 为 storage backend 增加单 key multi-buffer logical-page 接口。
 6. Mooncake backend 使用现有 multi-buffer zero-copy API。

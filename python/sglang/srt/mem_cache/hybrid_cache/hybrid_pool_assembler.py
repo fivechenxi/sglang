@@ -1030,11 +1030,17 @@ class _NPUSFAC8Strategy(StackStrategy):
     ):
         if server_args.disaggregation_mode != "prefill":
             raise ValueError("SFA C8 HiCache is currently supported on Prefill only")
+        if server_args.hicache_io_backend != "kernel_ascend":
+            raise ValueError(
+                "SFA C8 HiCache requires --hicache-io-backend kernel_ascend"
+            )
         if server_args.hicache_size > 0:
             raise ValueError(
                 "SFA C8 HiCache currently requires --hicache-ratio; fixed "
                 "--hicache-size cannot include the late-created draft pool yet"
             )
+        if server_args.hicache_ratio <= 0:
+            raise ValueError("SFA C8 HiCache requires a positive --hicache-ratio")
         if storage_backend not in (None, "mooncake"):
             raise ValueError("SFA C8 logical-page L3 currently requires Mooncake Store")
         full_layer_mapping = {i: i for i in range(kvcache.layer_num)}

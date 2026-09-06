@@ -77,7 +77,7 @@ Host 继续使用原生 dtype 和布局；Mooncake 通过 multi-buffer API 对�
 
 采用“一个逻辑页、一个 key、四段 payload”：
 
-- L2 使用一个 allocator 和一个 valid 状态；
+- L2 仅使用 target allocator 作为权威分配器，并使用一个 valid 状态；
 - 四段 Host region 共用 logical page ID；
 - prefix lookup 只执行一次；
 - L3 每页只创建一个 Mooncake object；
@@ -87,9 +87,30 @@ Host 继续使用原生 dtype 和布局；Mooncake 通过 multi-buffer API 对�
 不采用四个 `PoolName` sidecar 作为独立 L3 对象，也不对四段 payload 分别做
 prefix match。
 
-## 实现前实测项
+## 深度审查后的约束
 
-1. 当前 Mooncake 版本的 multi-buffer API 对每个 key 返回单一、完整的结果。
+代码审查确认，L1→L2 的 target 与 draft 搬运位于同一个 completion event 内；
+L2→L1 也在发布 layer-done 前恢复两者。因此 logical page 的可见性边界覆盖四段
+payload，而不是只覆盖 target。
+
+为避免“命中 key 正确、恢复字节错误”这一类静默错误，实现增加以下硬约束：
+
+- 启动时核对 device descriptor 的 region 顺序、dtype、shape、layer 数、page bytes
+  和 Indexer layer-to-slot mapping；
+- 运行时拒绝非整数、非整页、页内不连续、越界或重复的 Host/Device page indices；
+- L3 布局指纹覆盖 target/draft 的 dtype、层范围、Indexer 物理层映射、页大小和行宽；
+- `extra_backend_tag` 必须另外标识准确的模型、tokenizer 和 release；
+- Mooncake multi-buffer 返回项数必须与 key 数一致，成功读取字节数必须等于逻辑页
+  payload 总大小；
+- 错误的 HiCache IO backend、固定 `hicache-size` 和非正 ratio 在启动阶段直接失败。
+
+Mooncake 当前实现会为一个 multi-buffer key 创建一个对象，成功读取返回该对象的
+总字节数；因此上述完整字节数检查可以识别旧布局碰撞或部分读取，而不会把半页发布
+为有效缓存。
+
+## 上线前实测项
+
+1. 候选镜像内 Mooncake 版本的 multi-buffer API 对每个 key 返回单一、完整的结果。
 2. 四个 page-first buffer 的地址、大小、对齐和注册范围正确。
 3. P 侧 NEXTN draft 的真实层数、dtype 和 layer mapping 与 descriptor 一致。
 4. 不同 attention rank 的 payload 是否一致；不一致时 L3 key 必须包含 rank。
