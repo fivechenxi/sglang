@@ -5,8 +5,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.mem_cache.pool_host import sfa_c8 as sfa_c8_host
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.pool_host import sfa_c8 as sfa_c8_host
 from sglang.srt.mem_cache.pool_host.sfa_c8 import NPUSFAC8TokenToKVPoolHost
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -64,9 +64,7 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                patch.object(
-                    sfa_c8_host, "TransferDirection", directions, create=True
-                )
+                patch.object(sfa_c8_host, "TransferDirection", directions, create=True)
             )
             host.backup_from_device_all_layer(
                 device, torch.arange(4), torch.arange(4), "kernel_ascend"
@@ -150,9 +148,7 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         store.mem_pool_host = wrapper
         store.mla_suffix = ""
         keys, ptrs, sizes = store._get_mla_buffer_meta(["prefix"], torch.arange(4))
-        self.assertEqual(
-            ["prefix__k_sfa_c8_logical_v1_p4_m2x6_i1x2_dm2x6_di1x2"], keys
-        )
+        self.assertEqual(["prefix__k_sfa_c8_logical_v1_p4_m2x6_i1x2_dm2x6_di1x2"], keys)
         self.assertEqual(1, len(ptrs))
         self.assertEqual(4, len(ptrs[0]))
         self.assertEqual(4, len(sizes[0]))

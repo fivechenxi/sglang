@@ -1008,10 +1008,9 @@ class _DsaStrategy(StackStrategy):
 
 class _NPUSFAC8Strategy(StackStrategy):
     def matches(self, kvcache, components):
-        return (
-            getattr(kvcache, "sfa_c8_enabled", False)
-            and components == {ComponentType.FULL}
-        )
+        return getattr(kvcache, "sfa_c8_enabled", False) and components == {
+            ComponentType.FULL
+        }
 
     def build(
         self,
@@ -1037,9 +1036,7 @@ class _NPUSFAC8Strategy(StackStrategy):
                 "--hicache-size cannot include the late-created draft pool yet"
             )
         if storage_backend not in (None, "mooncake"):
-            raise ValueError(
-                "SFA C8 logical-page L3 currently requires Mooncake Store"
-            )
+            raise ValueError("SFA C8 logical-page L3 currently requires Mooncake Store")
         full_layer_mapping = {i: i for i in range(kvcache.layer_num)}
         host_pool = NPUSFAC8TokenToKVPoolHost(
             kvcache,

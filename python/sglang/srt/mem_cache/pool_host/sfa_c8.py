@@ -51,8 +51,7 @@ class NPUSFAC8TokenToKVPoolHost(HostKVCache):
             raise ValueError("SFA C8 HiCache does not yet support layer-sharded pools")
         if layout != "page_first_kv_split":
             raise ValueError(
-                "SFA C8 HiCache requires page_first_kv_split, "
-                f"got {layout!r}"
+                "SFA C8 HiCache requires page_first_kv_split, " f"got {layout!r}"
             )
         payloads = device_pool.get_sfa_c8_page_payload_descriptor()
         if not payloads or payloads[0]["name"] != "sfa":
