@@ -92,6 +92,24 @@ class AscendTransferEngine(MooncakeTransferEngine):
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
 
+    def batch_transfer_sync(
+        self,
+        session_id: str,
+        buffers: List[int],
+        peer_buffer_addresses: List[int],
+        lengths: List[int],
+    ) -> int:
+        # Transfers can run in ThreadPoolExecutor workers.  The NPU current
+        # device is thread-local and a fresh worker defaults to device 0.  The
+        # MemFabric 1.2 lazy connection path consults that current device while
+        # creating its RDev, so an unbound TP worker can initialize the wrong
+        # physical device even though initialize() received the correct npu_id.
+        if torch.npu.current_device() != self.npu_id:
+            torch.npu.set_device(self.npu_id)
+        return super().batch_transfer_sync(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
+
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
