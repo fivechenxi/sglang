@@ -99,6 +99,43 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         self.assertIs(kwargs["device_index_k"], device.index_k_buffer)
         self.assertEqual("d2h", kwargs["direction"])
 
+    def test_npu_load_restores_all_regions_once_at_layer_zero(self):
+        device = _device_pool()
+        host = NPUSFAC8TokenToKVPoolHost(
+            device, 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        transfer = Mock()
+        directions = SimpleNamespace(D2H="d2h", H2D="h2d")
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sfa_c8_host, "_is_npu", True))
+            stack.enter_context(
+                patch.object(
+                    sfa_c8_host,
+                    "transfer_kv_dim_exchange",
+                    transfer,
+                    create=True,
+                )
+            )
+            stack.enter_context(
+                patch.object(sfa_c8_host, "TransferDirection", directions, create=True)
+            )
+            for layer_id in range(device.layer_num):
+                host.load_to_device_per_layer(
+                    device,
+                    torch.arange(4),
+                    torch.arange(4, 8),
+                    layer_id,
+                    "kernel_ascend",
+                )
+
+        transfer.assert_called_once()
+        kwargs = transfer.call_args.kwargs
+        self.assertIs(kwargs["device_k"], device.packed_kv_buffer)
+        self.assertIs(kwargs["host_k"], host.packed_kv_buffer)
+        self.assertIs(kwargs["device_index_k"], device.index_k_buffer)
+        self.assertIs(kwargs["host_index_k"], host.index_k_buffer)
+        self.assertEqual("h2d", kwargs["direction"])
+
     def test_physical_page_remap_round_trip_preserves_both_regions(self):
         device = _device_pool()
         host = NPUSFAC8TokenToKVPoolHost(
@@ -314,6 +351,51 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         store.extra_backend_tag = "model-tokenizer-release"
         store.register_mem_pool_host(host)
         self.assertGreater(store.gb_per_page, 0)
+
+    def test_draft_registration_refreshes_logical_page_metric_size(self):
+        target = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        draft = NPUSFAC8TokenToKVPoolHost(
+            _device_pool(), 1, 0, 4, "page_first_kv_split", pin_memory=False
+        )
+        store = object.__new__(MooncakeStore)
+        store.store = SimpleNamespace(
+            register_buffer=lambda *args: 0,
+            batch_put_from_multi_buffers=lambda *args: [0],
+            batch_get_into_multi_buffers=lambda *args: [1],
+        )
+        store.extra_backend_tag = "model-tokenizer-release"
+        store._replicate_config_cls = SimpleNamespace
+
+        store.register_mem_pool_host(target)
+        target_only = store.gb_per_page
+        target.attach_draft_host_pool(draft)
+        store.register_logical_page_pool_extension(draft)
+
+        expected = (
+            (target.size_per_token + draft.size_per_token)
+            * target.page_size
+            / (1 << 30)
+        )
+        self.assertEqual(expected, store.gb_per_page)
+        self.assertGreater(store.gb_per_page, target_only)
+
+    def test_mooncake_host_registration_handles_empty_and_alias_buffers(self):
+        calls = []
+        store = object.__new__(MooncakeStore)
+        store.store = SimpleNamespace(
+            register_buffer=lambda ptr, size: calls.append((ptr, size)) or 0
+        )
+        buffer = torch.zeros(8, dtype=torch.uint8)
+
+        store._register_host_buffer_once(torch.empty(0, dtype=torch.uint8))
+        store._register_host_buffer_once(buffer)
+        store._register_host_buffer_once(buffer.view_as(buffer))
+        self.assertEqual([(buffer.data_ptr(), buffer.nbytes)], calls)
+
+        with self.assertRaisesRegex(RuntimeError, "different extents"):
+            store._register_host_buffer_once(buffer[:4])
 
     def test_mooncake_multi_buffer_result_count_is_validated(self):
         store = object.__new__(MooncakeStore)

@@ -64,6 +64,11 @@ class NPUSFAC8TokenToKVPoolHost(HostKVCache):
         self.indexer_layer_num = device_pool.indexer_layer_num
         self.indexer_layer_ids = tuple(device_pool.indexer_layer_ids)
         self.indexer_layer_id_to_slot = dict(device_pool.indexer_layer_id_to_slot)
+        # SFA C8 rejects layer sharding above, so the host payload owns every
+        # layer in the device pool.  Set this before HostKVCache.__init__ calls
+        # get_size_per_token() and init_kv_buffer(); keep the getter side-effect
+        # free so later size queries cannot mutate the physical layout.
+        self.layer_num = device_pool.layer_num
         self._validate_device_payloads(device_pool, payloads, page_size)
         self.draft_host_pool = None
         self.logical_page_anchor = None
@@ -178,7 +183,6 @@ class NPUSFAC8TokenToKVPoolHost(HostKVCache):
             )
 
     def get_size_per_token(self):
-        self.layer_num = self._effective_host_layer_num()
         packed_bytes = self.layer_num * self.packed_head_dim
         indexer_bytes = 0
         if self.index_head_dim is not None:
@@ -354,6 +358,10 @@ class NPUSFAC8TokenToKVPoolHost(HostKVCache):
         # Restore every physical region in one operation.  The controller calls
         # this method once per layer; doing the work at layer zero keeps the
         # existing layer-done protocol while avoiding repeated full-pool copies.
+        # transfer_kv_dim_exchange launches both SFA and Indexer copies on the
+        # controller's current load stream.  The per-layer events recorded after
+        # this call (including no-op layers) are therefore ordered after all
+        # four target/draft payload copies, so no layer can observe a partial page.
         if layer_id != 0:
             return
         page_pairs = self._page_pairs(host_indices, device_indices, device_pool)

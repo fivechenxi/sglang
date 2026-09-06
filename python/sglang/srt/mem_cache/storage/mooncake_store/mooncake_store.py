@@ -698,14 +698,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._register_host_buffer_once(buf)
 
     def _register_host_buffer_once(self, buffer) -> None:
-        registered = getattr(self, "_registered_host_buffer_ptrs", None)
+        size = buffer.numel() * buffer.element_size()
+        if size == 0:
+            # Empty optional regions carry no payload and Mooncake cannot make
+            # a useful registration for their sentinel data_ptr().
+            return
+        registered = getattr(self, "_registered_host_buffer_sizes", None)
         if registered is None:
-            registered = self._registered_host_buffer_ptrs = set()
+            registered = self._registered_host_buffer_sizes = {}
         ptr = buffer.data_ptr()
         if ptr in registered:
+            if registered[ptr] != size:
+                raise RuntimeError(
+                    "Mooncake host buffers share a start address but expose "
+                    f"different extents: ptr={ptr}, "
+                    f"registered={registered[ptr]}, requested={size}"
+                )
             return
         super().register_buffer(buffer)
-        registered.add(ptr)
+        registered[ptr] = size
 
     def register_logical_page_pool_extension(self, host_pool: HostKVCache):
         """Register extra regions folded into the anchor's single page key."""
@@ -719,6 +730,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         for buf in self._iter_host_pool_buffers(host_pool):
             self._register_host_buffer_once(buf)
+        # The anchor is registered before the draft pool is attached.  Refresh
+        # the metric denominator now that one logical page includes both target
+        # and draft regions; no storage operation is issued during this setup.
         bytes_per_page = (
             self.mem_pool_host.get_ksize_per_token() * self.mem_pool_host.page_size
         )
@@ -1336,6 +1350,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             results = self.store.batch_put_from_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes, config
             )
+            # Mooncake's multi-buffer API returns one status per key (not one
+            # status per constituent buffer).  This validation intentionally
+            # protects every multi-buffer caller, including ordinary MLA pools.
             if len(results) != len(key_strs):
                 raise RuntimeError(
                     "Mooncake multi-buffer put returned an unexpected result "
@@ -1356,6 +1373,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             results = self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
             )
+            # The API returns one byte count per key.  A logical page is atomic,
+            # so a non-negative short read must not be published as a cache hit.
             if len(results) != len(key_strs):
                 raise RuntimeError(
                     "Mooncake multi-buffer get returned an unexpected result "

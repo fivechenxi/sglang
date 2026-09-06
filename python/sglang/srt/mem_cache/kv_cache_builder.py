@@ -116,9 +116,11 @@ def maybe_register_hicache_draft(
     )
     if getattr(pool, "sfa_c8_enabled", False):
         # The draft shares the target logical page ids.  Pick a token budget
-        # in the middle of the final target page; HostKVCache rounds it up to
-        # exactly the same page count.  Using the midpoint avoids a floating
-        # point boundary at `primary.size - 1` for large pools.
+        # in the middle of the final target page.  HostKVCache currently uses
+        # `page_num = raw_tokens // page_size + 1`, so any value in that page
+        # produces exactly the target page count.  The midpoint avoids a float
+        # round-trip near either boundary; attach_draft_host_pool() then asserts
+        # the final target/draft page counts and token capacities are identical.
         raw_draft_tokens = max(primary.size - max(1, page_size // 2), 0)
         kw["host_to_device_ratio"] = raw_draft_tokens / pool.size
         draft_host_pool = NPUSFAC8TokenToKVPoolHost(pool, **kw)
