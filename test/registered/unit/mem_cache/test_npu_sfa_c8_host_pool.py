@@ -151,14 +151,20 @@ class TestNPUSFAC8HostPool(unittest.TestCase):
         host_indices = torch.arange(8, 12)
         device_indices = torch.arange(4, 8)
 
-        host.backup_from_device_all_layer(
-            device, host_indices, device_indices, "kernel_ascend"
-        )
-        device.packed_kv_buffer[:, 1].zero_()
-        device.index_k_buffer[:, 1].zero_()
-        host.load_to_device_per_layer(
-            device, host_indices, device_indices, 0, "kernel_ascend"
-        )
+        # This is a CPU remapping test.  On an Ascend test host the module-level
+        # capability probe is true even though this fixture deliberately owns
+        # CPU tensors, so force the portable copy path here.  The NPU dispatch
+        # contract is covered separately by the mocked dim-exchange tests and
+        # by the real-device HiCache integration test.
+        with patch.object(sfa_c8_host, "_is_npu", False):
+            host.backup_from_device_all_layer(
+                device, host_indices, device_indices, "kernel_ascend"
+            )
+            device.packed_kv_buffer[:, 1].zero_()
+            device.index_k_buffer[:, 1].zero_()
+            host.load_to_device_per_layer(
+                device, host_indices, device_indices, 0, "kernel_ascend"
+            )
 
         self.assertTrue(torch.all(device.packed_kv_buffer[:, 1] == 7))
         self.assertTrue(torch.all(device.index_k_buffer[:, 1] == 3))
