@@ -15,8 +15,8 @@ import numpy.typing as npt
 import requests
 import torch.distributed as dist
 import zmq
-from zmq.utils.monitor import recv_monitor_message
 from aiohttp import web
+from zmq.utils.monitor import recv_monitor_message
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -1635,9 +1635,7 @@ class CommonKVReceiver(BaseKVReceiver):
             # Destination metadata is sent before P queues and computes the
             # prompt. Only actual P-side chunk progress starts/refreshed the KV
             # transfer inactivity deadline.
-            deadline_start = self.kv_mgr.transfer_progress_time.get(
-                self.bootstrap_room
-            )
+            deadline_start = self.kv_mgr.transfer_progress_time.get(self.bootstrap_room)
             if deadline_start is None:
                 return None
             timeout_phase = "KV transfer inactivity"

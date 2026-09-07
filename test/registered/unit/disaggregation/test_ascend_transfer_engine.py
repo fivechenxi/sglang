@@ -77,7 +77,9 @@ def test_batch_transfer_does_not_rebind_correct_npu():
     engine.npu_id = 7
 
     with (
-        patch.object(ascend_transfer_engine.torch.npu, "current_device", return_value=7),
+        patch.object(
+            ascend_transfer_engine.torch.npu, "current_device", return_value=7
+        ),
         patch.object(ascend_transfer_engine.torch.npu, "set_device") as set_device,
         patch.object(
             ascend_transfer_engine.MooncakeTransferEngine,

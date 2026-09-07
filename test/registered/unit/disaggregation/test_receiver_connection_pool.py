@@ -60,9 +60,7 @@ class TestReceiverSocketConfiguration(CustomTestCase):
         ):
             CommonKVReceiver._connect("tcp://127.0.0.1:12345")
 
-        self.assertNotIn(
-            call(zmq.RECONNECT_IVL, -1), socket.setsockopt.call_args_list
-        )
+        self.assertNotIn(call(zmq.RECONNECT_IVL, -1), socket.setsockopt.call_args_list)
         self.assertIn(call(zmq.LINGER, 0), socket.setsockopt.call_args_list)
 
 
