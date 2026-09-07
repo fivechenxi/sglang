@@ -91,6 +91,9 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    // Additional prompt material rendered by the chat template but deliberately
+    // excluded from cache-routing identity (for example tool schemas).
+    decode_extra_text: Option<String>,
     input_tokens: Option<usize>,
     input_multiplier: usize,
     model_id: Option<&'a str>,
@@ -1284,13 +1287,17 @@ impl PDRouter {
     }
 
     fn estimate_decode_reservation(&self, context: &PDRequestContext<'_>) -> usize {
-        let input_tokens = context.input_tokens.unwrap_or_else(|| {
+        let mut input_tokens = context.input_tokens.unwrap_or_else(|| {
             context
                 .request_text
                 .as_deref()
                 .map(|text| self.estimate_token_count(text, context.model_id))
                 .unwrap_or(0)
         });
+        if let Some(extra_text) = context.decode_extra_text.as_deref() {
+            input_tokens = input_tokens
+                .saturating_add(self.estimate_token_count(extra_text, context.model_id));
+        }
         let sequences = context.batch_size.unwrap_or(1).max(1);
         input_tokens
             .saturating_mul(context.input_multiplier.max(1))
@@ -1298,6 +1305,27 @@ impl PDRouter {
                 self.decode_admission_token_overhead
                     .saturating_mul(sequences),
             )
+    }
+
+    #[allow(deprecated)]
+    fn build_chat_decode_extra_text(body: &ChatCompletionRequest) -> Option<String> {
+        // SGLang renders tool/function definitions into the model prompt.  They
+        // are intentionally absent from `extract_text_for_routing`, but D must
+        // reserve KV for them.  JSON is not byte-for-byte the final chat
+        // template, so the configured per-sequence overhead remains the safety
+        // margin for template control tokens.
+        let mut parts = Vec::with_capacity(2);
+        if let Some(tools) = body.tools.as_ref() {
+            if let Ok(serialized) = serde_json::to_string(tools) {
+                parts.push(serialized);
+            }
+        }
+        if let Some(functions) = body.functions.as_ref() {
+            if let Ok(serialized) = serde_json::to_string(functions) {
+                parts.push(serialized);
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     fn acquire_decode_admission(
@@ -2077,6 +2105,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            decode_extra_text: None,
             input_tokens,
             input_multiplier: 1,
             model_id,
@@ -2110,6 +2139,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            decode_extra_text: Self::build_chat_decode_extra_text(body),
             input_tokens: None,
             input_multiplier: body.n.unwrap_or(1) as usize,
             model_id,
@@ -2148,6 +2178,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            decode_extra_text: None,
             input_tokens: None,
             input_multiplier: 1,
             model_id,
@@ -2176,6 +2207,7 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            decode_extra_text: None,
             input_tokens: None,
             input_multiplier: 1,
             model_id,
@@ -2317,6 +2349,34 @@ mod tests {
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
         );
+    }
+
+    #[test]
+    fn test_chat_decode_admission_counts_tool_schema_separately_from_routing_text() {
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_inventory",
+                    "description": "unique-tool-schema-marker",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"sku": {"type": "string"}}
+                    }
+                }
+            }]
+        }))
+        .expect("valid tool-enabled chat request");
+
+        let routing_text = PDRouter::build_chat_request_text(&body).unwrap();
+        assert_eq!(routing_text, "hello");
+
+        let decode_extra = PDRouter::build_chat_decode_extra_text(&body)
+            .expect("tool schema must be included in D admission accounting");
+        assert!(decode_extra.contains("lookup_inventory"));
+        assert!(decode_extra.contains("unique-tool-schema-marker"));
     }
 
     #[tokio::test]
@@ -2561,6 +2621,7 @@ mod tests {
             is_stream: false,
             return_logprob: false,
             request_text: Some("x".repeat(50)),
+            decode_extra_text: None,
             input_tokens: Some(50),
             input_multiplier: 1,
             model_id: None,
@@ -2618,6 +2679,7 @@ mod tests {
             is_stream: true,
             return_logprob: false,
             request_text: Some("x".repeat(50)),
+            decode_extra_text: None,
             input_tokens: Some(50),
             input_multiplier: 1,
             model_id: None,
