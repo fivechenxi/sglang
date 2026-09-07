@@ -33,6 +33,8 @@ class TestRouterArgs:
         assert args.decode_policy is None
         assert args.pd_prefill_admission_max_cold_tokens == 0
         assert args.pd_prefill_admission_max_cold_requests == 0
+        assert args.pd_decode_admission_max_tokens == 0
+        assert args.pd_decode_admission_token_overhead == 0
 
         # Test service discovery defaults
         assert args.service_discovery is False
@@ -606,6 +608,10 @@ class TestParseRouterArgs:
                 "2.5",
                 "--pd-prefill-admission-retry-after-secs",
                 "3",
+                "--pd-decode-admission-max-tokens",
+                "150000",
+                "--pd-decode-admission-token-overhead",
+                "640",
             ]
         )
         assert router_args.pd_prefill_admission_max_cold_tokens == 65536
@@ -613,6 +619,8 @@ class TestParseRouterArgs:
         assert router_args.pd_prefill_admission_cold_request_threshold_tokens == 8192
         assert router_args.pd_prefill_admission_chars_per_token == 2.5
         assert router_args.pd_prefill_admission_retry_after_secs == 3
+        assert router_args.pd_decode_admission_max_tokens == 150000
+        assert router_args.pd_decode_admission_token_overhead == 640
 
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""

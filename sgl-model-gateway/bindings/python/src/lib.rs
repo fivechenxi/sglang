@@ -395,6 +395,8 @@ struct Router {
     pd_prefill_admission_cold_request_threshold_tokens: usize,
     pd_prefill_admission_chars_per_token: f32,
     pd_prefill_admission_retry_after_secs: u64,
+    pd_decode_admission_max_tokens: usize,
+    pd_decode_admission_token_overhead: usize,
     max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
@@ -614,6 +616,10 @@ impl Router {
                 self.pd_prefill_admission_chars_per_token,
                 self.pd_prefill_admission_retry_after_secs,
             )
+            .pd_decode_admission(
+                self.pd_decode_admission_max_tokens,
+                self.pd_decode_admission_token_overhead,
+            )
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -730,6 +736,8 @@ impl Router {
         pd_prefill_admission_cold_request_threshold_tokens = 0,
         pd_prefill_admission_chars_per_token = 3.0,
         pd_prefill_admission_retry_after_secs = 1,
+        pd_decode_admission_max_tokens = 0,
+        pd_decode_admission_token_overhead = 0,
         max_concurrent_requests = -1,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
@@ -828,6 +836,8 @@ impl Router {
         pd_prefill_admission_cold_request_threshold_tokens: usize,
         pd_prefill_admission_chars_per_token: f32,
         pd_prefill_admission_retry_after_secs: u64,
+        pd_decode_admission_max_tokens: usize,
+        pd_decode_admission_token_overhead: usize,
         max_concurrent_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
@@ -939,6 +949,8 @@ impl Router {
             pd_prefill_admission_cold_request_threshold_tokens,
             pd_prefill_admission_chars_per_token,
             pd_prefill_admission_retry_after_secs,
+            pd_decode_admission_max_tokens,
+            pd_decode_admission_token_overhead,
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,
