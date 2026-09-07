@@ -1611,7 +1611,10 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
         if self.init_time is None:
-            return None
+            # Start the waiting deadline on the first receiver poll, before
+            # decode KV preallocation. send_metadata() resets init_time so the
+            # subsequent transfer phase still gets its own full deadline.
+            self.init_time = time.time()
         elapsed = time.time() - self.init_time
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
