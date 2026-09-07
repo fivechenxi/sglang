@@ -8,7 +8,9 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
+
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
@@ -43,6 +45,25 @@ class _FetchingReceiver(_ConcreteReceiver):
 
     def _register_kv_args(self):
         return True
+
+
+class TestReceiverSocketConfiguration(CustomTestCase):
+    def test_bootstrap_metadata_socket_keeps_automatic_reconnect_enabled(self):
+        context = Mock()
+        socket = context.socket.return_value
+
+        with (
+            patch.object(CommonKVReceiver, "_ctx", context),
+            patch.object(CommonKVReceiver, "_socket_cache", {}),
+            patch.object(CommonKVReceiver, "_socket_locks", {}),
+            patch.object(CommonKVReceiver, "_global_lock", threading.Lock()),
+        ):
+            CommonKVReceiver._connect("tcp://127.0.0.1:12345")
+
+        self.assertNotIn(
+            call(zmq.RECONNECT_IVL, -1), socket.setsockopt.call_args_list
+        )
+        self.assertIn(call(zmq.LINGER, 0), socket.setsockopt.call_args_list)
 
 
 def _fetching_receiver(connection_pool):

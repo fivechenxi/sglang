@@ -1501,7 +1501,6 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
                 sock.setsockopt(zmq.LINGER, 0)
                 # Bound send so a dead peer cannot block the scheduler forever.
                 sock.setsockopt(
