@@ -228,6 +228,9 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Refreshed by P-side chunk progress. Transfer timeouts are based on
+            # inactivity and must not include prefill queueing or computation.
+            self.transfer_progress_time: Dict[int, float] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -278,6 +281,16 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def record_transfer_progress(self, bootstrap_room: int) -> None:
+        """Refresh a live decode request's KV-transfer inactivity deadline."""
+        if (
+            not hasattr(self, "transfer_progress_time")
+            or bootstrap_room not in self.request_status
+        ):
+            return
+        self.transfer_progress_time[bootstrap_room] = time.monotonic()
+        self.update_status(bootstrap_room, KVPoll.Transferring)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1240,6 +1253,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
+        self.metadata_sent: bool = False
         self.abort_notified: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._fetched_bootstrap_generation: Optional[str] = None
@@ -1610,12 +1624,25 @@ class CommonKVReceiver(BaseKVReceiver):
         raise NotImplementedError
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        if self.init_time is None:
-            # Start the waiting deadline on the first receiver poll, before
-            # decode KV preallocation. send_metadata() resets init_time so the
-            # subsequent transfer phase still gets its own full deadline.
-            self.init_time = time.time()
-        elapsed = time.time() - self.init_time
+        if not getattr(self, "metadata_sent", False):
+            # Before metadata is sent, WaitingForInput means the request is
+            # blocked on decode KV preallocation. Bound that wait separately.
+            if self.init_time is None:
+                self.init_time = time.monotonic()
+            deadline_start = self.init_time
+            timeout_phase = "decode KV preallocation"
+        else:
+            # Destination metadata is sent before P queues and computes the
+            # prompt. Only actual P-side chunk progress starts/refreshed the KV
+            # transfer inactivity deadline.
+            deadline_start = self.kv_mgr.transfer_progress_time.get(
+                self.bootstrap_room
+            )
+            if deadline_start is None:
+                return None
+            timeout_phase = "KV transfer inactivity"
+
+        elapsed = time.monotonic() - deadline_start
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
         logger.warning_once(
@@ -1625,7 +1652,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            f"in KVPoll.WaitingForInput",
+            f"during {timeout_phase}",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos(disconnect_endpoints=True)
@@ -1643,6 +1670,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "transfer_progress_time"):
+            self.kv_mgr.transfer_progress_time.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
