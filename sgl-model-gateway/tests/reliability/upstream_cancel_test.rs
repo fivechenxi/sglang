@@ -2521,6 +2521,63 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
+    /// A P-side cache-tier admission rejection is an overload response, not an
+    /// internal Router error. Preserve 429 so the MaaS gateway can retry a
+    /// different backend, and cancel the already-dispatched D request.
+    #[tokio::test]
+    async fn test_pd_prefill_429_is_forwarded_and_decode_is_cancelled() {
+        let prefill_port = 20320;
+        let decode_port = 20321;
+        set_fail_status_code(prefill_port, 429);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4320)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.fail_rate = 1.0;
+                    p
+                },
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"text":"x","stream":true}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("x-smg-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("prefill_tier_admission_limited")
+        );
+        assert!(resp.headers().contains_key("retry-after"));
+
+        clear_fail_status_code(prefill_port);
+        ctx.shutdown().await;
+    }
+
     /// http chat streaming, upstream connect failure BEFORE the
     /// `BreakerTrackedStream` is constructed: the breaker MUST still record
     /// a failure. Guards the pre-stream error arm in

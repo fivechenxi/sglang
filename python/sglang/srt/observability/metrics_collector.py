@@ -541,6 +541,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
+        self.prefill_tier_admission_inflight_tokens = Gauge(
+            name="sglang:prefill_tier_admission_inflight_tokens",
+            documentation="P-side admitted in-flight tokens by actual cache tier.",
+            labelnames=[*labels.keys(), "tier"],
+            multiprocess_mode="mostrecent",
+        )
+        self.prefill_tier_admission_rejections_total = Counter(
+            name="sglang:prefill_tier_admission_rejections_total",
+            documentation="P-side cache-tier admission rejections by limiting tier.",
+            labelnames=[*labels.keys(), "tier"],
+        )
         self.kv_transfer_bootstrap_ms = Histogram(
             name="sglang:kv_transfer_bootstrap_ms",
             documentation="Histogram of KV transfer bootstrap time in ms.",
@@ -1128,6 +1139,23 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def set_prefill_tier_admission_tokens(
+        self, *, cold: int, load_back: int, storage: int
+    ) -> None:
+        for tier, value in (
+            ("cold", cold),
+            ("load_back", load_back),
+            ("storage", storage),
+        ):
+            self.prefill_tier_admission_inflight_tokens.labels(
+                **self.labels, tier=tier
+            ).set(value)
+
+    def increment_prefill_tier_admission_rejection(self, tier: str) -> None:
+        self.prefill_tier_admission_rejections_total.labels(
+            **self.labels, tier=tier
+        ).inc(1)
 
     def observe_kv_transfer_metrics(
         self,

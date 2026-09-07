@@ -835,6 +835,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
+            self._release_prefill_tier_admission(req.rid)
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -935,6 +936,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        self._release_prefill_tier_admission(req.rid)
         if (
             req.req_pool_idx is not None
             or req.kv is not None
