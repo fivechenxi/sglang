@@ -248,6 +248,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_decode_admission(mut self, max_tokens: usize, token_overhead: usize) -> Self {
+        self.config.pd_decode_admission_max_tokens = max_tokens;
+        self.config.pd_decode_admission_token_overhead = token_overhead;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self

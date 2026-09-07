@@ -16,6 +16,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
 use super::{
+    decode_admission::{Controller as DecodeAdmissionController, Guard as DecodeAdmissionGuard},
     pd_types::api_path,
     prefill_admission::{Controller as PrefillAdmissionController, Guard as AdmissionGuard},
 };
@@ -59,8 +60,10 @@ pub struct PDRouter {
     pub enable_igw: bool,
     tokenizer_registry: Arc<TokenizerRegistry>,
     prefill_admission: Arc<PrefillAdmissionController>,
+    decode_admission: Arc<DecodeAdmissionController>,
     prefill_admission_chars_per_token: f32,
     prefill_admission_retry_after_secs: u64,
+    decode_admission_token_overhead: usize,
 }
 
 impl std::fmt::Debug for PDRouter {
@@ -71,6 +74,7 @@ impl std::fmt::Debug for PDRouter {
             .field("retry_config", &self.retry_config)
             .field("enable_igw", &self.enable_igw)
             .field("prefill_admission", &self.prefill_admission)
+            .field("decode_admission", &self.decode_admission)
             .finish_non_exhaustive()
     }
 }
@@ -88,6 +92,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     input_tokens: Option<usize>,
+    input_multiplier: usize,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
 }
@@ -114,6 +119,14 @@ struct BreakerOutcomesRecorded;
 /// 429 responses must be returned immediately to the upstream gateway.
 #[derive(Debug, Clone, Copy)]
 struct PrefillAdmissionRejected;
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeAdmissionRejected;
+
+struct PDAdmissionGuards {
+    prefill: Option<AdmissionGuard>,
+    decode: Option<DecodeAdmissionGuard>,
+}
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -227,12 +240,16 @@ impl PDRouter {
                 ctx.router_config
                     .pd_prefill_admission_cold_request_threshold_tokens,
             ),
+            decode_admission: DecodeAdmissionController::new(
+                ctx.router_config.pd_decode_admission_max_tokens,
+            ),
             prefill_admission_chars_per_token: ctx
                 .router_config
                 .pd_prefill_admission_chars_per_token,
             prefill_admission_retry_after_secs: ctx
                 .router_config
                 .pd_prefill_admission_retry_after_secs,
+            decode_admission_token_overhead: ctx.router_config.pd_decode_admission_token_overhead,
         })
     }
 
@@ -301,6 +318,27 @@ impl PDRouter {
             response.headers_mut().insert("retry-after", value);
         }
         response.extensions_mut().insert(PrefillAdmissionRejected);
+        response
+    }
+
+    fn decode_admission_rejected_response(
+        &self,
+        rejection: super::decode_admission::Rejection,
+    ) -> Response {
+        let mut response = error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "decode_admission_limited",
+            format!(
+                "Decode KV capacity is full (requested_tokens={}, inflight_tokens={}, max_tokens={})",
+                rejection.requested_tokens, rejection.current_tokens, rejection.max_tokens,
+            ),
+        );
+        if let Ok(value) =
+            HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response.extensions_mut().insert(DecodeAdmissionRejected);
         response
     }
 
@@ -556,6 +594,19 @@ impl PDRouter {
                                 }
                             };
 
+                        // Reserve D-side KV before either side is dispatched.
+                        // A P prefix hit lowers prefill compute but does not
+                        // lower D's physical KV requirement.
+                        let decode_admission_guard =
+                            match self.acquire_decode_admission(&mut selected, &context) {
+                                Ok(guard) => guard,
+                                Err(rejection) => {
+                                    self.decode_admission
+                                        .record_rejection(selected.decode.url());
+                                    return self.decode_admission_rejected_response(rejection);
+                                }
+                            };
+
                         // Keep handles for outcome accounting after the typed
                         // selection bundle is moved into the dispatcher.
                         let prefill = Arc::clone(&selected.prefill);
@@ -589,7 +640,10 @@ impl PDRouter {
                                 json_request,
                                 context,
                                 selected,
-                                admission_guard,
+                                PDAdmissionGuards {
+                                    prefill: admission_guard,
+                                    decode: decode_admission_guard,
+                                },
                                 start_time,
                             )
                             .await;
@@ -635,6 +689,7 @@ impl PDRouter {
             },
             |res, _attempt| {
                 res.extensions().get::<PrefillAdmissionRejected>().is_none()
+                    && res.extensions().get::<DecodeAdmissionRejected>().is_none()
                     && is_retryable_status(res.status())
             },
             |delay, attempt| {
@@ -665,6 +720,10 @@ impl PDRouter {
             .extensions()
             .get::<PrefillAdmissionRejected>()
             .is_some()
+            || response
+                .extensions()
+                .get::<DecodeAdmissionRejected>()
+                .is_some()
             || !is_retryable_status(response.status())
         {
             Metrics::record_router_error(
@@ -686,6 +745,7 @@ impl PDRouter {
         context: &PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_admission_guard: Option<DecodeAdmissionGuard>,
     ) -> Response {
         let status = res.status();
 
@@ -730,6 +790,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                decode_admission_guard,
             )
         } else {
             // Handle non-streaming error response
@@ -810,9 +871,13 @@ impl PDRouter {
         json_request: Value,
         context: PDRequestContext<'_>,
         selected: SelectedPDPair,
-        admission_guard: Option<AdmissionGuard>,
+        admission_guards: PDAdmissionGuards,
         _start_time: Instant,
     ) -> Response {
+        let PDAdmissionGuards {
+            prefill: admission_guard,
+            decode: decode_admission_guard,
+        } = admission_guards;
         let SelectedPDPair {
             prefill,
             decode,
@@ -1007,7 +1072,13 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(
+                            res,
+                            &context,
+                            prefill,
+                            decode,
+                            decode_admission_guard,
+                        )
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -1060,6 +1131,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        decode_admission_guard,
                     )
                 } else {
                     // Non-streaming response
@@ -1135,6 +1207,7 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         self.prefill_admission.enabled()
+            || self.decode_admission.enabled()
             || prefill_policy.needs_request_text()
             || decode_policy.needs_request_text()
     }
@@ -1208,6 +1281,81 @@ impl PDRouter {
                 Err(primary_rejection)
             }
         }
+    }
+
+    fn estimate_decode_reservation(&self, context: &PDRequestContext<'_>) -> usize {
+        let input_tokens = context.input_tokens.unwrap_or_else(|| {
+            context
+                .request_text
+                .as_deref()
+                .map(|text| self.estimate_token_count(text, context.model_id))
+                .unwrap_or(0)
+        });
+        let sequences = context.batch_size.unwrap_or(1).max(1);
+        input_tokens
+            .saturating_mul(context.input_multiplier.max(1))
+            .saturating_add(
+                self.decode_admission_token_overhead
+                    .saturating_mul(sequences),
+            )
+    }
+
+    fn acquire_decode_admission(
+        &self,
+        selected: &mut SelectedPDPair,
+        context: &PDRequestContext<'_>,
+    ) -> Result<Option<DecodeAdmissionGuard>, super::decode_admission::Rejection> {
+        if !self.decode_admission.enabled() {
+            return Ok(None);
+        }
+
+        let requested_tokens = self.estimate_decode_reservation(context);
+        match self
+            .decode_admission
+            .try_acquire(selected.decode.url(), requested_tokens)
+        {
+            Ok(guard) => Ok(Some(guard)),
+            Err(primary_rejection) => {
+                for worker in
+                    self.alternative_decode_candidates(context.model_id, selected.decode.url())
+                {
+                    if let Ok(guard) = self
+                        .decode_admission
+                        .try_acquire(worker.url(), requested_tokens)
+                    {
+                        selected.decode = worker;
+                        self.decode_admission.record_reroute(selected.decode.url());
+                        return Ok(Some(guard));
+                    }
+                }
+                Err(primary_rejection)
+            }
+        }
+    }
+
+    fn alternative_decode_candidates(
+        &self,
+        model_id: Option<&str>,
+        selected_url: &str,
+    ) -> Vec<Arc<dyn Worker>> {
+        let effective_model_id = if self.enable_igw { model_id } else { None };
+        let mut candidates: Vec<_> = if let Some(model) = effective_model_id {
+            self.worker_registry
+                .get_by_model(model)
+                .iter()
+                .filter(|worker| matches!(worker.worker_type(), WorkerType::Decode))
+                .cloned()
+                .collect()
+        } else {
+            self.worker_registry.get_decode_workers()
+        };
+        candidates.retain(|worker| worker.is_available() && worker.url() != selected_url);
+        candidates.sort_by(|left, right| {
+            left.load()
+                .cmp(&right.load())
+                .then_with(|| left.url().cmp(right.url()))
+        });
+        candidates
     }
 
     fn prefill_workers(&self, model_id: Option<&str>) -> Vec<Arc<dyn Worker>> {
@@ -1447,6 +1595,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_admission_guard: Option<DecodeAdmissionGuard>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1474,6 +1623,9 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            // Hold D-side token credit until the upstream stream completes or
+            // the client disconnects and this task drops the upstream request.
+            let _decode_admission_guard = decode_admission_guard;
             loop {
                 tokio::select! {
                     biased;
@@ -1926,6 +2078,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             input_tokens,
+            input_multiplier: 1,
             model_id,
             headers: headers.cloned(),
         };
@@ -1958,6 +2111,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             input_tokens: None,
+            input_multiplier: body.n.unwrap_or(1) as usize,
             model_id,
             headers: headers.cloned(),
         };
@@ -1995,6 +2149,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             input_tokens: None,
+            input_multiplier: 1,
             model_id,
             headers: headers.cloned(),
         };
@@ -2022,6 +2177,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             input_tokens: None,
+            input_multiplier: 1,
             model_id,
             headers: headers.cloned(),
         };
@@ -2083,8 +2239,10 @@ mod tests {
             enable_igw: false,
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             prefill_admission: PrefillAdmissionController::new(0, 0, 0, 0),
+            decode_admission: DecodeAdmissionController::new(0),
             prefill_admission_chars_per_token: 3.0,
             prefill_admission_retry_after_secs: 1,
+            decode_admission_token_overhead: 0,
         }
     }
 
@@ -2261,6 +2419,56 @@ mod tests {
         assert_eq!(payload["error"]["code"], "prefill_admission_limited");
     }
 
+    #[tokio::test]
+    async fn test_decode_admission_returns_immediate_429_before_dispatch() {
+        let mut router = create_test_pd_router();
+        router.decode_admission = DecodeAdmissionController::new(1);
+        router.decode_admission_token_overhead = 1;
+        router.prefill_admission_chars_per_token = 1.0;
+        router.retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 5_000,
+            max_backoff_ms: 5_000,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:9".to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:10".to_string(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "too large"}],
+            "max_tokens": 1,
+            "stream": false
+        }))
+        .expect("valid chat request");
+
+        let started = Instant::now();
+        let response = router.route_chat(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "decode_admission_limited");
+    }
+
     #[test]
     fn test_worker_endpoint_url_uses_base_url_for_dp_aware_worker() {
         let worker = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
@@ -2354,6 +2562,7 @@ mod tests {
             return_logprob: false,
             request_text: Some("x".repeat(50)),
             input_tokens: Some(50),
+            input_multiplier: 1,
             model_id: None,
             headers: None,
         };
@@ -2364,6 +2573,63 @@ mod tests {
             .expect("admission is enabled");
         assert_eq!(selected.prefill.url(), prefill1.url());
         drop(fallback_guard);
+    }
+
+    #[test]
+    fn test_decode_admission_falls_back_to_idle_dp_rank() {
+        let mut router = create_test_pd_router();
+        router.decode_admission = DecodeAdmissionController::new(100);
+
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        ));
+        let decode0: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://decode:30000", 0, 2)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let decode1: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new("http://decode:30000", 1, 2)
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        decode0.set_healthy(true);
+        decode1.set_healthy(true);
+        router.worker_registry.register(Arc::clone(&decode0));
+        router.worker_registry.register(Arc::clone(&decode1));
+
+        let _occupied = router
+            .decode_admission
+            .try_acquire(decode0.url(), 100)
+            .unwrap();
+        let mut selected = SelectedPDPair {
+            prefill,
+            decode: Arc::clone(&decode0),
+            matched_chars: 0,
+            publish_prefill_affinity_on_success: false,
+        };
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream: true,
+            return_logprob: false,
+            request_text: Some("x".repeat(50)),
+            input_tokens: Some(50),
+            input_multiplier: 1,
+            model_id: None,
+            headers: None,
+        };
+
+        let guard = router
+            .acquire_decode_admission(&mut selected, &context)
+            .expect("an idle D-DP should accept the request")
+            .expect("decode admission is enabled");
+        assert_eq!(selected.decode.url(), decode1.url());
+        drop(guard);
     }
 
     #[test]
@@ -2537,6 +2803,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1
