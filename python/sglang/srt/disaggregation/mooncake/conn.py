@@ -1636,6 +1636,15 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                        logger.info(
+                            "PD_BOOTSTRAP_TRACE event=p_metadata_received room=%s "
+                            "session=%s required_dst=%s kv_index_bytes=%s",
+                            room,
+                            mooncake_session_id,
+                            required_dst_info_num,
+                            len(waiting_req_bytes[4]),
+                        )
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -1654,6 +1663,14 @@ class MooncakeKVManager(CommonKVManager):
                             0,
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
+                        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                            logger.info(
+                                "PD_BOOTSTRAP_TRACE event=p_handshake_ready room=%s "
+                                "received_dst=%s required_dst=%s",
+                                room,
+                                len(self.transfer_infos[room]),
+                                required_dst_info_num,
+                            )
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1848,6 +1865,14 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            logger.info(
+                "PD_BOOTSTRAP_TRACE event=p_sender_created room=%s bootstrap_addr=%s "
+                "dest_tp_ranks=%s",
+                self.bootstrap_room,
+                self.bootstrap_server_url,
+                dest_tp_ranks,
+            )
         self._init_trace_ctx()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
@@ -2038,6 +2063,18 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                send_start = time.monotonic()
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.info(
+                        "PD_BOOTSTRAP_TRACE event=d_metadata_send_start room=%s "
+                        "endpoint=%s:%s session=%s pages=%s dummy=%s",
+                        self.bootstrap_room,
+                        bootstrap_info.get("rank_ip"),
+                        bootstrap_info.get("rank_port"),
+                        self.session_id,
+                        len(kv_indices),
+                        is_dummy,
+                    )
                 with lock:
                     sock.send_multipart(
                         [
@@ -2055,6 +2092,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             str(self.required_dst_info_num).encode("ascii"),
                             str(decode_prefix_len or 0).encode("ascii"),
                         ]
+                    )
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.info(
+                        "PD_BOOTSTRAP_TRACE event=d_metadata_send_queued room=%s "
+                        "endpoint=%s:%s elapsed_ms=%.1f",
+                        self.bootstrap_room,
+                        bootstrap_info.get("rank_ip"),
+                        bootstrap_info.get("rank_port"),
+                        (time.monotonic() - send_start) * 1000,
                     )
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()

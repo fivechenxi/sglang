@@ -15,6 +15,7 @@ import numpy.typing as npt
 import requests
 import torch.distributed as dist
 import zmq
+from zmq.utils.monitor import recv_monitor_message
 from aiohttp import web
 
 from sglang.srt.disaggregation.base.conn import (
@@ -1225,6 +1226,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+    _monitor_threads = {}
 
     def __init__(
         self,
@@ -1245,6 +1247,15 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
+        trace_start = time.monotonic()
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            logger.info(
+                "PD_BOOTSTRAP_TRACE event=d_receiver_init_start room=%s "
+                "bootstrap_addr=%s prefill_dp_rank=%s",
+                self.bootstrap_room,
+                self.bootstrap_addr,
+                prefill_dp_rank,
+            )
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -1280,6 +1291,19 @@ class CommonKVReceiver(BaseKVReceiver):
         if self.conclude_state == KVPoll.Failed:
             return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            endpoints = [
+                f"{info.get('rank_ip')}:{info.get('rank_port')}"
+                for info in self.bootstrap_infos
+            ]
+            logger.info(
+                "PD_BOOTSTRAP_TRACE event=d_receiver_init_done room=%s "
+                "elapsed_ms=%.1f generation=%s endpoints=%s",
+                self.bootstrap_room,
+                (time.monotonic() - trace_start) * 1000,
+                self._fetched_bootstrap_generation,
+                endpoints,
+            )
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -1507,7 +1531,46 @@ class CommonKVReceiver(BaseKVReceiver):
                     zmq.SNDTIMEO,
                     envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
                 )
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    monitor = sock.get_monitor_socket(
+                        events=(
+                            zmq.EVENT_CONNECTED
+                            | zmq.EVENT_CONNECT_DELAYED
+                            | zmq.EVENT_CONNECT_RETRIED
+                            | zmq.EVENT_DISCONNECTED
+                            | zmq.EVENT_CLOSED
+                        )
+                    )
+
+                    def _monitor_socket_events():
+                        while True:
+                            try:
+                                event = recv_monitor_message(monitor)
+                            except Exception:
+                                return
+                            logger.info(
+                                "PD_BOOTSTRAP_TRACE event=zmq_socket endpoint=%s "
+                                "zmq_event=%s value=%s",
+                                endpoint,
+                                event.get("event"),
+                                event.get("value"),
+                            )
+                            if event.get("event") == zmq.EVENT_CLOSED:
+                                return
+
+                    thread = threading.Thread(
+                        target=_monitor_socket_events,
+                        name=f"pd-zmq-monitor-{endpoint}",
+                        daemon=True,
+                    )
+                    cls._monitor_threads[endpoint] = (thread, monitor)
+                    thread.start()
                 sock.connect(endpoint)
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.info(
+                        "PD_BOOTSTRAP_TRACE event=zmq_connect_called endpoint=%s",
+                        endpoint,
+                    )
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
@@ -1524,6 +1587,7 @@ class CommonKVReceiver(BaseKVReceiver):
             else:
                 sock.close()
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
+        cls._monitor_threads.pop(endpoint, None)
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):

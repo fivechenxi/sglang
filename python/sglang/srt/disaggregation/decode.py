@@ -271,6 +271,7 @@ class DecodeRequest:
     hicache_restored_node: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    trace_created_at: float = 0.0
 
     @property
     def seqlen(self) -> int:
@@ -335,6 +336,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._bootstrap_trace_last_log: Dict[int, float] = {}
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -583,10 +585,46 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         decode_req = DecodeRequest(
-            req=req, kv_receiver=kv_receiver, is_rebootstrap=is_rebootstrap
+            req=req,
+            kv_receiver=kv_receiver,
+            is_rebootstrap=is_rebootstrap,
+            trace_created_at=time.monotonic(),
         )
         self.queue.append(decode_req)
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            logger.info(
+                "PD_BOOTSTRAP_TRACE event=d_enqueued rid=%s room=%s input_tokens=%s "
+                "max_new_tokens=%s prealloc_queue=%s pending_queue=%s",
+                req.rid,
+                req.bootstrap_room,
+                len(req.origin_input_ids),
+                req.sampling_params.max_new_tokens,
+                len(self.queue),
+                len(self.pending_reqs),
+            )
         return decode_req
+
+    def _trace_prealloc_blocked(
+        self, reason: str, decode_req: DecodeRequest, **values
+    ) -> None:
+        if not envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            return
+        now = time.monotonic()
+        room = decode_req.req.bootstrap_room
+        if now - self._bootstrap_trace_last_log.get(room, 0.0) < 5.0:
+            return
+        self._bootstrap_trace_last_log[room] = now
+        logger.info(
+            "PD_BOOTSTRAP_TRACE event=d_prealloc_blocked reason=%s rid=%s room=%s "
+            "age_ms=%.1f prealloc_queue=%s pending_queue=%s values=%s",
+            reason,
+            decode_req.req.rid,
+            room,
+            (now - decode_req.trace_created_at) * 1000,
+            len(self.queue),
+            len(self.pending_reqs),
+            values,
+        )
 
     def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
@@ -744,6 +782,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.info(
+                        "PD_BOOTSTRAP_TRACE event=d_handshake_ready rid=%s room=%s age_ms=%.1f",
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                        (time.monotonic() - decode_req.trace_created_at) * 1000,
+                    )
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
@@ -951,12 +996,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                self._trace_prealloc_blocked(
+                    "req_pool_empty",
+                    decode_req,
+                    req_pool_available=self.req_to_token_pool.available_size(),
+                )
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                self._trace_prealloc_blocked(
+                    "metadata_pool_empty",
+                    decode_req,
+                    metadata_available=self.req_to_metadata_buffer_idx_allocator.available_size(),
+                )
                 break
 
             if hisparse_req_budget <= 0:
+                self._trace_prealloc_blocked(
+                    "hisparse_req_budget",
+                    decode_req,
+                    hisparse_req_budget=hisparse_req_budget,
+                )
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1015,10 +1075,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
                 > full_allocatable_tokens
             ):
+                self._trace_prealloc_blocked(
+                    "projected_memory",
+                    decode_req,
+                    required_tokens_for_request=required_tokens_for_request,
+                    origin_input_len=origin_input_len,
+                    prefix_len=prefix_len,
+                    retractable_tokens=retractable_tokens,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                )
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
+                self._trace_prealloc_blocked(
+                    "required_memory",
+                    decode_req,
+                    required_tokens_for_request=required_tokens_for_request,
+                    full_allocatable_tokens=full_allocatable_tokens,
+                )
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
@@ -1178,6 +1253,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 state_indices,
                 decode_prefix_len=total_prefix_len,
             )
+            if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                logger.info(
+                    "PD_BOOTSTRAP_TRACE event=d_metadata_sent rid=%s room=%s "
+                    "age_ms=%.1f pages=%s prefix_tokens=%s",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    (time.monotonic() - decode_req.trace_created_at) * 1000,
+                    len(page_indices),
+                    total_prefix_len,
+                )
             if decode_req.is_rebootstrap:
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
