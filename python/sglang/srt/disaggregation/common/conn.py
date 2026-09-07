@@ -1249,7 +1249,7 @@ class CommonKVReceiver(BaseKVReceiver):
     def init(self, prefill_dp_rank: int):
         trace_start = time.monotonic()
         if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-            logger.info(
+            logger.debug(
                 "PD_BOOTSTRAP_TRACE event=d_receiver_init_start room=%s "
                 "bootstrap_addr=%s prefill_dp_rank=%s",
                 self.bootstrap_room,
@@ -1296,7 +1296,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 f"{info.get('rank_ip')}:{info.get('rank_port')}"
                 for info in self.bootstrap_infos
             ]
-            logger.info(
+            logger.debug(
                 "PD_BOOTSTRAP_TRACE event=d_receiver_init_done room=%s "
                 "elapsed_ms=%.1f generation=%s endpoints=%s",
                 self.bootstrap_room,
@@ -1548,7 +1548,7 @@ class CommonKVReceiver(BaseKVReceiver):
                                 event = recv_monitor_message(monitor)
                             except Exception:
                                 return
-                            logger.info(
+                            logger.debug(
                                 "PD_BOOTSTRAP_TRACE event=zmq_socket endpoint=%s "
                                 "zmq_event=%s value=%s",
                                 endpoint,
@@ -1567,7 +1567,7 @@ class CommonKVReceiver(BaseKVReceiver):
                     thread.start()
                 sock.connect(endpoint)
                 if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                    logger.info(
+                    logger.debug(
                         "PD_BOOTSTRAP_TRACE event=zmq_connect_called endpoint=%s",
                         endpoint,
                     )

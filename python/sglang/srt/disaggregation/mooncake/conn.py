@@ -1637,7 +1637,7 @@ class MooncakeKVManager(CommonKVManager):
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
                     if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                        logger.info(
+                        logger.debug(
                             "PD_BOOTSTRAP_TRACE event=p_metadata_received room=%s "
                             "session=%s required_dst=%s kv_index_bytes=%s",
                             room,
@@ -1664,7 +1664,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
                         if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                            logger.info(
+                            logger.debug(
                                 "PD_BOOTSTRAP_TRACE event=p_handshake_ready room=%s "
                                 "received_dst=%s required_dst=%s",
                                 room,
@@ -1866,7 +1866,7 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
         if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-            logger.info(
+            logger.debug(
                 "PD_BOOTSTRAP_TRACE event=p_sender_created room=%s bootstrap_addr=%s "
                 "dest_tp_ranks=%s",
                 self.bootstrap_room,
@@ -2065,7 +2065,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 send_start = time.monotonic()
                 if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                    logger.info(
+                    logger.debug(
                         "PD_BOOTSTRAP_TRACE event=d_metadata_send_start room=%s "
                         "endpoint=%s:%s session=%s pages=%s dummy=%s",
                         self.bootstrap_room,
@@ -2094,7 +2094,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ]
                     )
                 if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                    logger.info(
+                    logger.debug(
                         "PD_BOOTSTRAP_TRACE event=d_metadata_send_queued room=%s "
                         "endpoint=%s:%s elapsed_ms=%.1f",
                         self.bootstrap_room,

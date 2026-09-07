@@ -592,7 +592,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         self.queue.append(decode_req)
         if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-            logger.info(
+            logger.debug(
                 "PD_BOOTSTRAP_TRACE event=d_enqueued rid=%s room=%s input_tokens=%s "
                 "max_new_tokens=%s prealloc_queue=%s pending_queue=%s",
                 req.rid,
@@ -614,7 +614,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if now - self._bootstrap_trace_last_log.get(room, 0.0) < 5.0:
             return
         self._bootstrap_trace_last_log[room] = now
-        logger.info(
+        logger.debug(
             "PD_BOOTSTRAP_TRACE event=d_prealloc_blocked reason=%s rid=%s room=%s "
             "age_ms=%.1f prealloc_queue=%s pending_queue=%s values=%s",
             reason,
@@ -783,7 +783,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
                 if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                    logger.info(
+                    logger.debug(
                         "PD_BOOTSTRAP_TRACE event=d_handshake_ready rid=%s room=%s age_ms=%.1f",
                         decode_req.req.rid,
                         decode_req.req.bootstrap_room,
@@ -1254,7 +1254,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_prefix_len=total_prefix_len,
             )
             if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-                logger.info(
+                logger.debug(
                     "PD_BOOTSTRAP_TRACE event=d_metadata_sent rid=%s room=%s "
                     "age_ms=%.1f pages=%s prefix_tokens=%s",
                     decode_req.req.rid,
