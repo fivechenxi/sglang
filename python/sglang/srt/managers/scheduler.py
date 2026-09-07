@@ -150,6 +150,10 @@ from sglang.srt.managers.min_free_slots_delayer import (
     resolve_min_free_slots,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.prefill_tier_admission import (
+    PrefillTierAdmission,
+    PrefillTierCost,
+)
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
     decide_needs_confidence_relay,
@@ -517,6 +521,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.init_prefill_tier_admission()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1264,6 +1269,43 @@ class Scheduler(
                 tp_group=self.tp_group,
                 scheduler=self,
             )
+
+    def init_prefill_tier_admission(self) -> None:
+        self.prefill_tier_admission = PrefillTierAdmission(
+            max_cold_tokens=(
+                self.server_args.disaggregation_prefill_max_cold_tokens
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else 0
+            ),
+            max_load_back_tokens=(
+                self.server_args.disaggregation_prefill_max_load_back_tokens
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else 0
+            ),
+            max_storage_tokens=(
+                self.server_args.disaggregation_prefill_max_storage_tokens
+                if self.disaggregation_mode == DisaggregationMode.PREFILL
+                else 0
+            ),
+        )
+        self._report_prefill_tier_admission()
+
+    def _report_prefill_tier_admission(self) -> None:
+        if not (
+            self.metrics_reporter.enable_metrics
+            and self.metrics_reporter.is_stats_logging_rank
+        ):
+            return
+        used = self.prefill_tier_admission.used
+        self.metrics_reporter.metrics_collector.set_prefill_tier_admission_tokens(
+            cold=used.cold_tokens,
+            load_back=used.load_back_tokens,
+            storage=used.storage_tokens,
+        )
+
+    def _release_prefill_tier_admission(self, rid: str) -> None:
+        self.prefill_tier_admission.release(rid)
+        self._report_prefill_tier_admission()
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -2321,9 +2363,129 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
+    def _prefill_tier_cost(
+        self,
+        req: Req,
+        *,
+        query_storage: bool,
+        cow_mamba: Optional[bool] = False,
+    ) -> PrefillTierCost:
+        """Return the work split from this P-DP's physical cache state."""
+        req.init_next_round_input(self.tree_cache, cow_mamba=cow_mamba)
+        max_prefix_len = req._compute_max_prefix_len(
+            len(req.full_untruncated_fill_ids)
+        )
+        storage_tokens = req.storage_hit_length
+
+        # Gate an L3 fetch before starting it. This is an actual backend lookup,
+        # not the model gateway's historical text-prefix approximation.
+        if query_storage and self.enable_hicache_storage:
+            query = getattr(self.tree_cache, "query_storage_hit_length", None)
+            last_host_node = req.last_host_node
+            if query is not None and (
+                last_host_node.backuped or last_host_node is self.tree_cache.root_node
+            ):
+                matched_len = len(req.prefix_indices) + req.host_hit_length
+                new_input_tokens = req.full_untruncated_fill_ids[
+                    matched_len:max_prefix_len
+                ]
+                last_hash = last_host_node.get_last_hash_value()
+                prefix_keys = (
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
+                )
+                storage_tokens = query(
+                    last_host_node,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                )
+
+        return PrefillTierCost.from_cache_lookup(
+            total_tokens=max_prefix_len,
+            device_tokens=len(req.prefix_indices),
+            # Before prefetch, queried storage is not part of host_hit_length;
+            # after prefetch it is, and from_cache_lookup subtracts it from L2.
+            host_tokens=min(
+                max_prefix_len,
+                req.host_hit_length
+                + (storage_tokens if query_storage else 0),
+            ),
+            storage_tokens=storage_tokens,
+            load_back_threshold=getattr(self.tree_cache, "load_back_threshold", 0),
+        )
+
+    def _reject_prefill_tier_admission(
+        self, req: Req, cost: PrefillTierCost
+    ) -> None:
+        used = self.prefill_tier_admission.used
+        limits = self.prefill_tier_admission.limits
+        message = (
+            "P-side cache-tier admission is full "
+            f"(requested={cost}, in_flight={used}, limits={limits})"
+        )
+        logger.warning("Rejecting rid=%s: %s", req.rid, message)
+        exceeded_tiers = self.prefill_tier_admission.exceeded_tiers(req.rid, cost)
+        if (
+            self.metrics_reporter.enable_metrics
+            and self.metrics_reporter.is_stats_logging_rank
+        ):
+            for tier in exceeded_tiers or ("unknown",):
+                self.metrics_reporter.metrics_collector.increment_prefill_tier_admission_rejection(
+                    tier
+                )
+        self._release_prefill_tier_admission(req.rid)
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            self.tree_cache.release_aborted_request(req.rid)
+        # The scheduling-time reconciliation uses the normal Mamba match path,
+        # which may stage a private state slot before add_one_req().  A rejected
+        # request never reaches the ordinary batch cleanup, so mirror that
+        # cleanup here instead of leaking the slot.
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
+        if (
+            req.mamba_pool_idx is not None
+            and req.req_pool_idx is None
+            and not getattr(req, "session", None)
+        ):
+            self.tree_cache.req_to_token_pool.mamba_allocator.free(
+                req.mamba_pool_idx.unsqueeze(-1)
+            )
+            req.mamba_pool_idx = None
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                finished_reason={
+                    "type": "abort",
+                    "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                    "message": message,
+                },
+                rid=req.rid,
+            ),
+            req,
+        )
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+
+    def _reserve_prefill_tier_admission(self, req: Req) -> bool:
+        if not self.prefill_tier_admission.enabled:
+            return True
+        cost = self._prefill_tier_cost(req, query_storage=True)
+        if self.prefill_tier_admission.reserve_or_reconcile(req.rid, cost):
+            self._report_prefill_tier_admission()
+            logger.debug(
+                "Reserved P-side cache-tier admission rid=%s cost=%s in_flight=%s",
+                req.rid,
+                cost,
+                self.prefill_tier_admission.used,
+            )
+            return True
+        self._reject_prefill_tier_admission(req, cost)
+        return False
+
+    def _prefetch_kvcache(self, req: Req, *, cache_lookup_initialized=False):
+        if self.enable_hicache_storage:
+            if not cache_lookup_initialized:
+                req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 last_hash = last_host_node.get_last_hash_value()
@@ -2356,7 +2518,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
+            if not self._reserve_prefill_tier_admission(req):
+                return
+            self._prefetch_kvcache(
+                req,
+                cache_lookup_initialized=self.prefill_tier_admission.enabled,
+            )
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
@@ -2467,6 +2634,8 @@ class Scheduler(
                     ),
                     req,
                 )
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self._release_prefill_tier_admission(req.rid)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2910,6 +3079,7 @@ class Scheduler(
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+        tier_rejected_reqs = set()
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -2941,7 +3111,25 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            if self.prefill_tier_admission.enabled:
+                actual_cost = self._prefill_tier_cost(
+                    req,
+                    query_storage=False,
+                    # This is the real scheduling lookup. Preserve the normal
+                    # Mamba COW/clear staging side effects instead of matching
+                    # once for admission and immediately matching again.
+                    cow_mamba=None,
+                )
+                if not self.prefill_tier_admission.reserve_or_reconcile(
+                    req.rid, actual_cost
+                ):
+                    self._reject_prefill_tier_admission(req, actual_cost)
+                    tier_rejected_reqs.add(req)
+                    continue
+                self._report_prefill_tier_admission()
+
+            if not self.prefill_tier_admission.enabled:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2984,6 +3172,10 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        if tier_rejected_reqs:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req not in tier_rejected_reqs
+            ]
         if len(can_run_list) == 0:
             return None, running_batch
 
@@ -3823,6 +4015,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator.clear()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
+            self.prefill_tier_admission.reset()
+            self._report_prefill_tier_admission()
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
@@ -3989,6 +4183,11 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.prefill_tier_admission.release_matching(
+                recv_req.rid, all_requests=recv_req.abort_all
+            )
+            self._report_prefill_tier_admission()
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

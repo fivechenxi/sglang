@@ -2498,6 +2498,18 @@ class ServerArgs:
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
     ] = 512
+    disaggregation_prefill_max_cold_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight tokens that require model prefill compute. Zero disables this tier limit.",
+    ] = 0
+    disaggregation_prefill_max_load_back_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight L2 host-to-device load-back tokens. Zero disables this tier limit.",
+    ] = 0
+    disaggregation_prefill_max_storage_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight L3 storage fetch tokens. Zero disables this tier limit.",
+    ] = 0
     disaggregation_decode_extra_slots: A[
         Optional[int],
         "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",

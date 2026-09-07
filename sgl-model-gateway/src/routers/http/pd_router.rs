@@ -531,8 +531,18 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        // P only returns completion metadata after KV transfer; it never needs
+        // to mirror the client's token stream.  Keep this request non-streaming
+        // so a scheduler-side admission rejection can still become an HTTP 429
+        // before response headers are committed.  D retains the original
+        // stream setting and remains the sole source of generated deltas.
+        let mut prefill_json_request = json_request.clone();
+        let prefill_object = prefill_json_request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        prefill_object.insert("stream".to_string(), Value::Bool(false));
         let prefill_request =
-            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+            Self::prepare_worker_request(route, prefill, Cow::Owned(prefill_json_request)).await?;
         let decode_json_request =
             Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
         let decode_request =
@@ -1838,6 +1848,19 @@ impl PDRouter {
                     "prefill_unavailable",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
                 ),
+                StatusCode::TOO_MANY_REQUESTS => {
+                    let mut response = error::create_error(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "prefill_tier_admission_limited",
+                        format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                    );
+                    if let Ok(value) =
+                        HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
+                    {
+                        response.headers_mut().insert("retry-after", value);
+                    }
+                    response
+                }
                 StatusCode::BAD_GATEWAY => error::bad_gateway(
                     "prefill_bad_gateway",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
@@ -2732,6 +2755,7 @@ mod tests {
         let request = json!({
             "prompt": "shared prefix",
             "max_tokens": 8,
+            "stream": true,
             "bootstrap_host": "prefill",
             "bootstrap_port": 8998,
             "bootstrap_room": 1234,
@@ -2747,6 +2771,7 @@ mod tests {
             "http://prefill:30000/v1/completions"
         );
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert_eq!(prefill_request.body["stream"], false);
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
         assert_eq!(
@@ -2754,6 +2779,7 @@ mod tests {
             "http://decode:30001/v1/completions"
         );
         assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["stream"], true);
         assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_request.body["bootstrap_room"], 1234);
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
@@ -2773,6 +2799,7 @@ mod tests {
         let request = json!({
             "prompt": "shared prefix",
             "max_tokens": 8,
+            "stream": true,
             "bootstrap_room": 1234,
         });
 
@@ -2790,9 +2817,11 @@ mod tests {
             "http://decode:30001/v1/completions"
         );
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
+        assert_eq!(prefill_request.body["stream"], false);
         assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert_eq!(decode_request.body["stream"], true);
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
-        assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
+        assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
     }
 
