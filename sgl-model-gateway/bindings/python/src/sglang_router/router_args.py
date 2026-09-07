@@ -55,6 +55,8 @@ class RouterArgs:
     pd_prefill_admission_cold_request_threshold_tokens: int = 0
     pd_prefill_admission_chars_per_token: float = 3.0
     pd_prefill_admission_retry_after_secs: int = 1
+    pd_decode_admission_max_tokens: int = 0
+    pd_decode_admission_token_overhead: int = 0
 
     # Routing policy
     policy: str = "cache_aware"
@@ -424,6 +426,18 @@ class RouterArgs:
             type=int,
             default=RouterArgs.pd_prefill_admission_retry_after_secs,
             help="Retry-After value on prefill admission 429 responses",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-decode-admission-max-tokens",
+            type=int,
+            default=RouterArgs.pd_decode_admission_max_tokens,
+            help="Per-decode-DP in-flight KV token budget (0 disables)",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-decode-admission-token-overhead",
+            type=int,
+            default=RouterArgs.pd_decode_admission_token_overhead,
+            help="Safety overhead added to each decode token reservation",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",

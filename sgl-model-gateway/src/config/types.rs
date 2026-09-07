@@ -65,6 +65,14 @@ pub struct RouterConfig {
     /// Retry-After value returned by fail-fast admission 429 responses.
     #[serde(default = "default_pd_prefill_admission_retry_after_secs")]
     pub pd_prefill_admission_retry_after_secs: u64,
+    /// Per decode-DP in-flight KV token budget. The reservation covers the
+    /// entire response lifetime. Zero disables decode admission.
+    #[serde(default)]
+    pub pd_decode_admission_max_tokens: usize,
+    /// Conservative token overhead added to every decode reservation for chat
+    /// templates and protocol tokens not present in routing text.
+    #[serde(default)]
+    pub pd_decode_admission_token_overhead: usize,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
@@ -562,6 +570,8 @@ impl Default for RouterConfig {
             pd_prefill_admission_cold_request_threshold_tokens: 0,
             pd_prefill_admission_chars_per_token: default_pd_prefill_admission_chars_per_token(),
             pd_prefill_admission_retry_after_secs: default_pd_prefill_admission_retry_after_secs(),
+            pd_decode_admission_max_tokens: 0,
+            pd_decode_admission_token_overhead: 0,
             rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),

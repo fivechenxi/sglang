@@ -16,6 +16,7 @@ import requests
 import torch.distributed as dist
 import zmq
 from aiohttp import web
+from zmq.utils.monitor import recv_monitor_message
 
 from sglang.srt.disaggregation.base.conn import (
     BaseKVBootstrapServer,
@@ -227,6 +228,9 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Refreshed by P-side chunk progress. Transfer timeouts are based on
+            # inactivity and must not include prefill queueing or computation.
+            self.transfer_progress_time: Dict[int, float] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -277,6 +281,16 @@ class CommonKVManager(BaseKVManager):
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def record_transfer_progress(self, bootstrap_room: int) -> None:
+        """Refresh a live decode request's KV-transfer inactivity deadline."""
+        if (
+            not hasattr(self, "transfer_progress_time")
+            or bootstrap_room not in self.request_status
+        ):
+            return
+        self.transfer_progress_time[bootstrap_room] = time.monotonic()
+        self.update_status(bootstrap_room, KVPoll.Transferring)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1225,6 +1239,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+    _monitor_threads = {}
 
     def __init__(
         self,
@@ -1238,6 +1253,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
         self.init_time: Optional[float] = None
+        self.metadata_sent: bool = False
         self.abort_notified: bool = False
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._fetched_bootstrap_generation: Optional[str] = None
@@ -1245,6 +1261,15 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
+        trace_start = time.monotonic()
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            logger.debug(
+                "PD_BOOTSTRAP_TRACE event=d_receiver_init_start room=%s "
+                "bootstrap_addr=%s prefill_dp_rank=%s",
+                self.bootstrap_room,
+                self.bootstrap_addr,
+                prefill_dp_rank,
+            )
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -1280,6 +1305,19 @@ class CommonKVReceiver(BaseKVReceiver):
         if self.conclude_state == KVPoll.Failed:
             return
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            endpoints = [
+                f"{info.get('rank_ip')}:{info.get('rank_port')}"
+                for info in self.bootstrap_infos
+            ]
+            logger.debug(
+                "PD_BOOTSTRAP_TRACE event=d_receiver_init_done room=%s "
+                "elapsed_ms=%.1f generation=%s endpoints=%s",
+                self.bootstrap_room,
+                (time.monotonic() - trace_start) * 1000,
+                self._fetched_bootstrap_generation,
+                endpoints,
+            )
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []
@@ -1507,7 +1545,46 @@ class CommonKVReceiver(BaseKVReceiver):
                     zmq.SNDTIMEO,
                     envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
                 )
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    monitor = sock.get_monitor_socket(
+                        events=(
+                            zmq.EVENT_CONNECTED
+                            | zmq.EVENT_CONNECT_DELAYED
+                            | zmq.EVENT_CONNECT_RETRIED
+                            | zmq.EVENT_DISCONNECTED
+                            | zmq.EVENT_CLOSED
+                        )
+                    )
+
+                    def _monitor_socket_events():
+                        while True:
+                            try:
+                                event = recv_monitor_message(monitor)
+                            except Exception:
+                                return
+                            logger.debug(
+                                "PD_BOOTSTRAP_TRACE event=zmq_socket endpoint=%s "
+                                "zmq_event=%s value=%s",
+                                endpoint,
+                                event.get("event"),
+                                event.get("value"),
+                            )
+                            if event.get("event") == zmq.EVENT_CLOSED:
+                                return
+
+                    thread = threading.Thread(
+                        target=_monitor_socket_events,
+                        name=f"pd-zmq-monitor-{endpoint}",
+                        daemon=True,
+                    )
+                    cls._monitor_threads[endpoint] = (thread, monitor)
+                    thread.start()
                 sock.connect(endpoint)
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.debug(
+                        "PD_BOOTSTRAP_TRACE event=zmq_connect_called endpoint=%s",
+                        endpoint,
+                    )
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
@@ -1524,6 +1601,7 @@ class CommonKVReceiver(BaseKVReceiver):
             else:
                 sock.close()
             logger.debug(f"Disconnected stale ZMQ PUSH socket (receiver): {endpoint}")
+        cls._monitor_threads.pop(endpoint, None)
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
@@ -1546,9 +1624,23 @@ class CommonKVReceiver(BaseKVReceiver):
         raise NotImplementedError
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        if self.init_time is None:
-            return None
-        elapsed = time.time() - self.init_time
+        if not getattr(self, "metadata_sent", False):
+            # Before metadata is sent, WaitingForInput means the request is
+            # blocked on decode KV preallocation. Bound that wait separately.
+            if self.init_time is None:
+                self.init_time = time.monotonic()
+            deadline_start = self.init_time
+            timeout_phase = "decode KV preallocation"
+        else:
+            # Destination metadata is sent before P queues and computes the
+            # prompt. Only actual P-side chunk progress starts/refreshed the KV
+            # transfer inactivity deadline.
+            deadline_start = self.kv_mgr.transfer_progress_time.get(self.bootstrap_room)
+            if deadline_start is None:
+                return None
+            timeout_phase = "KV transfer inactivity"
+
+        elapsed = time.monotonic() - deadline_start
         if elapsed < self.kv_mgr.waiting_timeout:
             return None
         logger.warning_once(
@@ -1558,7 +1650,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-            f"in KVPoll.WaitingForInput",
+            f"during {timeout_phase}",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos(disconnect_endpoints=True)
@@ -1576,6 +1668,8 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def clear(self) -> None:
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "transfer_progress_time"):
+            self.kv_mgr.transfer_progress_time.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 

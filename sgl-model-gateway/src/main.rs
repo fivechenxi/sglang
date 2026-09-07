@@ -373,6 +373,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
     pd_prefill_admission_retry_after_secs: u64,
 
+    /// Per-decode-DP in-flight KV token budget (0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_decode_admission_max_tokens: usize,
+
+    /// Safety overhead added to each decode token reservation
+    #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
+    pd_decode_admission_token_overhead: usize,
+
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
@@ -1048,6 +1056,10 @@ impl CliArgs {
                 self.pd_prefill_admission_cold_request_threshold_tokens,
                 self.pd_prefill_admission_chars_per_token,
                 self.pd_prefill_admission_retry_after_secs,
+            )
+            .pd_decode_admission(
+                self.pd_decode_admission_max_tokens,
+                self.pd_decode_admission_token_overhead,
             )
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {

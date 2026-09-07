@@ -1344,6 +1344,17 @@ class MooncakeKVManager(CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
+                        # Metadata reaches D before P computes the prompt. Send
+                        # progress only when this produced chunk reaches the
+                        # transfer worker; repeated chunks refresh D's transfer
+                        # inactivity deadline.
+                        self.sync_status_to_decode_endpoint(
+                            req.endpoint,
+                            req.dst_port,
+                            req.room,
+                            KVPoll.Transferring,
+                            prefill_unique_rank,
+                        )
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
 
                         # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
@@ -1636,6 +1647,15 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                        logger.debug(
+                            "PD_BOOTSTRAP_TRACE event=p_metadata_received room=%s "
+                            "session=%s required_dst=%s kv_index_bytes=%s",
+                            room,
+                            mooncake_session_id,
+                            required_dst_info_num,
+                            len(waiting_req_bytes[4]),
+                        )
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -1654,6 +1674,14 @@ class MooncakeKVManager(CommonKVManager):
                             0,
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
+                        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                            logger.debug(
+                                "PD_BOOTSTRAP_TRACE event=p_handshake_ready room=%s "
+                                "received_dst=%s required_dst=%s",
+                                room,
+                                len(self.transfer_infos[room]),
+                                required_dst_info_num,
+                            )
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1719,6 +1747,10 @@ class MooncakeKVManager(CommonKVManager):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
                             self.update_status(bootstrap_room, KVPoll.Success)
+                elif status == KVPoll.Transferring:
+                    # Refresh progress even when the monotonic request status
+                    # is already Transferring: this is an inactivity watchdog.
+                    self.record_transfer_progress(bootstrap_room)
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
@@ -1848,6 +1880,14 @@ class MooncakeKVSender(CommonKVSender):
         )
         self.conclude_state = None
         self.init_time = time.time()
+        if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            logger.debug(
+                "PD_BOOTSTRAP_TRACE event=p_sender_created room=%s bootstrap_addr=%s "
+                "dest_tp_ranks=%s",
+                self.bootstrap_room,
+                self.bootstrap_server_url,
+                dest_tp_ranks,
+            )
         self._init_trace_ctx()
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
@@ -2038,6 +2078,18 @@ class MooncakeKVReceiver(CommonKVReceiver):
             is_dummy = bootstrap_info["is_dummy"]
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                send_start = time.monotonic()
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.debug(
+                        "PD_BOOTSTRAP_TRACE event=d_metadata_send_start room=%s "
+                        "endpoint=%s:%s session=%s pages=%s dummy=%s",
+                        self.bootstrap_room,
+                        bootstrap_info.get("rank_ip"),
+                        bootstrap_info.get("rank_port"),
+                        self.session_id,
+                        len(kv_indices),
+                        is_dummy,
+                    )
                 with lock:
                     sock.send_multipart(
                         [
@@ -2056,6 +2108,15 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             str(decode_prefix_len or 0).encode("ascii"),
                         ]
                     )
+                if envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+                    logger.debug(
+                        "PD_BOOTSTRAP_TRACE event=d_metadata_send_queued room=%s "
+                        "endpoint=%s:%s elapsed_ms=%.1f",
+                        self.bootstrap_room,
+                        bootstrap_info.get("rank_ip"),
+                        bootstrap_info.get("rank_port"),
+                        (time.monotonic() - send_start) * 1000,
+                    )
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(
@@ -2065,7 +2126,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
-        self.init_time = time.time()
+        # P still has to queue and compute after receiving these destination
+        # indices. The first Transferring notification, not metadata delivery,
+        # starts the transfer inactivity deadline.
+        self.metadata_sent = True
+        self.init_time = None
 
     def poll(self) -> KVPoll:
         if self.conclude_state is not None:
@@ -2074,7 +2139,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
-        elif status == KVPoll.WaitingForInput:
+        elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
                 return timeout_result

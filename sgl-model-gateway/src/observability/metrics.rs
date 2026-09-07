@@ -187,6 +187,14 @@ pub(crate) fn init_metrics() {
         "smg_pd_prefill_admission_inflight_requests",
         "All in-flight prefill requests per prefill worker"
     );
+    describe_counter!(
+        "smg_pd_decode_admission_total",
+        "PD decode token-credit admission decisions per decode DP rank"
+    );
+    describe_gauge!(
+        "smg_pd_decode_admission_inflight_tokens",
+        "Estimated in-flight KV tokens reserved per decode DP rank"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(

@@ -213,6 +213,8 @@ class Router:
             available. Default: 3.0
         pd_prefill_admission_retry_after_secs: Retry-After value for fail-fast admission 429s.
             Default: 1
+        pd_decode_admission_max_tokens: Per-decode-DP in-flight KV token budget; 0 disables.
+        pd_decode_admission_token_overhead: Safety overhead added to each decode reservation.
         request_id_headers: List of HTTP headers to check for request IDs. If not specified,
             uses common defaults: ['x-request-id', 'x-correlation-id', 'x-trace-id', 'request-id'].
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
