@@ -15,7 +15,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade \
 # HiCache L3 uses Mooncake Store independently of the Ascend MemFabric P/D
 # transport. Pin the NPU CPython 3.11 ARM64 wheel and verify both the Store and
 # Transfer Engine bindings at image-build time.
-RUN python3 -m pip install --no-cache-dir \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libibverbs1 && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3 -m pip install --no-cache-dir \
     "https://files.pythonhosted.org/packages/91/f0/1a3fd7995a80500078beaa7337c08c3da6ca34af1deaa343c39088645245/mooncake_transfer_engine_npu-0.3.11.post1-cp311-cp311-manylinux_2_35_aarch64.whl#sha256=72759fa93543e6d5e5cfe191614b9ec5949d7ce93ad2297475040019141ade18" && \
     python3 -c "from mooncake.store import MooncakeDistributedStore; from mooncake.engine import TransferEngine; print(MooncakeDistributedStore, TransferEngine)"
 
