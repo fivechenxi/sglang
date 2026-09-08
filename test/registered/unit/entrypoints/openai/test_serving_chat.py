@@ -1343,7 +1343,8 @@ class ServingChatTestCase(unittest.TestCase):
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        # msgpack IPC decodes HTTPStatus values as plain integers.
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR.value
 
         async def _mock_generate_abort():
             yield {
@@ -1407,7 +1408,7 @@ class ServingChatTestCase(unittest.TestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(error_chunk_data["error"]["code"], err_code)
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
@@ -1416,6 +1417,37 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_prefill_admission_rejection_is_http_429_before_stream_starts(self):
+        """Internal P rejection must not commit HTTP 200 or dispatch D."""
+
+        async def _mock_generate_rejection():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "prefill-admission-test",
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": 429,
+                        "message": "P-side cache-tier admission is full",
+                    },
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_rejection()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "cold request"}],
+            max_tokens=1,
+            stream=True,
+            pd_prefill_admission_ack=True,
+        )
+
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(Mock(), req, self.fastapi_request)
+        )
+        self.assertEqual(response.status_code, 429)
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():

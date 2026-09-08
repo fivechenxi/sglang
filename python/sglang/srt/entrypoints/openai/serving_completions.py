@@ -262,6 +262,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     yield ": pd-prefill-admitted\n\n"
                     continue
                 if request.pd_prefill_admission_ack:
+                    finish_reason = content.get("meta_info", {}).get("finish_reason")
+                    status_code = (
+                        finish_reason.get("status_code") if finish_reason else None
+                    )
+                    if (
+                        finish_reason
+                        and finish_reason.get("type") == "abort"
+                        and isinstance(status_code, int)
+                        and not stream_started
+                    ):
+                        # HTTPStatus is serialized as an int by msgpack IPC.
+                        raise _PrefillAdmissionRejected(
+                            finish_reason.get(
+                                "message", "Prefill admission rejected."
+                            ),
+                            status_code,
+                        )
                     yield f"data: {orjson.dumps(content).decode()}\n\n"
                     continue
                 index = content.get("index", 0)
@@ -346,9 +363,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # to the normal chunk path, matching the non-stream behavior
                 # in tokenizer_manager._handle_abort_finish_reason.
                 if finish_reason_type == "abort" and isinstance(
-                    finish_reason.get("status_code"), HTTPStatus
+                    finish_reason.get("status_code"), int
                 ):
-                    code = finish_reason["status_code"]
+                    code = HTTPStatus(finish_reason["status_code"])
                     if request.pd_prefill_admission_ack and not stream_started:
                         raise _PrefillAdmissionRejected(
                             finish_reason.get(

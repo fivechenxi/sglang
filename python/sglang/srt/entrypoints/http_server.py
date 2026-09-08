@@ -832,7 +832,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             finish_reason = first_out.get("meta_info", {}).get("finish_reason")
             if finish_reason and finish_reason.get("type") == "abort":
                 status = finish_reason.get("status_code")
-                if isinstance(status, HTTPStatus):
+                if isinstance(status, int):
                     return SGLangORJSONResponse(
                         content={
                             "error": {
@@ -840,10 +840,10 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                                     "message", "Prefill admission rejected."
                                 ),
                                 "type": "PrefillAdmissionRejected",
-                                "code": status.value,
+                                "code": status,
                             }
                         },
-                        status_code=status.value,
+                        status_code=status,
                     )
 
         async def stream_results() -> AsyncIterator[bytes]:

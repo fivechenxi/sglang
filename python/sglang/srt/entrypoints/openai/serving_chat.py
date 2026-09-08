@@ -1099,6 +1099,25 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield ": pd-prefill-admitted\n\n"
                     continue
                 if request.pd_prefill_admission_ack:
+                    finish_reason = content.get("meta_info", {}).get("finish_reason")
+                    status_code = (
+                        finish_reason.get("status_code") if finish_reason else None
+                    )
+                    if (
+                        finish_reason
+                        and finish_reason.get("type") == "abort"
+                        and isinstance(status_code, int)
+                        and not stream_started
+                    ):
+                        # HTTPStatus is serialized as an int by msgpack IPC.
+                        # Surface P-side admission rejection before committing
+                        # HTTP 200, so Router never dispatches the paired D.
+                        raise _PrefillAdmissionRejected(
+                            finish_reason.get(
+                                "message", "Prefill admission rejected."
+                            ),
+                            status_code,
+                        )
                     # P is an internal metadata producer, not the client-visible
                     # stream. Preserve its native meta_info so Router can still
                     # merge prompt logprobs after the handshake.
@@ -1148,9 +1167,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
                     if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                        finish_reason.get("status_code"), int
                     ):
-                        code = finish_reason["status_code"]
+                        code = HTTPStatus(finish_reason["status_code"])
                         if (
                             request.pd_prefill_admission_ack
                             and not stream_started
