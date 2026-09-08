@@ -16,6 +16,16 @@ on:
         required: false
         type: boolean
         default: false
+      build_router:
+        description: "Build the ARM64 PD Router image"
+        required: false
+        type: boolean
+        default: false
+      build_mooncake_master:
+        description: "Build the ARM64 Mooncake master image"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,6 +37,7 @@ concurrency:
 
 jobs:
   build-mooncake-master-arm64:
+    if: github.event_name == 'push' || inputs.build_mooncake_master
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout exact source
@@ -105,7 +116,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-router-arm64:
-    if: github.event_name == 'push' || inputs.build_client
+    if: github.event_name == 'push' || inputs.build_router
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout exact source
