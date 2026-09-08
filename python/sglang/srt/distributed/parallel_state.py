@@ -2340,7 +2340,16 @@ def create_custom_parallel_group(
     local_config = sorted(list(set(group_ranks)))
     gathered_configs = [None for _ in range(world_size)]
 
-    torch.distributed.all_gather_object(gathered_configs, local_config)
+    # This exchange only carries Python rank metadata.  In particular, do not
+    # use the default WORLD process group here: on NPU that group is HCCL, and
+    # the first object collective can lazily allocate the WORLD HCCL buffers
+    # (which inherit HCCL_BUFFSIZE) even though the groups created below use
+    # Gloo.  Reuse the already initialized world CPU group instead.
+    torch.distributed.all_gather_object(
+        gathered_configs,
+        local_config,
+        group=get_world_group().cpu_group,
+    )
 
     unique_groups = []
     seen_signatures = set()
