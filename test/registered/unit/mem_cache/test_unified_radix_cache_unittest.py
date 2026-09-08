@@ -447,8 +447,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertEqual(hit, 8)
         self.assertIsNotNone(controller.operation)
         self.assertTrue(controller.operation.token_ids.is_bigram)
+        self.assertEqual(len(controller.operation.token_ids), len(tokens) - 1)
         self.assertEqual(
-            list(controller.operation.token_ids.token_ids), list(tokens[:-1])
+            list(controller.operation.token_ids.token_ids), list(tokens)
         )
 
 
