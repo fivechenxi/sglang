@@ -12,6 +12,13 @@ RUN python3 -m pip install --no-cache-dir --upgrade \
     "https://files.pythonhosted.org/packages/d4/6b/750a2f834e4f3bc9d2066d534ba53468ff7ed49c85d0c44802c79d2d45b4/memfabric_hybrid-1.2.0-cp311-cp311-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl#sha256=5213be7e6384923612447d79828dd6c45500525449f0849a200337a7cf20f442" && \
     python3 -m pip show memfabric-hybrid | grep -q '^Version: 1.2.0$'
 
+# HiCache L3 uses Mooncake Store independently of the Ascend MemFabric P/D
+# transport. Pin the NPU CPython 3.11 ARM64 wheel and verify both the Store and
+# Transfer Engine bindings at image-build time.
+RUN python3 -m pip install --no-cache-dir \
+    "https://files.pythonhosted.org/packages/91/f0/1a3fd7995a80500078beaa7337c08c3da6ca34af1deaa343c39088645245/mooncake_transfer_engine_npu-0.3.11.post1-cp311-cp311-manylinux_2_35_aarch64.whl#sha256=72759fa93543e6d5e5cfe191614b9ec5949d7ce93ad2297475040019141ade18" && \
+    python3 -c "from mooncake.store import MooncakeDistributedStore; from mooncake.engine import TransferEngine; print(MooncakeDistributedStore, TransferEngine)"
+
 # MemFabric loads HCOM again by its bare filename when it creates a lazy
 # device-RDMA connection. The wheel preloads the absolute file, but its SONAME
 # is libhcom.so.0, so that preload does not satisfy a later dlopen("libhcom.so").
