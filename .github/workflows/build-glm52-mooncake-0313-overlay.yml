@@ -2,6 +2,12 @@ name: Build GLM-5.2 Mooncake 0.3.13 NPU client overlay
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/mooncake-0313-ha-arm64
+    paths:
+      - .github/workflows/build-glm52-mooncake-0313-overlay.yml
+      - docker/glm52-910b-w4a8c8-mooncake-0313.Dockerfile
 
 permissions:
   contents: read
