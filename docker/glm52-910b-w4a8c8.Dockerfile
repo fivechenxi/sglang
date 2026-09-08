@@ -13,7 +13,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade \
     python3 -m pip show memfabric-hybrid | grep -q '^Version: 1.2.0$'
 
 # HiCache L3 uses Mooncake Store independently of the Ascend MemFabric P/D
-# transport. Pin the NPU CPython 3.11 ARM64 wheel and verify both the Store and
+# transport. Pin the HA-compatible NPU CPython 3.11 ARM64 wheel and verify both the Store and
 # Transfer Engine payload at image-build time. The native extension itself is
 # imported by the in-cluster smoke test because libascend_hal.so is supplied by
 # the host driver mount, not by the portable image build environment.
@@ -21,8 +21,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends libibverbs1 && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m pip install --no-cache-dir \
-    "https://files.pythonhosted.org/packages/91/f0/1a3fd7995a80500078beaa7337c08c3da6ca34af1deaa343c39088645245/mooncake_transfer_engine_npu-0.3.11.post1-cp311-cp311-manylinux_2_35_aarch64.whl#sha256=72759fa93543e6d5e5cfe191614b9ec5949d7ce93ad2297475040019141ade18" && \
-    python3 -c "from importlib.metadata import distribution; d = distribution('mooncake-transfer-engine-npu'); files = tuple(map(str, d.files or ())); assert d.version == '0.3.11.post1'; assert any(f.startswith('mooncake/store') for f in files); assert any(f.startswith('mooncake/engine') for f in files); print(d.metadata['Name'], d.version)"
+    "https://files.pythonhosted.org/packages/d6/ed/0e8d4286bead87dd7f353a3e88a3bb24713f6e65985f7a0ed4b2eda8433a/mooncake_transfer_engine_npu-0.3.13.post1-cp311-cp311-manylinux_2_35_aarch64.whl#sha256=0e618bd3a17554ddbea14cb7e0cc0d2e5e63a8e1bde34e49cab7fbd8c2367153" && \
+    python3 -c "from importlib.metadata import distribution; d = distribution('mooncake-transfer-engine-npu'); files = tuple(map(str, d.files or ())); assert d.version == '0.3.13.post1'; assert any(f.startswith('mooncake/store') for f in files); assert any(f.startswith('mooncake/engine') for f in files); print(d.metadata['Name'], d.version)"
 
 # MemFabric loads HCOM again by its bare filename when it creates a lazy
 # device-RDMA connection. The wheel preloads the absolute file, but its SONAME
