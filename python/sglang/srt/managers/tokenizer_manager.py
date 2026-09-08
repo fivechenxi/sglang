@@ -72,6 +72,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PrefillAdmissionAck,
     SessionParams,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
@@ -593,6 +594,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
+                (PrefillAdmissionAck, self._handle_prefill_admission_ack),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -1183,6 +1185,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_ids_logprob=obj.token_ids_logprob,
                 return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
+                pd_prefill_admission_ack=obj.pd_prefill_admission_ack,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,
@@ -2816,6 +2819,32 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         del self.rid_to_state[recv_obj.rid]
 
         state.out_list.append(out)
+        state.event.set()
+
+    def _handle_prefill_admission_ack(self, recv_obj: PrefillAdmissionAck):
+        """Wake the internal P stream without completing its request state."""
+        state = self.rid_to_state.get(recv_obj.rid)
+        if state is None:
+            logger.warning(
+                "Prefill admission ACK for rid=%s has no tokenizer state",
+                recv_obj.rid,
+            )
+            return
+        state.out_list.append(
+            {
+                "pd_prefill_admitted": True,
+                "text": "",
+                "output_ids": [],
+                "meta_info": {
+                    "id": recv_obj.rid,
+                    "finish_reason": None,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "cached_tokens": 0,
+                },
+            }
+        )
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):

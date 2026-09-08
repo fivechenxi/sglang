@@ -41,6 +41,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.priority = priority
         req.rid = "req"
+        req.pd_prefill_admission_ack = False
         req.time_stats = MagicMock()
         req.time_stats.trace_ctx = MagicMock()
         return req
@@ -54,6 +55,21 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         self.assertEqual(req.priority, -sys.maxsize - 1)
         scheduler.disagg_prefill_bootstrap_queue.add.assert_called_once_with(req, 8)
         req.time_stats.set_prefill_bootstrap_queue_entry_time.assert_called_once()
+
+    def test_prefill_admission_ack_precedes_bootstrap_queue(self):
+        scheduler = self._new_scheduler(DisaggregationMode.PREFILL)
+        scheduler._reserve_prefill_tier_admission = MagicMock(return_value=True)
+        req = self._new_req()
+        req.pd_prefill_admission_ack = True
+        calls = MagicMock()
+        calls.attach_mock(
+            scheduler.ipc_channels.send_to_tokenizer.send_output, "ack"
+        )
+        calls.attach_mock(scheduler.disagg_prefill_bootstrap_queue.add, "queue")
+
+        scheduler._add_request_to_queue(req)
+
+        self.assertEqual([call[0] for call in calls.mock_calls], ["ack", "queue"])
 
     def test_decode_mode_assigns_default_priority_before_prealloc_queue(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)

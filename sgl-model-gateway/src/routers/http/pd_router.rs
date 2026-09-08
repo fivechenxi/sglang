@@ -543,16 +543,17 @@ impl PDRouter {
         prefill: &dyn Worker,
         decode: &dyn Worker,
     ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
-        // P only returns completion metadata after KV transfer; it never needs
-        // to mirror the client's token stream.  Keep this request non-streaming
-        // so a scheduler-side admission rejection can still become an HTTP 429
-        // before response headers are committed.  D retains the original
-        // stream setting and remains the sole source of generated deltas.
+        // P uses an internal streaming handshake: its first response is emitted
+        // only after the scheduler's exact L1/L2/L3 lookup and reservation.
+        // Router waits for that HTTP response before contacting D, so a P-side
+        // 429 cannot allocate and then abort D KV. D remains the sole source of
+        // client-visible generated deltas.
         let mut prefill_json_request = json_request.clone();
         let prefill_object = prefill_json_request
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
-        prefill_object.insert("stream".to_string(), Value::Bool(false));
+        prefill_object.insert("stream".to_string(), Value::Bool(true));
+        prefill_object.insert("pd_prefill_admission_ack".to_string(), Value::Bool(true));
         let prefill_request =
             Self::prepare_worker_request(route, prefill, Cow::Owned(prefill_json_request)).await?;
         let decode_json_request =
@@ -958,7 +959,8 @@ impl PDRouter {
             }
         };
 
-        // Build both requests
+        // Build P first. D must not be contacted until P has completed its
+        // exact cache-tier admission and committed the ACK response.
         let prefill_request = self.build_post_with_headers(
             &self.client,
             &prepared_prefill.endpoint_url,
@@ -966,50 +968,10 @@ impl PDRouter {
             headers,
             false,
         );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            &prepared_decode.endpoint_url,
-            &prepared_decode.body,
-            headers,
-            false,
-        );
+        let prefill_result = prefill_request.send().await;
 
-        // Run both in this handler task (not a detached tokio::spawn) so a client
-        // disconnect cancels the pending decode request too, keeping the
-        // upstream-cancel behavior from #19524.
-        events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
-        }
-        .emit();
-
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
-
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
-        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        loop {
-            tokio::select! {
-                biased;
-                pr = &mut prefill_fut => {
-                    prefill_result = pr;
-                    break;
-                }
-                dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
-                }
-            }
-        }
-
-        // Decode can't generate without prefill's KV, so any prefill failure
-        // (non-2xx / transport error) dooms the paired decode request, which would
-        // otherwise block in WaitingForInput until the 300s disaggregation
-        // timeout. Drop the decode future to close its connection; the decode
-        // engine then detects the disconnect and aborts the request in ~4-8s.
+        // This response is the scheduler admission ACK, not completion of
+        // prefill. A failure here is returned directly: no D request exists yet.
         let prefill_failed = match &prefill_result {
             Ok(resp) => !resp.status().is_success(),
             Err(_) => true,
@@ -1020,8 +982,7 @@ impl PDRouter {
             // shaping/reading the error response.
             drop(admission_guard);
             warn!(
-                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
-                decode.url(),
+                "Prefill admission failed before decode dispatch prefill_url={}",
                 prefill.url()
             );
 
@@ -1049,6 +1010,22 @@ impl PDRouter {
             return response;
         }
 
+        let decode_request = self.build_post_with_headers(
+            &self.client,
+            &prepared_decode.endpoint_url,
+            &prepared_decode.body,
+            headers,
+            false,
+        );
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url(),
+            decode_url: decode.url(),
+        }
+        .emit();
+        // Keep this future in the handler task so client cancellation still
+        // closes D, preserving the upstream-cancel behavior from #19524.
+        let decode_result = decode_request.send().await;
+
         // Publish cache affinity only after P has successfully completed. An
         // admitted-but-inflight request is not a cache hit yet; publishing it
         // early would let a concurrent retry bypass the cold-token budget.
@@ -1068,12 +1045,6 @@ impl PDRouter {
         // handshake. Release after publishing the now-valid cache affinity and
         // do not hold cold-prefill capacity for the remainder of decode.
         drop(admission_guard);
-
-        // Prefill ok: take decode's result, awaiting it if still pending.
-        let decode_result = match decode_early {
-            Some(dr) => dr,
-            None => (&mut decode_fut).await,
-        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -1932,7 +1903,7 @@ impl PDRouter {
         // Read prefill body if needed for logprob merging
         let prefill_body = if return_logprob {
             match prefill_response.bytes().await {
-                Ok(body) => Some(body),
+                Ok(body) => Self::extract_prefill_metadata_from_sse(&body).or(Some(body)),
                 Err(e) => {
                     warn!("Failed to read prefill response body for logprobs: {}", e);
                     None
@@ -1949,6 +1920,19 @@ impl PDRouter {
         };
 
         Ok((prefill_status, prefill_body))
+    }
+
+    fn extract_prefill_metadata_from_sse(body: &[u8]) -> Option<bytes::Bytes> {
+        let text = std::str::from_utf8(body).ok()?;
+        text.lines().rev().find_map(|line| {
+            let payload = line.strip_prefix("data: ")?;
+            if payload == "[DONE]" {
+                return None;
+            }
+            let value: Value = serde_json::from_str(payload).ok()?;
+            value.get("meta_info")?;
+            serde_json::to_vec(&value).ok().map(bytes::Bytes::from)
+        })
     }
 
     fn build_post_with_headers(
@@ -2379,6 +2363,15 @@ mod tests {
             50
         );
         assert_eq!(router.estimate_cold_tokens(None, 0, None, Some(128)), 128);
+    }
+
+    #[test]
+    fn test_extract_prefill_metadata_from_internal_sse() {
+        let body = b": pd-prefill-admitted\n\ndata: {\"text\":\"\",\"meta_info\":{\"input_token_logprobs\":[1.0]}}\n\ndata: [DONE]\n\n";
+        let metadata = PDRouter::extract_prefill_metadata_from_sse(body)
+            .expect("internal P stream must preserve metadata");
+        let value: Value = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(value["meta_info"]["input_token_logprobs"][0], 1.0);
     }
 
     #[test]
@@ -2827,7 +2820,8 @@ mod tests {
             "http://prefill:30000/v1/completions"
         );
         assert_eq!(prefill_request.body["data_parallel_rank"], 2);
-        assert_eq!(prefill_request.body["stream"], false);
+        assert_eq!(prefill_request.body["stream"], true);
+        assert_eq!(prefill_request.body["pd_prefill_admission_ack"], true);
         assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
 
         assert_eq!(
@@ -2873,7 +2867,8 @@ mod tests {
             "http://decode:30001/v1/completions"
         );
         assert!(prefill_request.body.get("data_parallel_rank").is_none());
-        assert_eq!(prefill_request.body["stream"], false);
+        assert_eq!(prefill_request.body["stream"], true);
+        assert_eq!(prefill_request.body["pd_prefill_admission_ack"], true);
         assert!(decode_request.body.get("data_parallel_rank").is_none());
         assert_eq!(decode_request.body["stream"], true);
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());

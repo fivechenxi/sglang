@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrefillAdmissionAck,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -2138,6 +2139,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
+            req.pd_prefill_admission_ack = recv_req.pd_prefill_admission_ack
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -2520,6 +2522,13 @@ class Scheduler(
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             if not self._reserve_prefill_tier_admission(req):
                 return
+            if getattr(req, "pd_prefill_admission_ack", False) is True:
+                # The ACK is deliberately after the exact L1/L2/L3 lookup and
+                # reservation, but before bootstrap. Router starts D only after
+                # seeing it, so a rejected P request allocates no D-side KV.
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    PrefillAdmissionAck(rid=req.rid), req
+                )
             self._prefetch_kvcache(
                 req,
                 cache_lookup_initialized=self.prefill_tier_admission.enabled,

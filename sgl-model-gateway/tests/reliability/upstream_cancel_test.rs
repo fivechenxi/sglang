@@ -2523,12 +2523,14 @@ mod upstream_cancel_tests {
 
     /// A P-side cache-tier admission rejection is an overload response, not an
     /// internal Router error. Preserve 429 so the MaaS gateway can retry a
-    /// different backend, and cancel the already-dispatched D request.
+    /// different backend, and prove D was never dispatched or allocated.
     #[tokio::test]
-    async fn test_pd_prefill_429_is_forwarded_and_decode_is_cancelled() {
+    async fn test_pd_prefill_429_is_forwarded_before_decode_dispatch() {
         let prefill_port = 20320;
         let decode_port = 20321;
         set_fail_status_code(prefill_port, 429);
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 16);
 
         let config = RouterConfig::builder()
             .prefill_decode_mode(
@@ -2573,8 +2575,71 @@ mod upstream_cancel_tests {
             Some("prefill_tier_admission_limited")
         );
         assert!(resp.headers().contains_key("retry-after"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            get_stream_tracking_state(decode_port).is_none(),
+            "P admission 429 must not dispatch a request to D"
+        );
 
         clear_fail_status_code(prefill_port);
+        clear_slow_stream_chunks(decode_port);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_dispatch_waits_for_prefill_admission_ack() {
+        let prefill_port = 20322;
+        let decode_port = 20323;
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 4);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{prefill_port}"), None)],
+                vec![format!("http://127.0.0.1:{decode_port}")],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4321)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.response_delay_ms = 400;
+                    p
+                },
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"text":"x","stream":true}"#))
+            .unwrap();
+        let response_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            get_stream_tracking_state(decode_port).is_none(),
+            "D must remain untouched while P admission ACK is pending"
+        );
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(get_stream_tracking_state(decode_port).is_some());
+        let _ = response.into_body().collect().await;
+
+        clear_slow_stream_chunks(decode_port);
         ctx.shutdown().await;
     }
 

@@ -822,11 +822,35 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         apply_header_overrides(obj, request.headers)
     if obj.stream:
 
+        generator = _global_state.tokenizer_manager.generate_request(obj, request)
+        first_out = None
+        if obj.pd_prefill_admission_ack:
+            # Delay HTTP 200 until the P scheduler has completed its exact
+            # cache-tier admission. This is the raw /generate counterpart of
+            # the OpenAI streaming handlers' internal PD handshake.
+            first_out = await generator.__anext__()
+            finish_reason = first_out.get("meta_info", {}).get("finish_reason")
+            if finish_reason and finish_reason.get("type") == "abort":
+                status = finish_reason.get("status_code")
+                if isinstance(status, HTTPStatus):
+                    return SGLangORJSONResponse(
+                        content={
+                            "error": {
+                                "message": finish_reason.get(
+                                    "message", "Prefill admission rejected."
+                                ),
+                                "type": "PrefillAdmissionRejected",
+                                "code": status.value,
+                            }
+                        },
+                        status_code=status.value,
+                    )
+
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                if first_out is not None:
+                    yield b": pd-prefill-admitted\n\n"
+                async for out in generator:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side

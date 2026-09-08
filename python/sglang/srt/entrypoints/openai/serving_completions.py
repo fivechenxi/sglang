@@ -5,6 +5,7 @@ import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -38,6 +39,12 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+
+class _PrefillAdmissionRejected(Exception):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class OpenAIServingCompletion(OpenAIServingBase):
@@ -115,6 +122,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
             stream=request.stream,
+            pd_prefill_admission_ack=request.pd_prefill_admission_ack,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
@@ -198,6 +206,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
         try:
             first_chunk = await generator.__anext__()
+        except _PrefillAdmissionRejected as e:
+            return self.create_error_response(
+                str(e),
+                err_type="PrefillAdmissionRejected",
+                status_code=e.status_code,
+            )
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -244,6 +258,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
+                if content.get("pd_prefill_admitted"):
+                    yield ": pd-prefill-admitted\n\n"
+                    continue
+                if request.pd_prefill_admission_ack:
+                    yield f"data: {orjson.dumps(content).decode()}\n\n"
+                    continue
                 index = content.get("index", 0)
 
                 text = content["text"]
@@ -329,6 +349,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     finish_reason.get("status_code"), HTTPStatus
                 ):
                     code = finish_reason["status_code"]
+                    if request.pd_prefill_admission_ack and not stream_started:
+                        raise _PrefillAdmissionRejected(
+                            finish_reason.get(
+                                "message", "Prefill admission rejected."
+                            ),
+                            code.value,
+                        )
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         code.name,

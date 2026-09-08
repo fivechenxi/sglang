@@ -210,6 +210,8 @@ class GenerateReqInput:
     return_text_in_logprobs: bool = False
     # Whether to stream output.
     stream: bool = False
+    # Internal use by the PD Router; not part of the public API contract.
+    pd_prefill_admission_ack: bool = False
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
@@ -806,6 +808,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob: Optional[List[int]]
     # Whether to stream output
     stream: bool
+    # Internal PD-router handshake. On a prefill server, emit an admission ACK
+    # after the real L1/L2/L3 lookup and reservation, before waiting for D-side
+    # bootstrap/KV allocation. Never set this for public client requests.
+    pd_prefill_admission_ack: bool = False
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
 
@@ -1803,6 +1809,12 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+class PrefillAdmissionAck(BaseReq, kw_only=True):
+    """Internal P->Router signal that exact cache-tier admission succeeded."""
+
+    pass
 
 
 class ActiveRanksOutput(BaseReq, kw_only=True):
