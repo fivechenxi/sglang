@@ -48,6 +48,7 @@ jobs:
           tags: ghcr.io/${{ github.repository_owner }}/mooncake-master:0.3.11-arm64-${{ github.sha }}
 
   build-arm64:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout exact source
@@ -98,6 +99,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-router-arm64:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout exact source
