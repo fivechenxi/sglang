@@ -4,7 +4,7 @@ ARG MOONCAKE_VERSION=0.3.11
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      ca-certificates libibverbs1 python3 python3-pip python3-venv && \
+      ca-certificates libcurl4t64 libibverbs1 python3 python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/* && \
     python3 -m venv /opt/mooncake && \
     /opt/mooncake/bin/pip install --no-cache-dir \
@@ -17,4 +17,3 @@ ENV PATH=/opt/mooncake/bin:${PATH}
 EXPOSE 50051 8080 9003
 
 ENTRYPOINT ["mooncake_master"]
-
