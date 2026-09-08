@@ -122,8 +122,8 @@ struct SelectedPDPair {
 struct BreakerOutcomesRecorded;
 
 /// Marks a local admission rejection so the generic worker retry policy does
-/// not consume it. Worker-originated 429 responses remain retryable; admission
-/// 429 responses must be returned immediately to the upstream gateway.
+/// not consume it. Generic worker-originated 429 responses remain retryable;
+/// admission 429 responses must be returned immediately to the caller.
 #[derive(Debug, Clone, Copy)]
 struct PrefillAdmissionRejected;
 
@@ -144,6 +144,22 @@ struct PDAdmissionGuards {
 }
 
 impl PDRouter {
+    fn should_retry_response(response: &Response) -> bool {
+        response
+            .extensions()
+            .get::<PrefillAdmissionRejected>()
+            .is_none()
+            && response
+                .extensions()
+                .get::<UpstreamPrefillAdmissionRejected>()
+                .is_none()
+            && response
+                .extensions()
+                .get::<DecodeAdmissionRejected>()
+                .is_none()
+            && is_retryable_status(response.status())
+    }
+
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
         api_path(worker.base_url(), endpoint)
     }
@@ -727,11 +743,7 @@ impl PDRouter {
                     }
                 }
             },
-            |res, _attempt| {
-                res.extensions().get::<PrefillAdmissionRejected>().is_none()
-                    && res.extensions().get::<DecodeAdmissionRejected>().is_none()
-                    && is_retryable_status(res.status())
-            },
+            |res, _attempt| Self::should_retry_response(res),
             |delay, attempt| {
                 // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                 Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -2989,6 +3001,21 @@ mod tests {
             .extensions()
             .get::<UpstreamPrefillAdmissionRejected>()
             .is_some());
+    }
+
+    #[test]
+    fn test_upstream_prefill_admission_429_bypasses_retry() {
+        let router = create_test_pd_router();
+        let response = router
+            .upstream_prefill_admission_rejected_response("cold tier full".to_string());
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!PDRouter::should_retry_response(&response));
+
+        // A generic worker 429 has no admission marker and retains the
+        // existing retry behavior.
+        let generic_429 = StatusCode::TOO_MANY_REQUESTS.into_response();
+        assert!(PDRouter::should_retry_response(&generic_429));
     }
 
     #[test]
