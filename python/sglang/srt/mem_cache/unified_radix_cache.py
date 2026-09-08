@@ -1866,6 +1866,51 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.inc_host_lock_ref(node).to_dec_params(),
         )
 
+    def query_storage_hit_length(
+        self,
+        last_host_node: UnifiedTreeNode,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        """Synchronously probe L3 for the reusable page-aligned prefix.
+
+        Prefill tier admission calls this before starting an asynchronous L3
+        prefetch.  Without it, UnifiedRadixCache requests are conservatively
+        charged as cold input and long L3 hits can be rejected before storage
+        is queried at all.
+        """
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            torch.empty(0, dtype=torch.uint8),
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
+
     def prefetch_from_storage(
         self,
         req_id: str,

@@ -423,6 +423,34 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
+    def test_l3_hit_query_uses_bigram_key_for_prefill_admission(self):
+        cache, _, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        cache.prefetch_threshold = 1
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+        class FakeCacheController:
+            def __init__(self):
+                self.operation = None
+
+            def prefetch_rate_limited(self):
+                return False
+
+            def _storage_hit_query(self, operation):
+                self.operation = operation
+                return ["page-0", "page-1"], 8
+
+        controller = FakeCacheController()
+        cache.cache_controller = controller
+        hit = cache.query_storage_hit_length(cache.root_node, tokens)
+
+        self.assertEqual(hit, 8)
+        self.assertIsNotNone(controller.operation)
+        self.assertTrue(controller.operation.token_ids.is_bigram)
+        self.assertEqual(
+            list(controller.operation.token_ids.token_ids), list(tokens[:-1])
+        )
+
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
