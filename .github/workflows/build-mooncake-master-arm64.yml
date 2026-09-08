@@ -27,4 +27,4 @@ jobs:
           push: true
           provenance: true
           sbom: true
-          tags: ghcr.io/${{ github.repository_owner }}/mooncake-master:0.3.11-arm64-${{ github.sha }}
+          tags: ghcr.io/${{ github.repository_owner }}/mooncake-master:0.3.13.post1-npu-arm64-${{ github.sha }}
