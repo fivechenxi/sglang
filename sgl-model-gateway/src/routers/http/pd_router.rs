@@ -1,4 +1,8 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -122,6 +126,14 @@ struct BreakerOutcomesRecorded;
 /// 429 responses must be returned immediately to the upstream gateway.
 #[derive(Debug, Clone, Copy)]
 struct PrefillAdmissionRejected;
+
+/// A P worker has explicitly rejected the request because its cache-tier
+/// admission budget is full. Keep this across retries so a later transient
+/// transport failure cannot replace a useful 429 with a misleading 502.
+#[derive(Debug, Clone)]
+struct UpstreamPrefillAdmissionRejected {
+    message: String,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct DecodeAdmissionRejected;
@@ -575,12 +587,16 @@ impl PDRouter {
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
         let shared_request = Arc::new(original_request.clone());
-        let response = RetryExecutor::execute_response_with_retry(
+        let last_upstream_prefill_rejection =
+            Arc::new(Mutex::new(None::<UpstreamPrefillAdmissionRejected>));
+        let rejection_seen_by_attempt = Arc::clone(&last_upstream_prefill_rejection);
+        let mut response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
                 move |attempt: u32| {
                     // Clone Arc (cheap reference count increment) instead of cloning the entire request
                     let shared_request = Arc::clone(&shared_request);
+                    let rejection_seen_by_attempt = Arc::clone(&rejection_seen_by_attempt);
                     let context = context.clone();
                     async move {
                         let mut selected = match self
@@ -661,6 +677,16 @@ impl PDRouter {
                             )
                             .await;
 
+                        if let Some(rejection) = response
+                            .extensions()
+                            .get::<UpstreamPrefillAdmissionRejected>()
+                        {
+                            *rejection_seen_by_attempt
+                                .lock()
+                                .expect("prefill rejection mutex poisoned") =
+                                Some(rejection.clone());
+                        }
+
                         let status = response.status();
                         let outcomes_already_recorded = response
                             .extensions()
@@ -717,6 +743,15 @@ impl PDRouter {
             },
         )
         .await;
+
+        // An explicit admission rejection is more accurate than a subsequent
+        // transport/server error from another retry attempt. Preserve success
+        // and a final explicit 429, but do not expose a misleading final 5xx.
+        let saved_rejection = last_upstream_prefill_rejection
+            .lock()
+            .expect("prefill rejection mutex poisoned")
+            .clone();
+        response = self.preserve_upstream_prefill_admission_response(response, saved_rejection);
 
         // Record Layer 2 metrics
         let duration = start_time.elapsed();
@@ -1786,6 +1821,37 @@ impl PDRouter {
         }
     }
 
+    fn upstream_prefill_admission_rejected_response(&self, message: String) -> Response {
+        let mut response = error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "prefill_tier_admission_limited",
+            message.clone(),
+        );
+        if let Ok(value) =
+            HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
+        {
+            response.headers_mut().insert("retry-after", value);
+        }
+        response
+            .extensions_mut()
+            .insert(UpstreamPrefillAdmissionRejected { message });
+        response
+    }
+
+    fn preserve_upstream_prefill_admission_response(
+        &self,
+        response: Response,
+        saved_rejection: Option<UpstreamPrefillAdmissionRejected>,
+    ) -> Response {
+        if !response.status().is_server_error() {
+            return response;
+        }
+        match saved_rejection {
+            Some(rejection) => self.upstream_prefill_admission_rejected_response(rejection.message),
+            None => response,
+        }
+    }
+
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
         &self,
@@ -1848,19 +1914,9 @@ impl PDRouter {
                     "prefill_unavailable",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
                 ),
-                StatusCode::TOO_MANY_REQUESTS => {
-                    let mut response = error::create_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "prefill_tier_admission_limited",
-                        format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                    );
-                    if let Ok(value) =
-                        HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
-                    {
-                        response.headers_mut().insert("retry-after", value);
-                    }
-                    response
-                }
+                StatusCode::TOO_MANY_REQUESTS => self.upstream_prefill_admission_rejected_response(
+                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
+                ),
                 StatusCode::BAD_GATEWAY => error::bad_gateway(
                     "prefill_bad_gateway",
                     format!("Prefill server error ({}): {}", prefill_status, error_msg),
@@ -2918,5 +2974,40 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[test]
+    fn test_preserves_upstream_prefill_admission_over_later_5xx() {
+        let router = create_test_pd_router();
+        let rejection = UpstreamPrefillAdmissionRejected {
+            message: "cold tier full".to_string(),
+        };
+
+        let response = router.preserve_upstream_prefill_admission_response(
+            error::bad_gateway("prefill_server_error", "transport failed"),
+            Some(rejection),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        assert!(response
+            .extensions()
+            .get::<UpstreamPrefillAdmissionRejected>()
+            .is_some());
+    }
+
+    #[test]
+    fn test_does_not_replace_success_after_upstream_prefill_admission() {
+        let router = create_test_pd_router();
+        let rejection = UpstreamPrefillAdmissionRejected {
+            message: "cold tier full".to_string(),
+        };
+
+        let response = router.preserve_upstream_prefill_admission_response(
+            StatusCode::OK.into_response(),
+            Some(rejection),
+        );
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
