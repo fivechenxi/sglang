@@ -1896,6 +1896,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
         operation = PrefetchOperation(
             "__storage_hit_query__",
             torch.empty(0, dtype=torch.uint8),
