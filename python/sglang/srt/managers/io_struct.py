@@ -1811,7 +1811,7 @@ class AbortReq(BaseReq, kw_only=True):
             self.rid = ""
 
 
-class PrefillAdmissionAck(BaseReq, kw_only=True):
+class PrefillAdmissionAckReq(BaseReq, kw_only=True):
     """Internal P->Router signal that exact cache-tier admission succeeded."""
 
     pass

@@ -120,7 +120,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
-    PrefillAdmissionAck,
+    PrefillAdmissionAckReq,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -2527,7 +2527,7 @@ class Scheduler(
                 # reservation, but before bootstrap. Router starts D only after
                 # seeing it, so a rejected P request allocates no D-side KV.
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    PrefillAdmissionAck(rid=req.rid), req
+                    PrefillAdmissionAckReq(rid=req.rid), req
                 )
             self._prefetch_kvcache(
                 req,

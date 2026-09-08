@@ -72,7 +72,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    PrefillAdmissionAck,
+    PrefillAdmissionAckReq,
     SessionParams,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
@@ -594,7 +594,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
-                (PrefillAdmissionAck, self._handle_prefill_admission_ack),
+                (PrefillAdmissionAckReq, self._handle_prefill_admission_ack),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
                     UpdateWeightFromDiskReqOutput,
@@ -2821,7 +2821,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.out_list.append(out)
         state.event.set()
 
-    def _handle_prefill_admission_ack(self, recv_obj: PrefillAdmissionAck):
+    def _handle_prefill_admission_ack(self, recv_obj: PrefillAdmissionAckReq):
         """Wake the internal P stream without completing its request state."""
         state = self.rid_to_state.get(recv_obj.rid)
         if state is None:

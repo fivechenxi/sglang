@@ -42,6 +42,10 @@ RUN test -n "$SGLANG_REPOSITORY" && test -n "$SGLANG_COMMIT" && \
     mv pyproject_npu.toml pyproject.toml && \
     python3 -m pip install --no-cache-dir --no-deps -e .
 
+# Import the request protocol during the image build. compileall only checks
+# syntax and does not execute io_struct's BaseReq naming/protocol validation.
+RUN python3 -c "from sglang.srt.managers.io_struct import PrefillAdmissionAckReq; print(PrefillAdmissionAckReq.__name__)"
+
 # W4A8C8 uses the same verified EP32/DP8/TP4 DeepEP runtime policy as W8A8.
 RUN python3 /sgl-workspace/sglang/scripts/ascend/patch_glm52_910b_w8a8_runtime.py
 
