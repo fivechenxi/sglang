@@ -105,7 +105,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   build-router-arm64:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.build_client
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout exact source
