@@ -2611,6 +2611,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_open_prefill_breaker_fails_pair_before_decode_selection() {
+        let router = create_test_pd_router();
+
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        ));
+        prefill.circuit_breaker().force_open();
+        assert!(
+            prefill.is_healthy(),
+            "health must remain independent of breaker state"
+        );
+        assert!(
+            !prefill.circuit_breaker().can_execute(),
+            "test precondition: prefill breaker is open"
+        );
+
+        router.worker_registry.register(prefill);
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://decode".to_string(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let error = router
+            .select_pd_pair(None, None, None)
+            .await
+            .expect_err("an open P breaker must reject the whole PD pair");
+        assert!(error.contains("No available prefill workers"), "{error}");
+    }
+
+    #[tokio::test]
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
