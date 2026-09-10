@@ -762,13 +762,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self.queue:
             return
 
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
-        if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
-            decode_req.kv_receiver.conclude_state == KVPoll.Failed
-            for decode_req in self.queue
-        ):
-            return
-
+        # Keep polling after the handshake reaches WaitingForInput. A request
+        # can remain in this queue while decode KV preallocation is blocked;
+        # receiver.poll() is what drives that phase's timeout. This method is
+        # already called at the configured decode polling interval, and every
+        # rank enters the same all-reduce, preserving collective lockstep.
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
         )

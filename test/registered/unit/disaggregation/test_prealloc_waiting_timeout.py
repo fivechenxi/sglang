@@ -1,9 +1,10 @@
 """Decode preallocation and KV transfer use distinct timeout phases."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -11,6 +12,25 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_prealloc_queue_keeps_polling_after_handshake_ready():
+    """A blocked D-side preallocation must keep driving receiver timeouts."""
+    queue = object.__new__(DecodePreallocQueue)
+    queue.gloo_group = MagicMock()
+    req = SimpleNamespace(time_stats=MagicMock(), rid="rid-1", bootstrap_room=1)
+    receiver = MagicMock(conclude_state=None)
+    queue.queue = [
+        DecodeRequest(req=req, kv_receiver=receiver, waiting_for_input=True)
+    ]
+
+    with patch(
+        "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+        return_value=[KVPoll.WaitingForInput],
+    ) as poll_all_ranks:
+        queue._update_handshake_waiters()
+
+    poll_all_ranks.assert_called_once_with([receiver], queue.gloo_group)
 
 
 def test_waiting_timeout_starts_before_metadata_is_sent():
