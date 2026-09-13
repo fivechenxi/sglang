@@ -165,9 +165,9 @@ class DecodeReqToTokenPool:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        assert (
-            len(reusing) <= 1
-        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert len(reusing) <= 1, (
+            "only one chunked request may reuse req_pool_idx in a batch"
+        )
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -381,17 +381,40 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def admittable_tokens(self) -> int:
-        return self.token_admission.admittable_tokens(self._allocatable_token_budgets())
+        # `_allocatable_token_budgets` already protects every outstanding lease.
+        return max(0, self._allocatable_token_budgets())
 
     def reserve_tokens(self, reservation_id: str, tokens: int) -> bool:
         """Idempotently reserve opaque Decode capacity in token units."""
         return self.token_admission.reserve(
-            reservation_id, tokens, self._allocatable_token_budgets()
+            reservation_id,
+            tokens,
+            self._allocatable_token_budgets(include_token_reservations=False),
         ).accepted
 
     def release_token_reservation(self, reservation_id: str) -> bool:
-        self.token_admission.release(reservation_id, self._allocatable_token_budgets())
+        self.token_admission.release(reservation_id, 0)
         return True
+
+    def release_req_token_reservation(self, req: Req) -> None:
+        reservation_id = req.decode_token_reservation_id
+        if reservation_id is None:
+            return
+        self.release_token_reservation(reservation_id)
+        req.decode_token_reservation_id = None
+
+    def _dynamic_output_reserve(self, req: Req) -> int:
+        materialized_growth = max(
+            0,
+            req.kv_committed_len - req.decode_token_reservation_base_kv_len,
+        )
+        return max(
+            0,
+            req.decode_token_reservation_extra - materialized_growth,
+        )
+
+    def _reserved_decode_tokens(self, req: Req) -> int:
+        return self.num_reserved_decode_tokens + self._dynamic_output_reserve(req)
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -419,11 +442,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
-        swa_reserved = self.num_reserved_decode_tokens
+        reserved = self._reserved_decode_tokens(req)
+        swa_reserved = reserved
         if self.scheduler.server_args.disable_radix_cache:
             swa_reserved = 0
         return (
-            full_len + self.num_reserved_decode_tokens,
+            full_len + reserved,
             swa_len + swa_reserved,
         )
 
@@ -535,7 +559,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ``pop_preallocated``).
         """
         if self._check_if_req_exceed_kv_capacity(req):
+            self.release_req_token_reservation(req)
             return
+
+        reservation_id = req.decode_token_reservation_id
+        if reservation_id is not None and not (is_retracted or is_rebootstrap):
+            if not self.token_admission.commit(reservation_id):
+                message = (
+                    "Decode token reservation is missing, expired, or already "
+                    f"consumed: {reservation_id}"
+                )
+                logger.warning("%s rid=%s", message, req.rid)
+                prepare_abort(req, message, status_code=HTTPStatus.TOO_MANY_REQUESTS)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                req.decode_token_reservation_id = None
+                return
 
         if is_retracted:
             req.retraction_mb_id = None
@@ -724,6 +762,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.add(req, is_retracted=is_retracted)
 
     def release_memory_occupation(self):
+        self.token_admission.clear()
         self.queue.clear()
         self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
@@ -1005,7 +1044,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
+            reservation_id = decode_req.req.decode_token_reservation_id
+            if reservation_id is not None and not self.token_admission.is_committed(
+                reservation_id
+            ):
+                message = (
+                    "Decode token reservation disappeared before physical "
+                    f"preallocation: {reservation_id}"
+                )
+                logger.warning("%s rid=%s", message, decode_req.req.rid)
+                prepare_abort(
+                    decode_req.req,
+                    message,
+                    status_code=HTTPStatus.TOO_MANY_REQUESTS,
+                )
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self.release_req_token_reservation(decode_req.req)
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1077,6 +1131,31 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = self._rebootstrap_prefill_len(decode_req.req)
+            reservation_id = decode_req.req.decode_token_reservation_id
+            current_reservation_tokens = self.token_admission.reservation_tokens(
+                reservation_id
+            )
+            reservation_extra = (
+                self.token_admission.planned_extra_after_materialization(
+                    reservation_id,
+                    materialized_tokens=origin_input_len,
+                    baseline_output_tokens=self.num_reserved_decode_tokens,
+                )
+                if reservation_id is not None
+                else self._dynamic_output_reserve(decode_req.req)
+            )
+            if reservation_extra is None:
+                raise RuntimeError(
+                    "Committed Decode reservation disappeared while the "
+                    f"scheduler was preallocating rid={decode_req.req.rid}"
+                )
+            # The allocator budget protects all outstanding D-issued leases.
+            # This request is about to turn its own lease into physical KV, so
+            # add only that lease back while checking the transition. Leases for
+            # requests still in flight from Router remain unavailable.
+            request_allocatable_tokens = (
+                full_allocatable_tokens + current_reservation_tokens
+            )
             prefix_match: Optional[DecodePrefixMatch] = None
             use_decode_radix_cache = (
                 self.scheduler.server_args.disaggregation_decode_enable_radix_cache
@@ -1105,7 +1184,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     retractable_tokens=retractable_tokens,
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs),
+                    extra_reserved_tokens=sum(
+                        self._dynamic_output_reserve(req.req)
+                        for req in preallocated_reqs
+                    ),
                     hicache_reserved_tokens=reserved_restore_tokens,
+                )
+                request_allocatable_tokens = (
+                    full_allocatable_tokens + current_reservation_tokens
                 )
             else:
                 prefix_indices = None
@@ -1114,7 +1200,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 required_alloc_tokens = self._pre_alloc_fill_len(decode_req.req)
 
             required_tokens_for_request = (
-                required_alloc_tokens + self.num_reserved_decode_tokens
+                required_alloc_tokens
+                + self.num_reserved_decode_tokens
+                + reservation_extra
             )
 
             if (
@@ -1128,7 +1216,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     - retractable_tokens,
                 )
-                > full_allocatable_tokens
+                > request_allocatable_tokens
             ):
                 self._trace_prealloc_blocked(
                     "projected_memory",
@@ -1137,17 +1225,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     origin_input_len=origin_input_len,
                     prefix_len=prefix_len,
                     retractable_tokens=retractable_tokens,
-                    full_allocatable_tokens=full_allocatable_tokens,
+                    full_allocatable_tokens=request_allocatable_tokens,
                 )
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
-            if required_tokens_for_request > full_allocatable_tokens:
+            if required_tokens_for_request > request_allocatable_tokens:
                 self._trace_prealloc_blocked(
                     "required_memory",
                     decode_req,
                     required_tokens_for_request=required_tokens_for_request,
-                    full_allocatable_tokens=full_allocatable_tokens,
+                    full_allocatable_tokens=request_allocatable_tokens,
                 )
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -1155,6 +1243,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
+                swa_required += reservation_extra
+                request_swa_allocatable_tokens = (
+                    swa_allocatable_tokens + current_reservation_tokens
+                )
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
                 max_new_tokens = min(
                     decode_req.req.sampling_params.max_new_tokens,
@@ -1165,7 +1257,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         swa_required,
                         swa_len + max_new_tokens - retractable_swa_tokens,
                     )
-                    > swa_allocatable_tokens
+                    > request_swa_allocatable_tokens
                 ):
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
@@ -1180,6 +1272,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "DSV4 NPU PD disaggregation does not support decode-side "
                     "prefix cache yet; disable disaggregation decode radix/HiCache "
                     "for PD + chunked prefill."
+                )
+
+            if reservation_id is not None:
+                materialized_extra = self.token_admission.extra_after_materialization(
+                    reservation_id,
+                    materialized_tokens=origin_input_len,
+                    baseline_output_tokens=self.num_reserved_decode_tokens,
+                )
+                if materialized_extra is None:
+                    raise RuntimeError(
+                        "Committed Decode reservation disappeared while the "
+                        f"scheduler was materializing rid={decode_req.req.rid}"
+                    )
+                decode_req.req.decode_token_reservation_id = None
+                decode_req.req.decode_token_reservation_extra = materialized_extra
+                decode_req.req.decode_token_reservation_base_kv_len = (
+                    self._pre_alloc_fill_len(decode_req.req)
                 )
 
             dst_kv_indices = self._pre_alloc(
@@ -1200,12 +1309,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
+                extra_reserved_tokens=sum(
+                    self._dynamic_output_reserve(req.req) for req in preallocated_reqs
+                )
+                + self._dynamic_output_reserve(decode_req.req),
                 hicache_reserved_tokens=reserved_restore_tokens,
             )
             if uses_swa_tail_prealloc:
                 # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
-                swa_allocatable_tokens -= swa_required
+                # the SWA pool, so page-rounding drift is negligible). The
+                # current lease was already deducted from the starting budget;
+                # add it back as that lease becomes physical allocation.
+                swa_allocatable_tokens += current_reservation_tokens - swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -1406,11 +1521,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _active_reserved_tokens(
-        self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
+        self,
+        n_active: Optional[int] = None,
+        extra_reserved_reqs: int = 0,
+        extra_reserved_tokens: int = 0,
     ) -> int:
+        active_reqs = (
+            list(self.scheduler.running_batch.reqs)
+            + [entry.req for entry in self.transfer_queue.queue]
+            + list(self.scheduler.waiting_queue)
+        )
         if n_active is None:
-            n_active = self._active_req_count(extra_reserved_reqs)
-        return self.num_reserved_decode_tokens * n_active
+            n_active = len(active_reqs) + extra_reserved_reqs
+        dynamic_tokens = sum(self._dynamic_output_reserve(req) for req in active_reqs)
+        return (
+            self.num_reserved_decode_tokens * n_active
+            + dynamic_tokens
+            + extra_reserved_tokens
+        )
 
     def _swa_aware_allocatable_token_budgets(
         self,
@@ -1419,12 +1547,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         count_retracted: bool = True,
     ) -> Tuple[int, int]:
         n_active = self._active_req_count()
-        reserved_tokens = self._active_reserved_tokens(n_active)
+        reserved_tokens = (
+            self._active_reserved_tokens(n_active)
+            + self.token_admission.reserved_tokens()
+        )
 
         full_allocatable_tokens = self._allocatable_token_budgets(
             retractable_tokens=retractable_tokens,
             count_retracted=count_retracted,
             reserved_tokens=reserved_tokens,
+            include_token_reservations=False,
         )
 
         return full_allocatable_tokens, self._swa_tail_allocatable_token_budget(
@@ -1440,14 +1572,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         retractable_tokens: Optional[int] = None,
         count_retracted: bool = True,
         extra_reserved_reqs: int = 0,
+        extra_reserved_tokens: int = 0,
         reserved_tokens: Optional[int] = None,
         hicache_reserved_tokens: int = 0,
+        include_token_reservations: bool = True,
     ) -> int:
         need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(
-                extra_reserved_reqs=extra_reserved_reqs
+                extra_reserved_reqs=extra_reserved_reqs,
+                extra_reserved_tokens=extra_reserved_tokens,
             )
+        if include_token_reservations:
+            reserved_tokens += self.token_admission.reserved_tokens()
 
         if self.scheduler.enable_hisparse:
             logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
@@ -1588,9 +1725,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
-        assert (
-            req_pool_indices is not None
-        ), "req_pool_indices is full! There is a bug in memory estimation."
+        assert req_pool_indices is not None, (
+            "req_pool_indices is full! There is a bug in memory estimation."
+        )
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -1990,9 +2127,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ].tolist()
             )
         if decode_req.req.return_sampling_mask:
-            assert (
-                output_token_sampling_mask_idx is not None
-            ), "sampling mask buffer disabled on decode side"
+            assert output_token_sampling_mask_idx is not None, (
+                "sampling mask buffer disabled on decode side"
+            )
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)

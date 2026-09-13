@@ -2686,10 +2686,6 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            if req.decode_token_reservation_id is not None:
-                self.disagg_decode_prealloc_queue.release_token_reservation(
-                    req.decode_token_reservation_id
-                )
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -4499,6 +4495,9 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    self.disagg_decode_prealloc_queue.release_req_token_reservation(
+                        decode_req.req
+                    )
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache

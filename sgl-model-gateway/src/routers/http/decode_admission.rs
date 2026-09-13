@@ -161,9 +161,13 @@ struct ReservationRequest<'a> {
 
 #[derive(Deserialize)]
 struct ReservationResponse {
+    dp_rank: usize,
+    handled: bool,
     accepted: bool,
     reserved_tokens: usize,
     admittable_tokens: usize,
+    #[serde(default)]
+    error: String,
 }
 
 impl RemoteController {
@@ -172,7 +176,12 @@ impl RemoteController {
         worker: &dyn Worker,
         tokens: usize,
     ) -> Result<RemoteGuard, RemoteError> {
-        let dp_rank = worker.dp_rank().unwrap_or(0);
+        let Some(dp_rank) = worker.dp_rank() else {
+            return Err(RemoteError::Unavailable(format!(
+                "remote decode admission requires a DP-aware worker identity: {}",
+                worker.url()
+            )));
+        };
         let endpoint = format!("{}/internal/decode_token_reservation", worker.base_url());
         let reservation_id = Uuid::new_v4().to_string();
         let response = post_reservation(
@@ -196,6 +205,13 @@ impl RemoteController {
             RemoteError::Unavailable(error)
         })?;
 
+        if !response.handled || response.dp_rank != dp_rank {
+            return Err(RemoteError::Unavailable(format!(
+                "decode reservation response mismatch: requested dp_rank={dp_rank}, returned dp_rank={}, handled={}, error={}",
+                response.dp_rank, response.handled, response.error
+            )));
+        }
+
         if !response.accepted {
             return Err(RemoteError::Rejected(Rejection {
                 requested_tokens: tokens,
@@ -204,18 +220,24 @@ impl RemoteController {
                 max_tokens: 0,
             }));
         }
+        if response.reserved_tokens != tokens {
+            return Err(RemoteError::Unavailable(format!(
+                "decode reservation token mismatch: requested={tokens}, reserved={}",
+                response.reserved_tokens
+            )));
+        }
         counter!(
             "smg_pd_decode_admission_total",
             "worker" => worker.url().to_owned(),
             "result" => "accepted"
         )
         .increment(1);
-        debug_assert_eq!(response.reserved_tokens, tokens);
         Ok(RemoteGuard {
             client: client.clone(),
             endpoint,
             reservation_id,
             dp_rank,
+            release_on_drop: true,
         })
     }
 }
@@ -247,16 +269,29 @@ pub struct RemoteGuard {
     endpoint: String,
     reservation_id: String,
     dp_rank: usize,
+    release_on_drop: bool,
 }
 
 impl RemoteGuard {
     pub fn reservation_id(&self) -> &str {
         &self.reservation_id
     }
+
+    /// Transfer cleanup ownership to the Decode scheduler.
+    ///
+    /// Pending reservations still expire after 30 seconds if the request does
+    /// not reach Decode. Once committed, Decode carries the remaining output
+    /// headroom in the request's own scheduling state.
+    pub fn handoff_to_decode(&mut self) {
+        self.release_on_drop = false;
+    }
 }
 
 impl Drop for RemoteGuard {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let reservation_id = self.reservation_id.clone();
@@ -282,7 +317,7 @@ impl Drop for RemoteGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
 
     #[test]
     fn credits_are_atomic_per_decode_rank_and_release_on_drop() {
@@ -305,9 +340,12 @@ mod tests {
             assert_eq!(request["dp_rank"], 0);
             assert_eq!(request["tokens"], 700);
             Json(json!({
+                "dp_rank": 0,
+                "handled": true,
                 "accepted": true,
                 "reserved_tokens": 700,
                 "admittable_tokens": 300,
+                "error": "",
             }))
         }
 
@@ -315,15 +353,61 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let app = Router::new().route("/internal/decode_token_reservation", post(reserve));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let worker = BasicWorkerBuilder::new(format!("http://{address}"))
+        let worker = DPAwareWorkerBuilder::new(format!("http://{address}"), 0, 1)
             .worker_type(WorkerType::Decode)
             .build();
 
-        let guard = RemoteController::try_acquire(&Client::new(), &worker, 700)
+        let mut guard = RemoteController::try_acquire(&Client::new(), &worker, 700)
             .await
             .unwrap();
         assert!(!guard.reservation_id().is_empty());
+        assert!(guard.release_on_drop);
+        guard.handoff_to_decode();
+        assert!(!guard.release_on_drop);
         drop(guard);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_controller_rejects_mismatched_decode_response() {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn reserve(Json(_request): Json<Value>) -> Json<Value> {
+            Json(json!({
+                "dp_rank": 1,
+                "handled": true,
+                "accepted": true,
+                "reserved_tokens": 700,
+                "admittable_tokens": 300,
+                "error": "",
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/internal/decode_token_reservation", post(reserve));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let worker = DPAwareWorkerBuilder::new(format!("http://{address}"), 0, 1)
+            .worker_type(WorkerType::Decode)
+            .build();
+
+        assert!(matches!(
+            RemoteController::try_acquire(&Client::new(), &worker, 700).await,
+            Err(RemoteError::Unavailable(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_controller_rejects_aggregate_worker_without_dp_identity() {
+        let worker = BasicWorkerBuilder::new("http://decode:30000")
+            .worker_type(WorkerType::Decode)
+            .build();
+
+        assert!(matches!(
+            RemoteController::try_acquire(&Client::new(), &worker, 700).await,
+            Err(RemoteError::Unavailable(_))
+        ));
     }
 }

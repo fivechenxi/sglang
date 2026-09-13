@@ -65,12 +65,13 @@ pub struct RouterConfig {
     /// Retry-After value returned by fail-fast admission 429 responses.
     #[serde(default = "default_pd_prefill_admission_retry_after_secs")]
     pub pd_prefill_admission_retry_after_secs: u64,
-    /// Per decode-DP in-flight KV token budget. The reservation covers the
-    /// entire response lifetime. Zero disables decode admission.
+    /// Per decode-DP in-flight KV token fallback. It also handles batched
+    /// requests until the remote protocol supports per-child reservation IDs.
+    /// Zero disables local decode admission.
     #[serde(default)]
     pub pd_decode_admission_max_tokens: usize,
-    /// Conservative token overhead added to every decode reservation for chat
-    /// templates and protocol tokens not present in routing text.
+    /// Output-token fallback used before the Router has enough P90 samples.
+    /// Must be non-zero when remote Decode admission is enabled.
     #[serde(default)]
     pub pd_decode_admission_token_overhead: usize,
     /// Use Decode-issued real-time atomic reservations. Endpoint failures
