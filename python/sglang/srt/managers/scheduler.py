@@ -2031,11 +2031,6 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            record_completed_output=(
-                self.disagg_decode_prealloc_queue.record_completed_output
-                if self.disaggregation_mode == DisaggregationMode.DECODE
-                else lambda _tokens: None
-            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -4871,10 +4866,9 @@ class Scheduler(
         error = ""
         if handled:
             if recv_req.operation == "reserve":
-                accepted, reserved_tokens = queue.reserve_tokens(
-                    recv_req.reservation_id,
-                    recv_req.input_tokens,
-                    recv_req.max_output_tokens,
+                reserved_tokens = max(0, recv_req.tokens)
+                accepted = queue.reserve_tokens(
+                    recv_req.reservation_id, reserved_tokens
                 )
             else:
                 queue.release_token_reservation(recv_req.reservation_id)
@@ -4889,9 +4883,6 @@ class Scheduler(
                 accepted=accepted,
                 reserved_tokens=reserved_tokens,
                 admittable_tokens=queue.admittable_tokens() if queue else 0,
-                suggested_output_tokens=(
-                    queue.suggested_output_tokens() if queue else 0
-                ),
                 error=error,
             ),
             recv_req,

@@ -381,6 +381,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     pd_decode_admission_token_overhead: usize,
 
+    /// Use Decode-issued real-time atomic token reservations
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pd_decode_admission_remote: bool,
+
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
@@ -1060,6 +1064,7 @@ impl CliArgs {
             .pd_decode_admission(
                 self.pd_decode_admission_max_tokens,
                 self.pd_decode_admission_token_overhead,
+                self.pd_decode_admission_remote,
             )
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {

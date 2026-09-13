@@ -397,6 +397,7 @@ struct Router {
     pd_prefill_admission_retry_after_secs: u64,
     pd_decode_admission_max_tokens: usize,
     pd_decode_admission_token_overhead: usize,
+    pd_decode_admission_remote: bool,
     max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
@@ -619,6 +620,7 @@ impl Router {
             .pd_decode_admission(
                 self.pd_decode_admission_max_tokens,
                 self.pd_decode_admission_token_overhead,
+                self.pd_decode_admission_remote,
             )
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
@@ -738,6 +740,7 @@ impl Router {
         pd_prefill_admission_retry_after_secs = 1,
         pd_decode_admission_max_tokens = 0,
         pd_decode_admission_token_overhead = 0,
+        pd_decode_admission_remote = false,
         max_concurrent_requests = -1,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
@@ -838,6 +841,7 @@ impl Router {
         pd_prefill_admission_retry_after_secs: u64,
         pd_decode_admission_max_tokens: usize,
         pd_decode_admission_token_overhead: usize,
+        pd_decode_admission_remote: bool,
         max_concurrent_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
@@ -951,6 +955,7 @@ impl Router {
             pd_prefill_admission_retry_after_secs,
             pd_decode_admission_max_tokens,
             pd_decode_admission_token_overhead,
+            pd_decode_admission_remote,
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,

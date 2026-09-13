@@ -7,7 +7,6 @@ the current allocator-derived token budget in and receives one opaque scalar.
 from __future__ import annotations
 
 import time
-from array import array
 from dataclasses import dataclass
 from typing import Callable, Dict, Tuple
 
@@ -16,51 +15,18 @@ from typing import Callable, Dict, Tuple
 class ReservationResult:
     accepted: bool
     admittable_tokens: int
-    suggested_output_tokens: int
 
 
 class DecodeTokenAdmissionState:
     def __init__(
         self,
         *,
-        fallback_output_tokens: int,
-        sample_capacity: int = 100,
-        min_samples: int = 20,
         reservation_ttl_s: float = 30.0,
-        max_output_reserve_tokens: int = 4096,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if sample_capacity <= 0:
-            raise ValueError("sample_capacity must be positive")
-        if min_samples <= 0 or min_samples > sample_capacity:
-            raise ValueError("min_samples must be within sample_capacity")
-        self._fallback_output_tokens = max(0, fallback_output_tokens)
-        self._min_samples = min_samples
         self._reservation_ttl_s = reservation_ttl_s
-        self._max_output_reserve_tokens = max_output_reserve_tokens
         self._clock = clock
-        self._sample_capacity = sample_capacity
-        self._completed_output_tokens = array("I", [0]) * sample_capacity
-        self._sample_count = 0
-        self._sample_cursor = 0
-        self._suggested_output_tokens = self._fallback_output_tokens
         self._reservations: Dict[str, Tuple[int, float]] = {}
-
-    def record_completed_output(self, output_tokens: int) -> None:
-        output_tokens = min(max(0, int(output_tokens)), (1 << 32) - 1)
-        self._completed_output_tokens[self._sample_cursor] = output_tokens
-        self._sample_cursor = (self._sample_cursor + 1) % self._sample_capacity
-        self._sample_count = min(self._sample_count + 1, self._sample_capacity)
-        if self._sample_count >= self._min_samples:
-            values = sorted(self._completed_output_tokens[: self._sample_count])
-            p90 = values[(9 * len(values) - 1) // 10]
-            self._suggested_output_tokens = min(
-                self._max_output_reserve_tokens,
-                max(self._fallback_output_tokens, p90),
-            )
-
-    def suggested_output_tokens(self) -> int:
-        return self._suggested_output_tokens
 
     def _prune_expired(self) -> None:
         now = self._clock()
@@ -92,7 +58,6 @@ class DecodeTokenAdmissionState:
         return ReservationResult(
             accepted=accepted,
             admittable_tokens=self.admittable_tokens(allocator_budget),
-            suggested_output_tokens=self.suggested_output_tokens(),
         )
 
     def release(self, reservation_id: str, allocator_budget: int) -> ReservationResult:
@@ -100,5 +65,4 @@ class DecodeTokenAdmissionState:
         return ReservationResult(
             accepted=True,
             admittable_tokens=self.admittable_tokens(allocator_budget),
-            suggested_output_tokens=self.suggested_output_tokens(),
         )

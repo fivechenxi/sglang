@@ -344,10 +344,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         self._bootstrap_trace_last_log: Dict[int, float] = {}
-        self.token_admission = DecodeTokenAdmissionState(
-            fallback_output_tokens=num_reserved_decode_tokens,
-            max_output_reserve_tokens=CLIP_MAX_NEW_TOKEN,
-        )
+        self.token_admission = DecodeTokenAdmissionState()
         # Retracted requests staged for rebootstrap while generation is paused.
         # Enqueued into ``self.queue`` only on ``continue_generation`` so the
         # prefix KV is recomputed under the post-retract (updated) weights.
@@ -383,28 +380,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
-    def suggested_output_tokens(self) -> int:
-        return self.token_admission.suggested_output_tokens()
-
-    def record_completed_output(self, output_tokens: int) -> None:
-        self.token_admission.record_completed_output(output_tokens)
-
     def admittable_tokens(self) -> int:
         return self.token_admission.admittable_tokens(
             self._allocatable_token_budgets()
         )
 
-    def reserve_tokens(
-        self, reservation_id: str, input_tokens: int, max_output_tokens: int
-    ) -> Tuple[bool, int]:
+    def reserve_tokens(self, reservation_id: str, tokens: int) -> bool:
         """Idempotently reserve opaque Decode capacity in token units."""
-        tokens = max(0, int(input_tokens)) + min(
-            max(0, int(max_output_tokens)), self.suggested_output_tokens()
-        )
-        result = self.token_admission.reserve(
+        return self.token_admission.reserve(
             reservation_id, tokens, self._allocatable_token_budgets()
-        )
-        return result.accepted, tokens
+        ).accepted
 
     def release_token_reservation(self, reservation_id: str) -> bool:
         self.token_admission.release(
@@ -1423,7 +1408,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> int:
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
-        return self.suggested_output_tokens() * n_active
+        return self.num_reserved_decode_tokens * n_active
 
     def _swa_aware_allocatable_token_budgets(
         self,
