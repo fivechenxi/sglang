@@ -1275,6 +1275,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_sampling_mask=obj.return_sampling_mask,
                 stream=obj.stream,
                 pd_prefill_admission_ack=obj.pd_prefill_admission_ack,
+                decode_token_reservation_id=obj.decode_token_reservation_id,
                 rid=obj.rid,
                 http_worker_ipc=obj.http_worker_ipc,
                 bootstrap_host=obj.bootstrap_host,

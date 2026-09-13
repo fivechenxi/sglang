@@ -372,6 +372,8 @@ class CompletionRequest(BaseModel):
     bootstrap_room: Optional[Union[List[int], int]] = None
     # Internal PD Router handshake; see ChatCompletionRequest counterpart.
     pd_prefill_admission_ack: bool = False
+    # Internal PD Router field; not part of the public API contract.
+    decode_token_reservation_id: Optional[str] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -838,6 +840,8 @@ class ChatCompletionRequest(BaseModel):
     # Internal PD Router handshake. P emits a response only after its actual
     # cache-tier admission succeeds, allowing Router to defer D allocation.
     pd_prefill_admission_ack: bool = False
+    # Internal PD Router field; not part of the public API contract.
+    decode_token_reservation_id: Optional[str] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None

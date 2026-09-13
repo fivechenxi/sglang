@@ -197,6 +197,12 @@ class SchedulerLoadInquirer:
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
+        admittable_tokens = suggested_output_tokens = 0
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            decode_queue = self.get_disagg_decode_prealloc_queue()
+            admittable_tokens = decode_queue.admittable_tokens()
+            suggested_output_tokens = decode_queue.suggested_output_tokens()
+
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),
@@ -208,6 +214,8 @@ class SchedulerLoadInquirer:
             num_active_tokens=num_active_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
+            admittable_tokens=admittable_tokens,
+            suggested_output_tokens=suggested_output_tokens,
             token_usage=round(kv_token_usage, 4),
             gen_throughput=round(stats.gen_throughput, 2),
             cache_hit_rate=round(stats.cache_hit_rate, 4),
