@@ -7,9 +7,9 @@ the current allocator-derived token budget in and receives one opaque scalar.
 from __future__ import annotations
 
 import time
-from collections import deque
+from array import array
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 
 @dataclass(frozen=True)
@@ -30,30 +30,37 @@ class DecodeTokenAdmissionState:
         max_output_reserve_tokens: int = 4096,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if sample_capacity <= 0:
+            raise ValueError("sample_capacity must be positive")
+        if min_samples <= 0 or min_samples > sample_capacity:
+            raise ValueError("min_samples must be within sample_capacity")
         self._fallback_output_tokens = max(0, fallback_output_tokens)
         self._min_samples = min_samples
         self._reservation_ttl_s = reservation_ttl_s
         self._max_output_reserve_tokens = max_output_reserve_tokens
         self._clock = clock
-        self._completed_output_tokens: Deque[int] = deque(maxlen=sample_capacity)
+        self._sample_capacity = sample_capacity
+        self._completed_output_tokens = array("I", [0]) * sample_capacity
+        self._sample_count = 0
+        self._sample_cursor = 0
+        self._suggested_output_tokens = self._fallback_output_tokens
         self._reservations: Dict[str, Tuple[int, float]] = {}
 
     def record_completed_output(self, output_tokens: int) -> None:
-        self._completed_output_tokens.append(max(0, int(output_tokens)))
+        output_tokens = min(max(0, int(output_tokens)), (1 << 32) - 1)
+        self._completed_output_tokens[self._sample_cursor] = output_tokens
+        self._sample_cursor = (self._sample_cursor + 1) % self._sample_capacity
+        self._sample_count = min(self._sample_count + 1, self._sample_capacity)
+        if self._sample_count >= self._min_samples:
+            values = sorted(self._completed_output_tokens[: self._sample_count])
+            p90 = values[(9 * len(values) - 1) // 10]
+            self._suggested_output_tokens = min(
+                self._max_output_reserve_tokens,
+                max(self._fallback_output_tokens, p90),
+            )
 
     def suggested_output_tokens(self) -> int:
-        if len(self._completed_output_tokens) < self._min_samples:
-            return self._fallback_output_tokens
-        values = sorted(self._completed_output_tokens)
-        # Nearest-rank P90: ceil(0.9 * n) - 1.
-        p90 = values[(9 * len(values) - 1) // 10]
-        # Never regress below the existing operational safety reserve. The
-        # dynamic estimator is intended to fix under-reservation, not to claim
-        # capacity from a small low-output sample.
-        return min(
-            self._max_output_reserve_tokens,
-            max(self._fallback_output_tokens, p90),
-        )
+        return self._suggested_output_tokens
 
     def _prune_expired(self) -> None:
         now = self._clock()
