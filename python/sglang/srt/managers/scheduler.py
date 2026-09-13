@@ -103,6 +103,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DecodeTokenReservationReqInput,
+    DecodeTokenReservationReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertDistributionReq,
@@ -1541,6 +1543,10 @@ class Scheduler(
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (
+                    DecodeTokenReservationReqInput,
+                    self.handle_decode_token_reservation,
+                ),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
                     RemoveExternalCorpusReqInput,
@@ -2025,6 +2031,11 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
+            record_completed_output=(
+                self.disagg_decode_prealloc_queue.record_completed_output
+                if self.disaggregation_mode == DisaggregationMode.DECODE
+                else lambda _tokens: None
+            ),
         )
 
     def init_req_max_new_tokens(self, req):
@@ -2282,6 +2293,9 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.pd_prefill_admission_ack = recv_req.pd_prefill_admission_ack
+            req.decode_token_reservation_id = (
+                recv_req.decode_token_reservation_id
+            )
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -2679,6 +2693,10 @@ class Scheduler(
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            if req.decode_token_reservation_id is not None:
+                self.disagg_decode_prealloc_queue.release_token_reservation(
+                    req.decode_token_reservation_id
+                )
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
@@ -4837,6 +4855,47 @@ class Scheduler(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )
+
+    def handle_decode_token_reservation(
+        self, recv_req: DecodeTokenReservationReqInput
+    ) -> None:
+        dp_rank = int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0
+        queue = (
+            self.disagg_decode_prealloc_queue
+            if self.disaggregation_mode == DisaggregationMode.DECODE
+            else None
+        )
+        handled = queue is not None and recv_req.dp_rank == dp_rank
+        accepted = False
+        reserved_tokens = 0
+        error = ""
+        if handled:
+            if recv_req.operation == "reserve":
+                accepted, reserved_tokens = queue.reserve_tokens(
+                    recv_req.reservation_id,
+                    recv_req.input_tokens,
+                    recv_req.max_output_tokens,
+                )
+            else:
+                queue.release_token_reservation(recv_req.reservation_id)
+                accepted = True
+        elif queue is None:
+            error = "not a decode scheduler"
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            DecodeTokenReservationReqOutput(
+                dp_rank=dp_rank,
+                handled=handled,
+                accepted=accepted,
+                reserved_tokens=reserved_tokens,
+                admittable_tokens=queue.admittable_tokens() if queue else 0,
+                suggested_output_tokens=(
+                    queue.suggested_output_tokens() if queue else 0
+                ),
+                error=error,
+            ),
+            recv_req,
+        )
 
     # placeholder for override
     def update_cache_from_scheduler(

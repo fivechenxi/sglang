@@ -195,6 +195,10 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_active_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
+    # Decode-side scalar admission budget. It already folds every device-side
+    # constraint and safety reserve into opaque token units.
+    admittable_tokens: int = 0
+    suggested_output_tokens: int = 0
     token_usage: float = 0.0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0

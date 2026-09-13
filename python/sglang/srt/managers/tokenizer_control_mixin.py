@@ -25,6 +25,8 @@ from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
+    DecodeTokenReservationReqInput,
+    DecodeTokenReservationReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertDistributionReq,
@@ -119,6 +121,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
+    ("decode_token_reservation", DecodeTokenReservationReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
 
@@ -827,6 +830,19 @@ class TokenizerControlMixin:
     ) -> List[DumperControlReqOutput]:
         self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
+
+    async def decode_token_reservation(
+        self: TokenizerManager, obj: DecodeTokenReservationReqInput
+    ) -> DecodeTokenReservationReqOutput:
+        self.auto_create_handle_loop()
+        responses = await self.decode_token_reservation_communicator(obj)
+        handled = [response for response in responses if response.handled]
+        if len(handled) != 1:
+            raise RuntimeError(
+                "Expected exactly one Decode DP rank to handle reservation, "
+                f"got {len(handled)}"
+            )
+        return handled[0]
 
     async def get_loads(
         self: TokenizerManager,

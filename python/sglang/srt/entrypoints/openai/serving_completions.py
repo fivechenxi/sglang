@@ -123,6 +123,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_text_in_logprobs=True,
             stream=request.stream,
             pd_prefill_admission_ack=request.pd_prefill_admission_ack,
+            decode_token_reservation_id=request.decode_token_reservation_id,
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
