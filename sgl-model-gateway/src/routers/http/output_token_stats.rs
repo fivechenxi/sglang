@@ -103,11 +103,12 @@ impl OutputObservation {
             .get("choices")
             .and_then(Value::as_array)
             .is_some_and(|choices| {
-                choices.iter().any(|choice| {
-                    choice
-                        .get("finish_reason")
-                        .is_some_and(|reason| !reason.is_null())
-                })
+                !choices.is_empty()
+                    && choices.iter().all(|choice| {
+                        choice
+                            .get("finish_reason")
+                            .is_some_and(|reason| !reason.is_null())
+                    })
             })
             || value
                 .pointer("/meta_info/finish_reason")
@@ -149,10 +150,6 @@ impl OutputObservation {
     pub fn is_completed(&self) -> bool {
         self.completed && !self.failed
     }
-
-    pub fn is_failed(&self) -> bool {
-        self.failed
-    }
 }
 
 fn exact_completion_tokens(value: &Value) -> Option<usize> {
@@ -179,10 +176,15 @@ fn collect_generated_text(value: &Value, output: &mut String) {
             let Some(message) = choice.get(message_key) else {
                 continue;
             };
-            for key in ["reasoning_content", "reasoning", "content"] {
-                if let Some(text) = message.get(key).and_then(Value::as_str) {
-                    output.push_str(text);
-                }
+            if let Some(reasoning) = message
+                .get("reasoning_content")
+                .or_else(|| message.get("reasoning"))
+                .and_then(Value::as_str)
+            {
+                output.push_str(reasoning);
+            }
+            if let Some(content) = message.get("content").and_then(Value::as_str) {
+                output.push_str(content);
             }
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in tool_calls {
@@ -244,5 +246,27 @@ mod tests {
         failed.observe_sse_chunk(b"data: {\"error\":{\"message\":\"boom\"}}\n\n");
         failed.observe_sse_chunk(b"data: [DONE]\n\n");
         assert!(!failed.is_completed());
+
+        let mut partial_batch = OutputObservation::default();
+        partial_batch.observe_json(&serde_json::json!({
+            "choices": [
+                {"finish_reason": "stop"},
+                {"finish_reason": null}
+            ]
+        }));
+        assert!(!partial_batch.is_completed());
+
+        let mut alias = OutputObservation::default();
+        alias.observe_json(&serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "reasoning_content": "same",
+                    "reasoning": "same",
+                    "content": "answer"
+                }
+            }]
+        }));
+        assert_eq!(alias.finish(str::len), "sameanswer".len());
     }
 }

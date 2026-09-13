@@ -106,6 +106,7 @@ struct PDRequestContext<'a> {
     decode_extra_text: Option<String>,
     input_tokens: Option<usize>,
     input_multiplier: usize,
+    output_multiplier: usize,
     max_output_tokens: usize,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
@@ -264,6 +265,22 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        if ctx.router_config.pd_decode_admission_remote
+            && ctx.router_config.pd_decode_admission_token_overhead == 0
+        {
+            return Err(
+                "pd_decode_admission_token_overhead must be greater than zero when remote decode admission is enabled"
+                    .to_string(),
+            );
+        }
+        if ctx.router_config.pd_decode_admission_remote
+            && ctx.router_config.pd_decode_admission_max_tokens == 0
+        {
+            return Err(
+                "pd_decode_admission_max_tokens must be greater than zero when remote decode admission is enabled; it is the fail-closed fallback for endpoint failures and batch requests"
+                    .to_string(),
+            );
+        }
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -328,16 +345,24 @@ impl PDRouter {
         (chars as f64 / chars_per_token).ceil() as usize
     }
 
-    fn record_completed_output(&self, model: &str, body: &[u8]) {
+    fn per_sequence_output_tokens(tokens: usize, output_multiplier: usize) -> usize {
+        let output_multiplier = output_multiplier.max(1);
+        tokens.saturating_add(output_multiplier - 1) / output_multiplier
+    }
+
+    fn record_completed_output(&self, model: &str, body: &[u8], output_multiplier: usize) {
         let Ok(value) = serde_json::from_slice::<Value>(body) else {
             return;
         };
         let mut observation = OutputObservation::default();
         observation.observe_json(&value);
-        if observation.is_failed() {
+        if !observation.is_completed() {
             return;
         }
-        let tokens = observation.finish(|text| self.estimate_token_count(text, Some(model)));
+        let tokens = Self::per_sequence_output_tokens(
+            observation.finish(|text| self.estimate_token_count(text, Some(model))),
+            output_multiplier,
+        );
         self.output_token_stats.record(model, tokens);
     }
 
@@ -397,16 +422,24 @@ impl PDRouter {
         &self,
         rejection: super::decode_admission::Rejection,
     ) -> Response {
-        let mut response = error::create_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "decode_admission_limited",
+        let message = if rejection.max_tokens == 0 {
+            format!(
+                "Decode-issued KV capacity is full (requested_tokens={}, available_tokens={})",
+                rejection.requested_tokens, rejection.available_tokens
+            )
+        } else {
             format!(
                 "Decode KV capacity is full (requested_tokens={}, available_tokens={}, inflight_tokens={}, max_tokens={})",
                 rejection.requested_tokens,
                 rejection.available_tokens,
                 rejection.current_tokens,
                 rejection.max_tokens,
-            ),
+            )
+        };
+        let mut response = error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "decode_admission_limited",
+            message,
         );
         if let Ok(value) =
             HeaderValue::from_str(&self.prefill_admission_retry_after_secs.to_string())
@@ -450,12 +483,12 @@ impl PDRouter {
     }
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
-        if let StringOrArray::Array(arr) = &req.prompt {
-            if !arr.is_empty() {
-                return Some(arr.len());
-            }
-        }
-        None
+        let prompt_count = match &req.prompt {
+            StringOrArray::String(_) => 1,
+            StringOrArray::Array(prompts) => prompts.len().max(1),
+        };
+        let sequence_count = prompt_count.saturating_mul(req.n.unwrap_or(1) as usize);
+        (sequence_count > 1).then_some(sequence_count)
     }
 
     // Static key strings to avoid per-request allocations
@@ -910,6 +943,7 @@ impl PDRouter {
                 decode,
                 decode_admission_guard,
                 None,
+                1,
             )
         } else {
             // Handle non-streaming error response
@@ -996,11 +1030,8 @@ impl PDRouter {
         let PDAdmissionGuards {
             prefill: admission_guard,
             decode: decode_admission_guard,
-            remote_decode: remote_decode_admission_guard,
+            remote_decode: mut remote_decode_admission_guard,
         } = admission_guards;
-        // D consumes this lease atomically when the request enters its queue.
-        // Before that point, every early return drops the guard and releases it.
-        let _remote_decode_admission_guard = remote_decode_admission_guard;
         let SelectedPDPair {
             prefill,
             decode,
@@ -1108,6 +1139,12 @@ impl PDRouter {
         let prefill_url = prefill.url().to_string();
         let prefill_completion_fut =
             self.process_prefill_response(prefill_result, &prefill_url, context.return_logprob);
+        if let Some(guard) = remote_decode_admission_guard.as_mut() {
+            // The reservation ID is now part of the D request. From this point
+            // Decode owns cleanup; if the HTTP request never arrives, its
+            // still-pending lease expires after 30 seconds.
+            guard.handoff_to_decode();
+        }
         let decode_fut = decode_request.send();
         tokio::pin!(prefill_completion_fut);
         tokio::pin!(decode_fut);
@@ -1247,6 +1284,7 @@ impl PDRouter {
                         decode_admission_guard,
                         (self.decode_output_stats_enabled() && context.max_output_tokens > 0)
                             .then_some(context.model_id.unwrap_or(UNKNOWN_MODEL_ID)),
+                        context.output_multiplier,
                     )
                 } else {
                     // Non-streaming response
@@ -1258,6 +1296,7 @@ impl PDRouter {
                             prefill_body,
                             (self.decode_output_stats_enabled() && context.max_output_tokens > 0)
                                 .then_some(context.model_id.unwrap_or(UNKNOWN_MODEL_ID)),
+                            context.output_multiplier,
                         )
                         .await
                     } else {
@@ -1273,6 +1312,7 @@ impl PDRouter {
                                     self.record_completed_output(
                                         context.model_id.unwrap_or(UNKNOWN_MODEL_ID),
                                         &decode_body,
+                                        context.output_multiplier,
                                     );
                                 }
                                 let mut response = Response::new(Body::from(decode_body));
@@ -1323,6 +1363,7 @@ impl PDRouter {
         let decode_policy = self.policy_registry.get_decode_policy();
         self.prefill_admission.enabled()
             || self.decode_admission.enabled()
+            || self.decode_admission_remote
             || prefill_policy.needs_request_text()
             || decode_policy.needs_request_text()
     }
@@ -1410,19 +1451,15 @@ impl PDRouter {
             input_tokens = input_tokens
                 .saturating_add(self.estimate_token_count(extra_text, context.model_id));
         }
-        // Chat `n` is represented by both batch_size and input_multiplier;
-        // use one sequence count rather than accidentally charging n squared.
-        let sequences = context
-            .batch_size
-            .unwrap_or(context.input_multiplier)
-            .max(1);
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let output_tokens = self.output_token_stats.reserve(
-            model,
-            self.decode_admission_token_overhead
-                .saturating_mul(sequences),
-            context.max_output_tokens.saturating_mul(sequences),
-        );
+        let output_tokens = self
+            .output_token_stats
+            .reserve(
+                model,
+                self.decode_admission_token_overhead,
+                context.max_output_tokens,
+            )
+            .saturating_mul(context.output_multiplier.max(1));
         input_tokens
             .saturating_mul(context.input_multiplier.max(1))
             .saturating_add(output_tokens)
@@ -1465,7 +1502,13 @@ impl PDRouter {
         }
 
         let requested_tokens = self.estimate_decode_reservation(context);
-        if self.decode_admission_remote {
+        // SGLang expands batch requests into multiple scheduler requests, but
+        // the first version of the D reservation protocol carries one scalar
+        // lease ID. Until the wire protocol supports per-child IDs, use the
+        // legacy response-lifetime guard for batches instead of sending one ID
+        // that multiple D requests would race to commit.
+        let remote_supported = context.batch_size.unwrap_or(1) == 1;
+        if self.decode_admission_remote && remote_supported {
             let primary_rejection = match RemoteController::try_acquire(
                 &self.client,
                 selected.decode.as_ref(),
@@ -1807,6 +1850,7 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         decode_admission_guard: Option<DecodeAdmissionGuard>,
         output_model: Option<&str>,
+        output_multiplier: usize,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1883,7 +1927,11 @@ impl PDRouter {
                                 }
 
                                 if is_done {
-                                    if let Some(model) = output_model.as_deref() {
+                                    if let Some(model) = output_model.as_deref().filter(|_| {
+                                        output_observation
+                                            .as_ref()
+                                            .is_some_and(OutputObservation::is_completed)
+                                    }) {
                                         let tokens = output_observation.take().unwrap().finish(|text| {
                                             Self::estimate_token_count_with_registry(
                                                 &tokenizer_registry,
@@ -1892,7 +1940,13 @@ impl PDRouter {
                                                 Some(model),
                                             )
                                         });
-                                        output_token_stats.record(model, tokens);
+                                        output_token_stats.record(
+                                            model,
+                                            Self::per_sequence_output_tokens(
+                                                tokens,
+                                                output_multiplier,
+                                            ),
+                                        );
                                     }
                                     break;
                                 }
@@ -1918,7 +1972,13 @@ impl PDRouter {
                                             Some(model),
                                         )
                                     });
-                                    output_token_stats.record(model, tokens);
+                                    output_token_stats.record(
+                                        model,
+                                        Self::per_sequence_output_tokens(
+                                            tokens,
+                                            output_multiplier,
+                                        ),
+                                    );
                                 }
                                 break;
                             },
@@ -1961,6 +2021,7 @@ impl PDRouter {
         return_logprob: bool,
         prefill_body: Option<bytes::Bytes>,
         output_model: Option<&str>,
+        output_multiplier: usize,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -1972,7 +2033,7 @@ impl PDRouter {
         };
 
         if let Some(output_model) = output_model {
-            self.record_completed_output(output_model, &decode_body);
+            self.record_completed_output(output_model, &decode_body, output_multiplier);
         }
 
         if !return_logprob {
@@ -2465,6 +2526,7 @@ impl RouterTrait for PDRouter {
             decode_extra_text: None,
             input_tokens,
             input_multiplier: 1,
+            output_multiplier: batch_size.unwrap_or(1),
             max_output_tokens: body
                 .sampling_params
                 .as_ref()
@@ -2505,6 +2567,7 @@ impl RouterTrait for PDRouter {
             decode_extra_text: Self::build_chat_decode_extra_text(body),
             input_tokens: None,
             input_multiplier: body.n.unwrap_or(1) as usize,
+            output_multiplier: body.n.unwrap_or(1) as usize,
             max_output_tokens: body
                 .max_completion_tokens
                 .or(body.max_tokens)
@@ -2538,6 +2601,11 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_completion_batch_size(body);
+        let completion_count = body.n.unwrap_or(1) as usize;
+        let prompt_count = match &body.prompt {
+            StringOrArray::String(_) => 1,
+            StringOrArray::Array(prompts) => prompts.len().max(1),
+        };
 
         let context = PDRequestContext {
             route: "/v1/completions",
@@ -2547,7 +2615,8 @@ impl RouterTrait for PDRouter {
             request_text,
             decode_extra_text: None,
             input_tokens: None,
-            input_multiplier: 1,
+            input_multiplier: completion_count,
+            output_multiplier: prompt_count.saturating_mul(completion_count),
             max_output_tokens: body.max_tokens.unwrap_or(16) as usize,
             model_id,
             headers: headers.cloned(),
@@ -2578,6 +2647,7 @@ impl RouterTrait for PDRouter {
             decode_extra_text: None,
             input_tokens: None,
             input_multiplier: 1,
+            output_multiplier: 1,
             max_output_tokens: 0,
             model_id,
             headers: headers.cloned(),
@@ -3059,6 +3129,7 @@ mod tests {
             decode_extra_text: None,
             input_tokens: Some(50),
             input_multiplier: 1,
+            output_multiplier: 1,
             max_output_tokens: 50,
             model_id: None,
             headers: None,
@@ -3118,6 +3189,7 @@ mod tests {
             decode_extra_text: None,
             input_tokens: Some(50),
             input_multiplier: 1,
+            output_multiplier: 1,
             max_output_tokens: 50,
             model_id: None,
             headers: None,
@@ -3131,6 +3203,78 @@ mod tests {
             .expect("decode admission is enabled");
         assert_eq!(selected.decode.url(), decode1.url());
         drop(guard);
+    }
+
+    #[test]
+    fn test_remote_decode_admission_requires_request_text() {
+        let mut router = create_test_pd_router();
+        router.decode_admission_remote = true;
+        assert!(router.policies_need_request_text());
+    }
+
+    #[test]
+    fn test_completion_batch_size_includes_prompt_count_and_n() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "model",
+            "prompt": ["a", "b"],
+            "n": 2
+        }))
+        .unwrap();
+        assert_eq!(PDRouter::get_completion_batch_size(&request), Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_remote_decode_admission_uses_local_guard_for_batch() {
+        let mut router = create_test_pd_router();
+        router.decode_admission_remote = true;
+        router.decode_admission = DecodeAdmissionController::new(100);
+        router.decode_admission_token_overhead = 10;
+
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            "http://decode:30000".to_string(),
+            WorkerType::Decode,
+            true,
+        ));
+        let mut selected = SelectedPDPair {
+            prefill,
+            decode,
+            matched_chars: 0,
+            publish_prefill_affinity_on_success: false,
+        };
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: Some(2),
+            is_stream: true,
+            return_logprob: false,
+            request_text: None,
+            decode_extra_text: None,
+            input_tokens: Some(20),
+            input_multiplier: 2,
+            output_multiplier: 2,
+            max_output_tokens: 10,
+            model_id: Some("model"),
+            headers: None,
+        };
+
+        let (local, remote) = router
+            .acquire_decode_admission(&mut selected, &context)
+            .await
+            .expect("batch should use the configured local safety fallback");
+        assert!(local.is_some());
+        assert!(remote.is_none());
+    }
+
+    #[test]
+    fn test_output_observation_is_normalized_per_sequence() {
+        assert_eq!(PDRouter::per_sequence_output_tokens(2001, 2), 1001);
+        assert_eq!(PDRouter::per_sequence_output_tokens(2001, 0), 2001);
     }
 
     #[test]
@@ -3149,14 +3293,15 @@ mod tests {
             decode_extra_text: None,
             input_tokens: Some(50),
             input_multiplier: 2,
+            output_multiplier: 2,
             max_output_tokens: 800,
             model_id: Some("model"),
             headers: None,
         };
 
-        // Input is duplicated for n=2 (100). The legacy 640-per-sequence floor
-        // produces 1280 output tokens, not the erroneous n-squared 2560.
-        assert_eq!(router.estimate_decode_reservation(&context), 1380);
+        // Input is duplicated for n=2 (100). P90 is capped by each sequence's
+        // max_output_tokens and then charged twice: 100 + 2 * 800 = 1700.
+        assert_eq!(router.estimate_decode_reservation(&context), 1700);
     }
 
     #[test]
@@ -3340,6 +3485,7 @@ mod tests {
                 decode_ref.clone(),
                 None,
                 None,
+                1,
             );
 
             // Guards are now attached to response body, so load should be 1

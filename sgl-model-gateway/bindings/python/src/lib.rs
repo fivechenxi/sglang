@@ -620,8 +620,8 @@ impl Router {
             .pd_decode_admission(
                 self.pd_decode_admission_max_tokens,
                 self.pd_decode_admission_token_overhead,
-                self.pd_decode_admission_remote,
             )
+            .pd_decode_admission_remote(self.pd_decode_admission_remote)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,

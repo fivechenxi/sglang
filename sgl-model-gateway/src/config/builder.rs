@@ -248,14 +248,13 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn pd_decode_admission(
-        mut self,
-        max_tokens: usize,
-        token_overhead: usize,
-        remote: bool,
-    ) -> Self {
+    pub fn pd_decode_admission(mut self, max_tokens: usize, token_overhead: usize) -> Self {
         self.config.pd_decode_admission_max_tokens = max_tokens;
         self.config.pd_decode_admission_token_overhead = token_overhead;
+        self
+    }
+
+    pub fn pd_decode_admission_remote(mut self, remote: bool) -> Self {
         self.config.pd_decode_admission_remote = remote;
         self
     }

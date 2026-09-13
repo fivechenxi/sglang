@@ -5,7 +5,7 @@ description: "由 Decode 提供实时可准入 token，修正 Router 静态总�
 
 ## 状态
 
-本文同时记录设计与实现状态。Router 侧 100 样本输出 P90、D 侧标量容量及幂等预留端点均已实现；新路径由开关控制，默认关闭。
+本文同时记录设计与实现状态。Router 侧 100 样本输出 P90、D 侧标量容量及幂等预留端点均已实现并通过 CPU 单元测试；新路径由开关控制、默认关闭，启用前仍需在目标 NPU 拓扑完成 Shadow 和压力验证。
 
 当前 Router 用“输入 token + 固定 640 输出 token”估算每个 Decode DP 的占用，并在 Router 进程内维护容量账本。现场已经出现 Router 判断仍有余量，但 Decode KV Pool 实际达到 97.5%–100%，请求随后长时间等待预分配的情况。
 
@@ -18,14 +18,14 @@ description: "由 Decode 提供实时可准入 token，修正 Router 静态总�
 
 ## Decode 提供实时 token 容量
 
-Decode 内部已经掌握各 KV allocator 的真实可用页数、待预分配请求、传输中请求、cache 可淘汰量和请求槽。它在内部把这些约束折算为一个标量：
+Decode 内部已经掌握 KV allocator 的真实可用页数、待预分配请求、传输中请求和 cache 可淘汰量。它在内部把现有 allocator-derived token budget 折算为一个标量：
 
 ```text
 admittable_tokens = allocator_derived_budget
                   - outstanding_reservations
 ```
 
-`effective_free_tokens` 的具体计算仍是 Decode 内部实现。例如存在多个缓存池时，Decode 取各池按实际消耗比例折算后的最小值；Router 不接收也不存储这些明细。
+`allocator_derived_budget` 的具体计算仍是 Decode 内部实现；Router 不接收也不存储物理缓存明细。当前 GLM/SFA 路径沿用已有逻辑，以 logical full-attention allocator 作为 token 约束，SWA 等其他池仍保留物理预分配的最终保护。启用远端拦截前必须用 Shadow 数据确认该 allocator 确实是目标拓扑的容量约束；如果其他池可能先耗尽，应先在 D 内部把它按实际消耗比例折算进标量，不能让 Router 推测物理布局。
 
 Decode 对外只提供：
 
@@ -43,13 +43,14 @@ request_cost = input_tokens
              + min(request.max_output_tokens, router_recent_output_p90)
 ```
 
-Decode 在调度线程内串行处理 `reservation_id`，同 ID 同成本的重试幂等；预留只覆盖 Router 选路到 D 请求入队的短窗口，30 秒未提交自动过期。D 请求入队时把预留原子转换为真实队列占用。Router 崩溃不会永久泄漏容量，多 Router 同时请求也不会基于旧快照超发。
+Decode 在调度线程内串行处理 `reservation_id`，同 ID 同成本的重试幂等；30 秒内未进入 D 队列的预留自动过期。D 请求入队时把预留标为已提交；物理 KV 预分配成功后，输入部分由 allocator 反映，超出 D 常规每请求 reserve 的动态输出余量转入该请求的调度状态，并随实际输出增长递减。排队期间整笔预留仍计入可准入容量，避免“已入队但尚未分配”的突发超发窗口。请求取消会由 D 的队列清理路径释放已提交预留。多 Router 同时请求不会基于旧快照超发。
 
 ## Router 动态估计输出
 
 输出无法在请求开始时精确知道。固定 640 容易低估，而按完整 `max_tokens` 预留通常过度保守。首版使用近期实际输出的滚动分位数，不引入逐请求续租协议。
 
-Router 按模型维护最近 100 个正常完成请求的输出长度窗口：
+Router 按模型维护最近 100 个正常完成序列的等效输出长度窗口；批量响应的总
+`completion_tokens` 先按序列数归一化，避免历史批量请求在下一次准入时被重复放大：
 
 ```text
 output_reserve = clamp(
@@ -61,7 +62,7 @@ output_reserve = clamp(
 
 首版不按租户、prompt 类型、流式类型或缓存层继续拆分。少于 20 个有效样本时使用现有输出预算配置；达到 20 个后启用动态 P90，但不低于该安全下限，上限为 4096，并受单请求 `max_output_tokens` 约束。流式响应优先使用最终 usage，缺失 usage 时 Router 汇总有效 delta 并用 tokenizer 计数；非流式响应从最终响应统计。失败和客户端中止不写入正常完成窗口。
 
-请求生成的真实 KV 会持续降低 Decode 下一次计算的 `admittable_tokens`，因此不需要 Router 按输出 token 逐段续租。P90 只是准入时的保守预测，不参与 D 侧物理布局或运行时生成路径。
+请求生成的真实 KV 会持续降低 Decode 下一次计算的 `admittable_tokens`；D 侧只保留尚未由物理 KV 和常规 reserve 覆盖的动态余量，因此不需要 Router 按输出 token 逐段续租。P90 只形成标量余量，不参与 D 侧物理布局。
 
 需要分别观测正常完成和客户端中止的输出长度。中止样本只能作为“至少已经生成这么多”的删失样本，不能直接当作正常最终长度拉低分位数。
 
@@ -70,13 +71,20 @@ output_reserve = clamp(
 1. Router 选择 Decode 候选，并用输入 token、请求上限和本模型输出 P90 算出最终标量成本。
 2. Router 在发送 P 前向目标 D 提交一次 `reservation_id + token_count`。
 3. D 只用 allocator 实时容量原子接受或拒绝；拒绝后 Router 尝试其他 D。
-4. 接受后 Router 把同一个 `reservation_id` 放入 D 请求，再启动 P；P 失败或 Router 中止时释放预留。
-5. D 请求入队时消费预留，后续占用由真实 allocator 和队列反映；生成过程不逐 token 交互。
+4. 接受后 Router 把同一个 `reservation_id` 放入 D 请求，再启动 P。P 的 admission ACK 之前失败或 Router 中止时由 Router 释放；ACK 后把清理责任移交给 D，尚未抵达 D 的 lease 由 30 秒 TTL 回收。
+5. D 请求入队时提交预留；D 的其他物理分配路径也必须扣除全部尚未物化的 lease，不能占用已经签发给在途请求的容量。物理 KV 预分配成功后消费输入部分，剩余动态输出余量进入请求调度状态，并按 `kv_committed_len` 的真实增长递减；生成过程不与 Router 逐 token 交互。
 6. 所有 Decode 均无容量时，快速返回明确的 429。远端控制端点不可用时，仅在旧本地 token admission 已配置时回退；否则安全拒绝，不能无预留放行。
 
 分阶段启用时设置 `--pd-decode-admission-remote`，并保留
 `--pd-decode-admission-max-tokens` 作为控制端点故障时的本地安全回退；
 `--pd-decode-admission-token-overhead` 同时是动态窗口样本不足时的输出预算下限。
+远端预留必须选择带明确 `dp_rank` 的 DP-aware Decode worker；聚合 worker 无法保证
+预留和实际请求落到同一个 D-DP，只能走本地安全回退。
+
+首版远端协议只携带一个预留 ID，而 SGLang 会把批量请求展开为多个调度请求，
+因此批量请求暂时使用旧的 Router 本地响应生命周期账本，避免多个子请求重复提交
+同一远端预留。启用远端路径时，本地 token 上限必须同时配置；后续若需要在多
+Router 下严格支持批量请求，应扩展为每个子请求一个 D 侧预留 ID。
 
 ## 可观测性
 
