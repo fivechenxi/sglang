@@ -810,7 +810,8 @@ async def decode_token_reservation(
     obj: Annotated[DecodeTokenReservationReqInput, Body()], request: Request
 ):
     """Atomically reserve or release opaque token capacity on one Decode DP."""
-    return await _global_state.tokenizer_manager.decode_token_reservation(obj)
+    result = await _global_state.tokenizer_manager.decode_token_reservation(obj)
+    return msgspec_to_builtins(result)
 
 
 # Do not import `dumper.py` to avoid dependency
