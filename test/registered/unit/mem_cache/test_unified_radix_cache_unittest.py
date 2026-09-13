@@ -476,6 +476,33 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             canonical_hashes.append(running_hash)
         self.assertNotEqual(canonical_hashes, leaf.hash_value)
 
+    def test_l3_hit_query_uses_bigram_key_for_prefill_admission(self):
+        cache, _, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        cache.prefetch_threshold = 1
+        tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
+        class FakeCacheController:
+            def __init__(self):
+                self.operation = None
+
+            def prefetch_rate_limited(self):
+                return False
+
+            def _storage_hit_query(self, operation):
+                self.operation = operation
+                return ["page-0", "page-1"], 8
+
+        controller = FakeCacheController()
+        cache.cache_controller = controller
+        hit = cache.query_storage_hit_length(cache.root_node, tokens)
+
+        self.assertEqual(hit, 8)
+        self.assertIsNotNone(controller.operation)
+        self.assertTrue(controller.operation.token_ids.is_bigram)
+        self.assertEqual(len(controller.operation.token_ids), len(tokens) - 1)
+        self.assertEqual(list(controller.operation.token_ids.token_ids), list(tokens))
+
 
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -507,7 +534,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertIsNot(leaf, cache.root_node)
         return leaf
 
-    def _init_hicache(self, cache, *, write_policy: str = "write_through"):
+    def _init_hicache(
+        self,
+        cache,
+        *,
+        write_policy: str = "write_through",
+        load_back_threshold: int = 0,
+    ):
         import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
 
         # Wrap the host-pool factory (not MHATokenToKVPoolHost directly)
@@ -537,11 +570,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
+            hicache_load_back_threshold=load_back_threshold,
         )
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
 
     def _backup_node(self, cache, node):
         backed_up = _write_backup(cache, node, write_back=True)
@@ -686,6 +719,21 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         restored_gpu = self._stored_events(cache, StorageMedium.GPU)
         self.assertFalse(node.evicted)
         self.assertCountEqual([e.block_hashes[0] for e in restored_gpu], stored_hashes)
+
+    def test_hicache_load_back_threshold_skips_small_host_hit(self):
+        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
+        self._init_hicache(cache, load_back_threshold=5)
+
+        seq = [1, 2, 3, 4]
+        self._insert(cache, allocator, seq)
+        node = self._leaf_for(cache, seq)
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(seq)))
+
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertIsNone(cache.load_back(node))
+        self.assertTrue(node.evicted)
 
 
 class UnifiedRadixCacheSuite:
@@ -2808,6 +2856,7 @@ class UnifiedRadixCacheSuite:
         cache,
         *,
         write_policy: str = "write_through",
+        load_back_threshold: int = 0,
         storage_backend: Optional[str] = None,
         storage_dir: Optional[str] = None,
         prefetch_threshold: Optional[int] = None,
@@ -2878,6 +2927,7 @@ class UnifiedRadixCacheSuite:
             page_size=self.cfg.page_size,
             hicache_io_backend="direct",
             hicache_write_policy=write_policy,
+            hicache_load_back_threshold=load_back_threshold,
             hicache_storage_backend=storage_backend,
             hicache_storage_backend_extra_config=storage_extra_config,
             hicache_storage_prefetch_policy=prefetch_policy,
@@ -2887,7 +2937,6 @@ class UnifiedRadixCacheSuite:
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
         cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
         if storage_backend is not None:
             # Unit fixtures size host/device pools equally, which makes the
             # production prefetch capacity limit (host - device) zero.  Keep the
@@ -3231,6 +3280,25 @@ class UnifiedRadixCacheSuite:
             for actual_conv, expected_conv_buf in zip(loaded_conv, expected_conv):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
+
+    def test_hicache_load_back_threshold_skips_hybrid_host_hit(self):
+        """The threshold skips the whole host path, including auxiliary state."""
+        if self._skip_unsupported_hicache_test():
+            return
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        base = self._make_seq(1, 2)
+        self._init_hicache(cache, load_back_threshold=len(base) + 1)
+        self._insert(cache, allocator, req_to_token_pool, base)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", base))))
+        node = match.last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(base)))
+
+        self.assertTrue(node.evicted)
+        self.assertTrue(node.backuped)
+        self.assertFalse(cache.load_back(node))
+        self.assertTrue(node.evicted)
 
     def test_hicache_backup_continuity(self):
         """Backed-up nodes form a continuous prefix from the root."""

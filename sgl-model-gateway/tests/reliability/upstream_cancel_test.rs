@@ -13,7 +13,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::json;
-use smg::config::RouterConfig;
+use smg::config::{RetryConfig, RouterConfig};
 use tower::ServiceExt;
 
 use crate::common::{
@@ -2518,6 +2518,210 @@ mod upstream_cancel_tests {
             f_post_d
         );
 
+        ctx.shutdown().await;
+    }
+
+    /// Regression for the two-stage P admission handshake: response headers
+    /// acknowledge admission, while a later bootstrap/transfer failure appears
+    /// in the P response body. Router must observe that terminal failure and
+    /// cancel D instead of waiting for D's disaggregation timeout.
+    #[tokio::test]
+    async fn test_pd_prefill_post_ack_stream_failure_cancels_decode_fast() {
+        let prefill_port = 20322;
+        let decode_port = 20323;
+
+        set_slow_stream_chunks(prefill_port, 16);
+        set_stream_error_after_chunks(prefill_port, 1);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4322)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .retry_config(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(prefill_port),
+                // Hold D response headers long enough that the test detects the
+                // old behaviour of waiting only for D.
+                TestWorkerConfig {
+                    response_delay_ms: 5_000,
+                    ..TestWorkerConfig::decode(decode_port)
+                },
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill_url = format!("http://127.0.0.1:{}", prefill_port);
+        let decode_url = format!("http://127.0.0.1:{}", decode_port);
+        let prefill = pin_worker(&ctx, &prefill_url);
+        let decode = pin_worker(&ctx, &decode_url);
+        let (s_pre_p, f_pre_p) = breaker_counts(&prefill);
+        let (s_pre_d, f_pre_d) = breaker_counts(&decode);
+
+        let payload = json!({ "text": "x", "stream": true });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(2), app.oneshot(req))
+            .await
+            .expect("P terminal failure must beat D's delayed response")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let (s_post_p, f_post_p) = breaker_counts(&prefill);
+        let (s_post_d, f_post_d) = breaker_counts(&decode);
+        assert_eq!(s_post_p - s_pre_p, 0);
+        assert_eq!(f_post_p - f_pre_p, 1);
+        assert_eq!(
+            (s_post_d - s_pre_d, f_post_d - f_pre_d),
+            (0, 0),
+            "D cancelled because of P failure must not be blamed"
+        );
+
+        clear_stream_error_after_chunks(prefill_port);
+        clear_slow_stream_chunks(prefill_port);
+        ctx.shutdown().await;
+    }
+
+    /// A P-side cache-tier admission rejection is an overload response, not an
+    /// internal Router error. Preserve 429 so the MaaS gateway can retry a
+    /// different backend, and prove D was never dispatched or allocated.
+    #[tokio::test]
+    async fn test_pd_prefill_429_is_forwarded_before_decode_dispatch() {
+        let prefill_port = 20320;
+        let decode_port = 20321;
+        set_fail_status_code(prefill_port, 429);
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 16);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4320)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.fail_rate = 1.0;
+                    p
+                },
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"text":"x","stream":true}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("x-smg-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("prefill_tier_admission_limited")
+        );
+        assert!(resp.headers().contains_key("retry-after"));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            get_stream_tracking_state(decode_port).is_none(),
+            "P admission 429 must not dispatch a request to D"
+        );
+
+        clear_fail_status_code(prefill_port);
+        clear_slow_stream_chunks(decode_port);
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_decode_dispatch_waits_for_prefill_admission_ack() {
+        let prefill_port = 20322;
+        let decode_port = 20323;
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 4);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{prefill_port}"), None)],
+                vec![format!("http://127.0.0.1:{decode_port}")],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4321)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut p = TestWorkerConfig::prefill(prefill_port);
+                    p.response_delay_ms = 400;
+                    p
+                },
+                TestWorkerConfig::decode(decode_port),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"text":"x","stream":true}"#))
+            .unwrap();
+        let response_task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            get_stream_tracking_state(decode_port).is_none(),
+            "D must remain untouched while P admission ACK is pending"
+        );
+
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(get_stream_tracking_state(decode_port).is_some());
+        let _ = response.into_body().collect().await;
+
+        clear_slow_stream_chunks(decode_port);
         ctx.shutdown().await;
     }
 

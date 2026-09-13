@@ -263,6 +263,8 @@ class EagerRunner(BaseRunner):
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         if forward_batch.needs_forward_metadata_init():
+            # Split/packed KV pools need not expose a conventional K/V pair.
+            # Only query that shape when DCP will actually consume it.
             if model_runner.dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):

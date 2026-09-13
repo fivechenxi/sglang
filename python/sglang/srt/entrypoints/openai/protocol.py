@@ -370,6 +370,8 @@ class CompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    # Internal PD Router handshake; see ChatCompletionRequest counterpart.
+    pd_prefill_admission_ack: bool = False
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -833,6 +835,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    # Internal PD Router handshake. P emits a response only after its actual
+    # cache-tier admission succeeds, allowing Router to defer D allocation.
+    pd_prefill_admission_ack: bool = False
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None

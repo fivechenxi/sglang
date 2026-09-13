@@ -396,6 +396,8 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    # Emit request-correlated P/D bootstrap and ZMQ connection diagnostics.
+    SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE = EnvBool(False)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
@@ -508,6 +510,10 @@ class Envs:
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(False)
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
+    # Ascend MemFabric has no side-effect-free session probe. After this
+    # cooldown, allow one real KV transfer to test and recover a failed session.
+    # Set to 0 to keep failed sessions permanently blacklisted.
+    SGLANG_ASCEND_FAILED_SESSION_RETRY_INTERVAL_S = EnvFloat(30.0)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -607,6 +613,14 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Experimental GLM/DSA packed C8 KV cache for Quant Sparse Flash Attention.
+    # SFA and LightningIndexer use different physical layouts and must remain
+    # independently selectable throughout rollout and rollback.
+    SGLANG_NPU_ENABLE_SFA_C8 = EnvBool(False)
+    # Reserved for the phase-2 LightningIndexer C8 implementation. Defining a
+    # separate switch now prevents the SFA packed layout from becoming an
+    # implicit model-wide "C8" mode.
+    SGLANG_NPU_ENABLE_LI_C8 = EnvBool(False)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2

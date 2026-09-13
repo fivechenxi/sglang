@@ -165,8 +165,17 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
+                indexer_layer_num = getattr(
+                    self.device_pool, "indexer_layer_num", self.layer_num
+                )
                 self.index_k_buffer = alloc_func(
-                    (*base_dims, self.device_pool.index_head_dim),
+                    (
+                        self.page_num,
+                        indexer_layer_num,
+                        self.page_size,
+                        1,
+                        self.device_pool.index_head_dim,
+                    ),
                     dtype=self.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,

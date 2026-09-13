@@ -768,6 +768,11 @@ class ServerArgs:
         "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
         NS("schedule"),
     ] = None
+    prefill_decode_interval: A[
+        int,
+        "The number of decode rounds to run after a prefill batch before scheduling the next prefill. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+        NS("schedule"),
+    ] = 0
     enable_dynamic_chunking: A[
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
@@ -1017,10 +1022,42 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+        NS("parallel"),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks, at which point routing "
+        "skips it to keep load balanced. Must be >= 1.0.",
+        NS("parallel"),
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+        NS("parallel"),
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+        NS("parallel"),
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
@@ -2567,6 +2604,11 @@ class ServerArgs:
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         NS("memory"),
     ] = 0
+    hicache_load_back_threshold: A[
+        int,
+        "Minimum number of host KV cache tokens required before loading them back to the device.",
+        NS("memory"),
+    ] = 10
     hicache_write_policy: A[
         str,
         Arg(
@@ -2975,6 +3017,21 @@ class ServerArgs:
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
         NS("disagg"),
     ] = 512
+    disaggregation_prefill_max_cold_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight tokens that require model prefill compute. Zero disables this tier limit.",
+        NS("disagg"),
+    ] = 0
+    disaggregation_prefill_max_load_back_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight L2 host-to-device load-back tokens. Zero disables this tier limit.",
+        NS("disagg"),
+    ] = 0
+    disaggregation_prefill_max_storage_tokens: A[
+        int,
+        "Per-P-DP limit for in-flight L3 storage fetch tokens. Zero disables this tier limit.",
+        NS("disagg"),
+    ] = 0
     disaggregation_decode_extra_slots: A[
         Optional[int],
         "Number of extra decode req_to_token slots pre-allocated for in-transfer requests (PD mode). If unset, defaults to 0 (or 2x the per-worker running batch for small batches).",
@@ -3406,6 +3463,8 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._validate_prefill_decode_interval()
+
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3813,6 +3872,15 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+        if (
+            self.load_balance_method == "prefix_affinity"
+            and self.prefix_affinity_max_load_skew < 1.0
+        ):
+            raise ValueError(
+                "--prefix-affinity-max-load-skew must be >= 1.0, got "
+                f"{self.prefix_affinity_max_load_skew}"
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -7731,6 +7799,10 @@ class ServerArgs:
                 f"(got {self.asr_max_concurrent_sessions})."
             )
 
+    def _validate_prefill_decode_interval(self):
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative.")
+
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -8227,10 +8299,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-            resolved_view,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 
         return attention_backends_of(resolved_view(self))
 

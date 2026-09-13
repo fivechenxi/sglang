@@ -1,0 +1,162 @@
+name: Build GLM-5.2 910B W4A8C8 image
+
+on:
+  push:
+    branches:
+      - agent/glm52-w4a8c8-plan
+    paths:
+      - ".github/workflows/build-glm52-910b-w4a8c8.yml"
+      - "docker/glm52-910b-w4a8c8.Dockerfile"
+      - "python/**"
+      - "scripts/ascend/**"
+  workflow_dispatch:
+    inputs:
+      build_client:
+        description: "Build the ARM64 GLM-5.2 client image"
+        required: false
+        type: boolean
+        default: false
+      build_router:
+        description: "Build the ARM64 PD Router image"
+        required: false
+        type: boolean
+        default: false
+      build_mooncake_master:
+        description: "Build the ARM64 Mooncake master image"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: glm52-910b-w4a8c8-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-mooncake-master-arm64:
+    if: github.event_name == 'push' || inputs.build_mooncake_master
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_BOOTSTRAP_TOKEN }}
+
+      - name: Build and push CPU-only Mooncake master
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/mooncake-master-arm64.Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ghcr.io/${{ github.repository_owner }}/mooncake-master:0.3.13.post1-npu-arm64-${{ github.sha }}
+
+  build-arm64:
+    if: github.event_name == 'push' || inputs.build_client
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_BOOTSTRAP_TOKEN }}
+
+      - name: Compute immutable image tag
+        id: image
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sglang:glm52-910b-w4a8c8-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push W4A8C8 candidate
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          file: docker/glm52-910b-w4a8c8.Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.image.outputs.tag }}
+          build-args: |
+            SGLANG_REPOSITORY=https://github.com/${{ github.repository }}.git
+            SGLANG_COMMIT=${{ github.sha }}
+            BUILD_WORKFLOW_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Publish build summary
+        shell: bash
+        run: |
+          {
+            echo "### GLM-5.2 910B W4A8C8 image"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Image: \`${{ steps.image.outputs.tag }}\`"
+            echo "- Base digest: \`sha256:1e3fa2b90bd184dbf2e73cdef1fc5453d5edc5849aadbbde126f93d06082e43e\`"
+            echo "- W4 fixes: upstream #31707 and #32113"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-router-arm64:
+    if: github.event_name == 'push' || inputs.build_router
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_BOOTSTRAP_TOKEN }}
+
+      - name: Compute immutable image tag
+        id: image
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::12}"
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/sgl-model-gateway:glm52-pd-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Router
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/gateway.Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.image.outputs.tag }}
+
+      - name: Publish build summary
+        shell: bash
+        run: |
+          {
+            echo "### GLM-5.2 PD Router image"
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Image: \`${{ steps.image.outputs.tag }}\`"
+            echo "- Platform: \`linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
