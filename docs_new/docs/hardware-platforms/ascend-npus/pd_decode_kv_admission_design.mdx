@@ -1,0 +1,118 @@
+---
+title: "PD Decode KV 容量准入设计"
+description: "由 Decode 提供实时可准入 token，修正 Router 静态总容量及固定输出估算与实际 KV 使用不一致的问题。"
+---
+
+## 状态
+
+本文是设计评审稿，不包含实现。
+
+当前 Router 用“输入 token + 固定 640 输出 token”估算每个 Decode DP 的占用，并在 Router 进程内维护容量账本。现场已经出现 Router 判断仍有余量，但 Decode KV Pool 实际达到 97.5%–100%，请求随后长时间等待预分配的情况。
+
+## 设计原则
+
+- Router 只理解 token 容量，不感知 SFA、indexer、draft pool 或物理页布局。
+- Decode 负责把内部资源约束折算成一个实时、可准入的 token 容量。
+- 当前单 Router 部署先使用 Decode 实时容量和 Router 本地 pending 做准入；只有扩展到多 Router 时才增加 Decode 侧标量原子预占。
+- 输出长度使用运行数据动态估计，不再写死为 640，也不直接按完整 `max_tokens` 预留。
+
+## Decode 提供实时 token 容量
+
+Decode 内部已经掌握各 KV allocator 的真实可用页数、待预分配请求、传输中请求、cache 可淘汰量和请求槽。它在内部把这些约束折算为一个标量：
+
+```text
+admittable_tokens = effective_free_tokens
+                  - outstanding_reservations
+                  - active_output_headroom
+                  - safety_margin
+```
+
+`effective_free_tokens` 的具体计算仍是 Decode 内部实现。例如存在多个缓存池时，Decode 取各池按实际消耗比例折算后的最小值；Router 不接收也不存储这些明细。
+
+Decode 对外只需提供：
+
+- 当前可准入 token；
+- 当前活跃请求数或剩余请求槽；
+- 数据时间戳和实例 epoch；
+- 是否健康。
+
+这些信息可以合并进现有 `/v1/loads`，用于 Router 排序和观测。
+
+## 第一阶段：实时容量加本地 pending
+
+Router 每次选路时读取 Decode 的 `admittable_tokens`，并扣除已经发往该 Decode、但尚未反映到下一次 Decode 指标中的 `local_pending_tokens`：
+
+```text
+router_available = decode_admittable_tokens - local_pending_tokens
+request_cost     = input_tokens + min(max_tokens, recent_output_p90)
+```
+
+请求被 Decode 指标确认接收，或请求结束、取消和失败后，Router 清理对应 pending。Decode 上报值始终是容量事实源，Router 本地只弥补状态采样和传输之间的短暂延迟，不再维护固定的 DP 总容量。
+
+这一阶段不增加新的资源协议，改动集中在 Decode load 指标和 Router 现有 admission 逻辑，适用于当前单个活动 Router 的部署。
+
+### 多 Router 时的最小扩展
+
+多个 Router 同时读取同一个容量快照仍可能超发。需要多 Router 高可用时，再给 Decode 增加只接受 `request_id` 和 `token_count` 的原子 `try_reserve`。Decode 返回 accepted/rejected、剩余 token 和 epoch 即可；接口仍是标量，Router 不接触内部缓存池。
+
+## 动态估计输出
+
+输出无法在请求开始时精确知道。固定 640 容易低估，而按完整 `max_tokens` 预留通常过度保守。首版使用近期实际输出的滚动分位数，不引入逐请求续租协议。
+
+Router 维护该模型最近 100 个正常完成请求的输出长度窗口：
+
+```text
+output_reserve = clamp(
+    recent_output_p90,
+    minimum_budget,
+    maximum_budget
+)
+```
+
+首版只按模型维护一组统计，不按租户、prompt 类型、流式类型或缓存层继续拆分。少于 20 个有效样本时使用可配置的保守默认值，达到 20 个后启用动态 P90。
+
+请求生成的真实 KV 会持续降低 Decode 下一次上报的 `admittable_tokens`，因此不需要 Router 按输出 token 逐段续租。Decode 在该值中扣除一块安全水位，用来覆盖指标刷新延迟以及少量超过 P90 的长尾；水位被消耗后，只停止接收新请求，不打断已运行请求。
+
+需要分别观测正常完成和客户端中止的输出长度。中止样本只能作为“至少已经生成这么多”的删失样本，不能直接当作正常最终长度拉低分位数。
+
+## 请求流程
+
+1. Router 从 `/v1/loads` 读取各 Decode 的实时 `admittable_tokens`，选择候选实例。
+2. Router 扣除该实例尚未被指标覆盖的 local pending，再判断“输入 + 动态输出预留”能否放入。
+3. 容量足够时增加 local pending 并把请求送入 Prefill；不足时尝试其他 Decode。
+4. Decode 接收、请求结束、取消或失败时，Router 对账并清理 pending。
+5. Decode 的下一次实时容量覆盖真实输出增长，Router 不逐 token 更新账本。
+6. 所有 Decode 均无容量时，快速返回明确的 429。
+
+## 可观测性
+
+首版只需要围绕标量容量增加指标：
+
+- 每个 Decode DP 的 effective free、reserved、output headroom 和 admittable token；
+- admission accepted/rejected 和 local pending 对账结果；
+- 建议输出预留与最终实际输出的误差分布；
+- 超过建议预留后使用安全水位的请求数；
+- Decode 预分配等待时间；
+- Router 因容量不足改选 Decode 的次数。
+
+物理缓存池明细只作为 Decode 内部调试指标，不进入 Router 协议。
+
+## 验证计划
+
+1. Shadow 模式只计算实时容量和输出预算，不拦截请求；对比 Router 旧估算、Decode 实际空闲量和最终输出。
+2. 回放真实流量，确定滚动窗口、P90、最小/最大预算和安全余量。
+3. 验证 local pending 能覆盖 Decode 指标刷新延迟；启用多 Router 前再验证标量原子预占不会超发。
+4. 混合长冷请求、短请求、L1/L2/L3 命中和客户端取消，确认不会出现 KV 100% 后的长时间预分配等待。
+5. Decode 重启和 epoch 变化后，Router 必须清空该实例的旧 pending。
+6. 对比 TTFT、TPOT、429、成功率和总吞吐，确认安全余量没有过度损失容量。
+
+## 与现有修复的边界
+
+- Decode prealloc 停止轮询、导致超时不推进的问题仍由独立 PR 修复。
+- P 侧 L1/L2/L3 admission 保持独立。
+- 租户 RPM、TPM 和并发限流不属于本设计。
+
+## 待评审参数
+
+- 初始预算的最小值和上限；
+- 安全水位使用固定 token 值、容量比例，还是随活跃请求数线性调整。
