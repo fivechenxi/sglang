@@ -1,6 +1,27 @@
 from sglang.srt.disaggregation.decode_token_admission import (
     DecodeTokenAdmissionState,
 )
+from sglang.srt.managers.io_struct import DecodeTokenReservationReqOutput
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+
+
+def test_reservation_output_is_http_json_serializable():
+    output = DecodeTokenReservationReqOutput(
+        dp_rank=2,
+        handled=True,
+        accepted=True,
+        reserved_tokens=4096,
+        admittable_tokens=8192,
+    )
+
+    assert msgspec_to_builtins(output) == {
+        "dp_rank": 2,
+        "handled": True,
+        "accepted": True,
+        "reserved_tokens": 4096,
+        "admittable_tokens": 8192,
+        "error": "",
+    }
 
 
 def test_reservations_are_atomic_idempotent_and_expire():
