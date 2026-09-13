@@ -5,7 +5,7 @@ description: "由 Decode 提供实时可准入 token，修正 Router 静态总�
 
 ## 状态
 
-本文同时记录设计与分阶段实现状态。D 侧标量容量、100 样本输出 P90、幂等预留端点已经实现；Router 远程准入仍保持未接线，避免在失败回退和协议字段未验证前改变现网行为。
+本文同时记录设计与实现状态。Router 侧 100 样本输出 P90、D 侧标量容量及幂等预留端点均已实现；新路径由开关控制，默认关闭。
 
 当前 Router 用“输入 token + 固定 640 输出 token”估算每个 Decode DP 的占用，并在 Router 进程内维护容量账本。现场已经出现 Router 判断仍有余量，但 Decode KV Pool 实际达到 97.5%–100%，请求随后长时间等待预分配的情况。
 
@@ -21,20 +21,16 @@ description: "由 Decode 提供实时可准入 token，修正 Router 静态总�
 Decode 内部已经掌握各 KV allocator 的真实可用页数、待预分配请求、传输中请求、cache 可淘汰量和请求槽。它在内部把这些约束折算为一个标量：
 
 ```text
-admittable_tokens = effective_free_tokens
+admittable_tokens = allocator_derived_budget
                   - outstanding_reservations
-                  - active_output_headroom
-                  - safety_margin
 ```
 
 `effective_free_tokens` 的具体计算仍是 Decode 内部实现。例如存在多个缓存池时，Decode 取各池按实际消耗比例折算后的最小值；Router 不接收也不存储这些明细。
 
-Decode 对外只需提供：
+Decode 对外只提供：
 
 - 当前可准入 token；
-- 当前活跃请求数或剩余请求槽；
-- 数据时间戳和实例 epoch；
-- 是否健康。
+- 原子预留是否成功。
 
 这些信息可以合并进现有 `/v1/loads`，用于 Router 排序和观测。
 
@@ -43,16 +39,17 @@ Decode 对外只需提供：
 Router 可以读取 Decode 的 `admittable_tokens` 用于候选排序，但真正放行前必须向目标 Decode 做一次原子预留：
 
 ```text
-request_cost     = input_tokens + min(max_tokens, recent_output_p90)
+request_cost = input_tokens
+             + min(request.max_output_tokens, router_recent_output_p90)
 ```
 
 Decode 在调度线程内串行处理 `reservation_id`，同 ID 同成本的重试幂等；预留只覆盖 Router 选路到 D 请求入队的短窗口，30 秒未提交自动过期。D 请求入队时把预留原子转换为真实队列占用。Router 崩溃不会永久泄漏容量，多 Router 同时请求也不会基于旧快照超发。
 
-## 动态估计输出
+## Router 动态估计输出
 
 输出无法在请求开始时精确知道。固定 640 容易低估，而按完整 `max_tokens` 预留通常过度保守。首版使用近期实际输出的滚动分位数，不引入逐请求续租协议。
 
-Decode 维护该模型最近 100 个正常完成请求的输出长度窗口：
+Router 按模型维护最近 100 个正常完成请求的输出长度窗口：
 
 ```text
 output_reserve = clamp(
@@ -62,29 +59,32 @@ output_reserve = clamp(
 )
 ```
 
-首版每个 D-DP 维护一组统计，不按租户、prompt 类型、流式类型或缓存层继续拆分。少于 20 个有效样本时使用现有 `num_reserved_decode_tokens`；达到 20 个后启用动态 P90，但不低于该安全下限，并沿用 `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`（默认 4096）作为上限。
+首版不按租户、prompt 类型、流式类型或缓存层继续拆分。少于 20 个有效样本时使用现有输出预算配置；达到 20 个后启用动态 P90，但不低于该安全下限，上限为 4096，并受单请求 `max_output_tokens` 约束。流式响应优先使用最终 usage，缺失 usage 时 Router 汇总有效 delta 并用 tokenizer 计数；非流式响应从最终响应统计。失败和客户端中止不写入正常完成窗口。
 
-请求生成的真实 KV 会持续降低 Decode 下一次上报的 `admittable_tokens`，因此不需要 Router 按输出 token 逐段续租。Decode 在该值中扣除一块安全水位，用来覆盖指标刷新延迟以及少量超过 P90 的长尾；水位被消耗后，只停止接收新请求，不打断已运行请求。
+请求生成的真实 KV 会持续降低 Decode 下一次计算的 `admittable_tokens`，因此不需要 Router 按输出 token 逐段续租。P90 只是准入时的保守预测，不参与 D 侧物理布局或运行时生成路径。
 
 需要分别观测正常完成和客户端中止的输出长度。中止样本只能作为“至少已经生成这么多”的删失样本，不能直接当作正常最终长度拉低分位数。
 
 ## 请求流程
 
-1. Router 从 `/v1/loads` 读取各 Decode 的实时 `admittable_tokens`，选择候选实例。
-2. Router 在发送 P 前向目标 D 提交一次 `reservation_id + input_tokens + max_output_tokens`。
-3. D 用自己的输出 P90 算出标量成本并原子接受或拒绝；拒绝后 Router 尝试其他 D。
-4. 接受后 Router 把同一个 `reservation_id` 放入 D 请求，再启动 P；P 失败时释放预留。
+1. Router 选择 Decode 候选，并用输入 token、请求上限和本模型输出 P90 算出最终标量成本。
+2. Router 在发送 P 前向目标 D 提交一次 `reservation_id + token_count`。
+3. D 只用 allocator 实时容量原子接受或拒绝；拒绝后 Router 尝试其他 D。
+4. 接受后 Router 把同一个 `reservation_id` 放入 D 请求，再启动 P；P 失败或 Router 中止时释放预留。
 5. D 请求入队时消费预留，后续占用由真实 allocator 和队列反映；生成过程不逐 token 交互。
-6. 所有 Decode 均无容量时，快速返回明确的 429。
+6. 所有 Decode 均无容量时，快速返回明确的 429。远端控制端点不可用时，仅在旧本地 token admission 已配置时回退；否则安全拒绝，不能无预留放行。
+
+分阶段启用时设置 `--pd-decode-admission-remote`，并保留
+`--pd-decode-admission-max-tokens` 作为控制端点故障时的本地安全回退；
+`--pd-decode-admission-token-overhead` 同时是动态窗口样本不足时的输出预算下限。
 
 ## 可观测性
 
 首版只需要围绕标量容量增加指标：
 
-- 每个 Decode DP 的 effective free、reserved、output headroom 和 admittable token；
+- 每个 Decode DP 的 allocator budget、reserved 和 admittable token；
 - admission accepted/rejected、预留过期和重复请求结果；
-- 建议输出预留与最终实际输出的误差分布；
-- 超过建议预留后使用安全水位的请求数；
+- Router 输出 P90、输出预留与最终实际输出的误差分布；
 - Decode 预分配等待时间；
 - Router 因容量不足改选 Decode 的次数。
 
@@ -96,7 +96,7 @@ output_reserve = clamp(
 2. 回放真实流量，确定滚动窗口、P90、最小/最大预算和安全余量。
 3. 并发多个 Router 验证标量原子预占不会超发，并验证重复 ID 与 Router 崩溃后的过期回收。
 4. 混合长冷请求、短请求、L1/L2/L3 命中和客户端取消，确认不会出现 KV 100% 后的长时间预分配等待。
-5. Decode 重启和 epoch 变化后，Router 必须清空该实例的旧 pending。
+5. Decode 重启会自然清空进程内预留；Router 释放旧 ID 必须保持幂等。
 6. 对比 TTFT、TPOT、429、成功率和总吞吐，确认安全余量没有过度损失容量。
 
 ## 与现有修复的边界
@@ -108,4 +108,4 @@ output_reserve = clamp(
 ## 待评审参数
 
 - 初始预算的最小值和上限；
-- 安全水位使用固定 token 值、容量比例，还是随活跃请求数线性调整。
+- 后续是否需要按业务类型拆分输出窗口；首版不做。

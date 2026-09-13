@@ -73,6 +73,10 @@ pub struct RouterConfig {
     /// templates and protocol tokens not present in routing text.
     #[serde(default)]
     pub pd_decode_admission_token_overhead: usize,
+    /// Use Decode-issued real-time atomic reservations. Endpoint failures
+    /// fall back to the legacy Router-local budget during staged rollout.
+    #[serde(default)]
+    pub pd_decode_admission_remote: bool,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
@@ -572,6 +576,7 @@ impl Default for RouterConfig {
             pd_prefill_admission_retry_after_secs: default_pd_prefill_admission_retry_after_secs(),
             pd_decode_admission_max_tokens: 0,
             pd_decode_admission_token_overhead: 0,
+            pd_decode_admission_remote: false,
             rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),

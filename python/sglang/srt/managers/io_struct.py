@@ -2145,8 +2145,7 @@ class DecodeTokenReservationReqInput(BaseReq, kw_only=True):
     operation: Literal["reserve", "release"]
     reservation_id: str
     dp_rank: int
-    input_tokens: int = 0
-    max_output_tokens: int = 0
+    tokens: int = 0
 
 
 class DecodeTokenReservationReqOutput(BaseReq, kw_only=True):
@@ -2155,7 +2154,6 @@ class DecodeTokenReservationReqOutput(BaseReq, kw_only=True):
     accepted: bool
     reserved_tokens: int
     admittable_tokens: int
-    suggested_output_tokens: int
     error: str = ""
 
 
