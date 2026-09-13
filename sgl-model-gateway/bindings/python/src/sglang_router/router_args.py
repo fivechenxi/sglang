@@ -57,6 +57,7 @@ class RouterArgs:
     pd_prefill_admission_retry_after_secs: int = 1
     pd_decode_admission_max_tokens: int = 0
     pd_decode_admission_token_overhead: int = 0
+    pd_decode_admission_remote: bool = False
 
     # Routing policy
     policy: str = "cache_aware"
@@ -431,13 +432,22 @@ class RouterArgs:
             f"--{prefix}pd-decode-admission-max-tokens",
             type=int,
             default=RouterArgs.pd_decode_admission_max_tokens,
-            help="Per-decode-DP in-flight KV token budget (0 disables)",
+            help=(
+                "Per-decode-DP local KV token fallback; required for remote "
+                "admission endpoint failures and batch requests"
+            ),
         )
         pd_group.add_argument(
             f"--{prefix}pd-decode-admission-token-overhead",
             type=int,
             default=RouterArgs.pd_decode_admission_token_overhead,
-            help="Safety overhead added to each decode token reservation",
+            help="Output-token fallback before enough P90 samples are available",
+        )
+        pd_group.add_argument(
+            f"--{prefix}pd-decode-admission-remote",
+            action="store_true",
+            default=RouterArgs.pd_decode_admission_remote,
+            help="Use Decode-issued real-time atomic token reservations",
         )
         pd_group.add_argument(
             f"--{prefix}prefill",

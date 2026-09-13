@@ -217,6 +217,8 @@ class GenerateReqInput:
     stream: bool = False
     # Internal use by the PD Router; not part of the public API contract.
     pd_prefill_admission_ack: bool = False
+    # Opaque Decode capacity reservation issued before Prefill admission.
+    decode_token_reservation_id: Optional[str] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
     log_metrics: bool = True
     # Whether to return hidden states
@@ -789,6 +791,7 @@ class GenerateReqInput:
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
+            decode_token_reservation_id=self.decode_token_reservation_id,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             priority=self.priority,
@@ -835,6 +838,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # after the real L1/L2/L3 lookup and reservation, before waiting for D-side
     # bootstrap/KV allocation. Never set this for public client requests.
     pd_prefill_admission_ack: bool = False
+    decode_token_reservation_id: Optional[str] = None
     # Whether to return sparse output-token support from top-k/top-p/min-p sampling.
     return_sampling_mask: bool = False
 
@@ -2132,6 +2136,24 @@ class DumperControlReqOutput(BaseReq, kw_only=True):
     success: bool
     # JSON-native per-worker response dicts.
     response: List[Dict[str, Any]]
+    error: str = ""
+
+
+class DecodeTokenReservationReqInput(BaseReq, kw_only=True):
+    """Internal Router -> Decode token admission operation."""
+
+    operation: Literal["reserve", "release"]
+    reservation_id: str
+    dp_rank: int
+    tokens: int = 0
+
+
+class DecodeTokenReservationReqOutput(BaseReq, kw_only=True):
+    dp_rank: int
+    handled: bool
+    accepted: bool
+    reserved_tokens: int
+    admittable_tokens: int
     error: str = ""
 
 

@@ -117,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DecodeTokenReservationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
@@ -801,6 +802,15 @@ async def set_internal_state(
 ):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+@app.post("/internal/decode_token_reservation")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def decode_token_reservation(
+    obj: Annotated[DecodeTokenReservationReqInput, Body()], request: Request
+):
+    """Atomically reserve or release opaque token capacity on one Decode DP."""
+    return await _global_state.tokenizer_manager.decode_token_reservation(obj)
 
 
 # Do not import `dumper.py` to avoid dependency

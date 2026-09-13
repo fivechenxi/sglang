@@ -100,6 +100,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DecodeTokenReservationReqInput,
+    DecodeTokenReservationReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -1541,6 +1543,10 @@ class Scheduler(
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
+                (
+                    DecodeTokenReservationReqInput,
+                    self.handle_decode_token_reservation,
+                ),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
                     RemoveExternalCorpusReqInput,
@@ -2282,6 +2288,7 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.pd_prefill_admission_ack = recv_req.pd_prefill_admission_ack
+            req.decode_token_reservation_id = recv_req.decode_token_reservation_id
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -4488,6 +4495,9 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    self.disagg_decode_prealloc_queue.release_req_token_reservation(
+                        decode_req.req
+                    )
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
@@ -4837,6 +4847,43 @@ class Scheduler(
                 DumperControlReqOutput(success=False, response=[], error=str(e)),
                 recv_req,
             )
+
+    def handle_decode_token_reservation(
+        self, recv_req: DecodeTokenReservationReqInput
+    ) -> None:
+        dp_rank = int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0
+        queue = (
+            self.disagg_decode_prealloc_queue
+            if self.disaggregation_mode == DisaggregationMode.DECODE
+            else None
+        )
+        handled = queue is not None and recv_req.dp_rank == dp_rank
+        accepted = False
+        reserved_tokens = 0
+        error = ""
+        if handled:
+            if recv_req.operation == "reserve":
+                reserved_tokens = max(0, recv_req.tokens)
+                accepted = queue.reserve_tokens(
+                    recv_req.reservation_id, reserved_tokens
+                )
+            else:
+                queue.release_token_reservation(recv_req.reservation_id)
+                accepted = True
+        elif queue is None:
+            error = "not a decode scheduler"
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            DecodeTokenReservationReqOutput(
+                dp_rank=dp_rank,
+                handled=handled,
+                accepted=accepted,
+                reserved_tokens=reserved_tokens,
+                admittable_tokens=queue.admittable_tokens() if queue else 0,
+                error=error,
+            ),
+            recv_req,
+        )
 
     # placeholder for override
     def update_cache_from_scheduler(
