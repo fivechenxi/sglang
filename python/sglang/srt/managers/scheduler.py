@@ -100,11 +100,11 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DecodeTokenReservationReqInput,
+    DecodeTokenReservationReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
-    DecodeTokenReservationReqInput,
-    DecodeTokenReservationReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
     ExpertDistributionReq,
@@ -2288,9 +2288,7 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.pd_prefill_admission_ack = recv_req.pd_prefill_admission_ack
-            req.decode_token_reservation_id = (
-                recv_req.decode_token_reservation_id
-            )
+            req.decode_token_reservation_id = recv_req.decode_token_reservation_id
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
