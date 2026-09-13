@@ -381,9 +381,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def admittable_tokens(self) -> int:
-        return self.token_admission.admittable_tokens(
-            self._allocatable_token_budgets()
-        )
+        return self.token_admission.admittable_tokens(self._allocatable_token_budgets())
 
     def reserve_tokens(self, reservation_id: str, tokens: int) -> bool:
         """Idempotently reserve opaque Decode capacity in token units."""
@@ -392,9 +390,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ).accepted
 
     def release_token_reservation(self, reservation_id: str) -> bool:
-        self.token_admission.release(
-            reservation_id, self._allocatable_token_budgets()
-        )
+        self.token_admission.release(reservation_id, self._allocatable_token_budgets())
         return True
 
     def _swa_tail_len(self, seq_len: int) -> int:
