@@ -1,0 +1,179 @@
+---
+title: "SFA C8 HiCache L2/L3 设计"
+description: "为昇腾 GLM-5.2 SFA C8 增加原生布局的主机 L2 和可选共享 L3。"
+---
+
+# SFA C8 HiCache L2/L3 设计
+
+状态：第一版候选实现；尚未部署到生产。
+
+基线：`glm52-910b-w4a8c8-sfa-c8-pd-20260905`
+（`bcd4b0a39ced7293c7005c63684f8677170ed2a8`）。
+
+## 是什么
+
+在 Prefill worker 上为 SFA C8 增加两级缓存：
+
+- L2：本机 Host 内存，第一阶段先实现；
+- L3：多个 P 实例共享的存储后端，首个后端为 Mooncake Store，可选启用。
+
+一个 128-token 逻辑页只有一个 prefix key 和一次命中判定。该页包含四段运行时
+payload：
+
+| payload | 格式 | 每页每 rank 字节 |
+| --- | --- | ---: |
+| target SFA | packed C8 | 6,549,504 |
+| target Lightning Indexer | BF16 | 688,128 |
+| draft SFA | packed C8 | 83,968 |
+| draft Lightning Indexer | BF16 | 32,768 |
+| 合计 |  | 7,354,368 |
+
+四段 payload 共用 logical page ID 和有效性状态。target host pool 的 allocator 是唯一
+权威分配器；draft host pool 只按同一 logical page ID 提供 payload，不独立参与分配、
+命中或释放。它们不是四个独立缓存，也不分别做 prefix 匹配。
+
+## 为什么
+
+当前通用 MLA HiCache 假设 Host 侧保存独立 BF16 K/V。SFA C8 的主缓存是 packed
+opaque bytes，不能进入该路径，否则会发生布局错误或展开成 BF16。
+
+一次有效命中还必须恢复对应的 Lightning Indexer 和 P 侧 NEXTN draft 状态。
+这些数据都由同一个 token prefix 决定，只是恢复 payload，不应产生独立 key。
+
+L2 可以减少同一 P worker 上的重复 prefill。可选 L3 让其他 P worker 复用已淘汰
+前缀；L3 不可用时，服务应回退到 L2、L1 或重新计算。
+
+## 怎么做
+
+### 总体结构
+
+```text
+token prefix
+    |
+    v
+one logical page / one cache key
+    |
+    +-- target SFA C8
+    +-- target LI BF16
+    +-- draft SFA C8
+    +-- draft LI BF16
+
+L1 NPU <-> L2 Host <-> optional L3 storage
+```
+
+### 匹配与身份
+
+匹配 key 由 token page hash、现有 `extra_key` 和 cache identity 组成。启用 SFA C8
+L3 时必须显式配置非空的 Mooncake `extra_backend_tag`，用于区分准确的模型权重、
+tokenizer 和服务 release。代码生成的布局指纹另行覆盖 target/draft、dtype、页大小、
+物理层范围、Indexer layer-to-slot mapping 和每行宽度；两层身份共同进入最终 key，
+不能用布局指纹替代模型版本隔离。
+
+Radix tree 只匹配该 key。SFA main 可作为逻辑页的 anchor，但不会通过比较 SFA
+字节判断命中。四段 payload 只有一个 `valid` 状态；全部完成前不得发布 host node。
+
+### L2 Host pool
+
+新增 SFA C8 专用 host pool，并在通用 MLA strategy 之前选择它。host pool 包含
+四个 page-first 物理 region：
+
+```text
+target_sfa[page]
+target_li[page]
+draft_sfa[page]
+draft_li[page]
+```
+
+target allocator 为四个 region 分配同一个 logical page ID；draft 自身的分配状态不进入
+缓存生命周期。设备池提供真实 dtype、row bytes、layer-to-slot mapping 和 buffer 地址，
+其他模块不得从模型常量重建布局。
+
+D2H/H2D 按 source/destination physical page index 直接复制原始行：
+
+- 不反量化；
+- 不拆 K/V；
+- 不转置；
+- 不改变 BF16 Indexer；
+- 不要求源页和目标页具有相同物理下标。
+
+四段复制完成后记录一个 completion event，再把逻辑页标记为 valid。失败或取消时
+释放一次 logical page，不能留下部分可见数据。
+
+### 可选 L3
+
+L3 接口以一个 logical page 为一个对象：
+
+```python
+key = page_hash_with_identity
+buffers = [
+    target_sfa_page,
+    target_li_page,
+    draft_sfa_page,
+    draft_li_page,
+]
+```
+
+Mooncake 启动时注册四个 Host region。每次写入使用
+`batch_put_from_multi_buffers`，每次读取使用 `batch_get_into_multi_buffers`：一个
+key 对应四个已注册地址，不需要把数据拼成连续临时 buffer。
+
+L3 对每页只执行一次 exists、put 或 get。实现必须把一次成功定义为四段 payload
+全部完成；若当前 Mooncake 版本不能提供该语义，则启动失败，不能退化为部分成功。
+Mooncake 返回的结果数必须与提交的逻辑 key 数相等，读取成功的字节数也必须等于该
+逻辑页四段 payload 的总字节数；否则本次操作整体报错，不能把缺失或部分读取误判为
+成功。
+读取失败时整页 miss 并重新计算。不创建 main/indexer/draft sidecar key，不需要
+commit marker、多对象写入顺序或最小命中长度合并。
+
+Mooncake 只是首个 L3 backend。不开 L3 时，SFA C8 L2 仍可独立运行。
+
+### 容量
+
+最终实现中，`--hicache-size` 或 `--hicache-ratio` 只产生一个逻辑页预算：
+
+```text
+num_host_pages = floor(host_budget_bytes / 7,354,368)
+host_token_slots = num_host_pages * 128
+```
+
+启动前按每 rank 和每节点检查总 Host 内存，并预留 allocator、传输引擎和系统内存。
+显式容量无法分配时启动失败，不静默缩容。
+
+第一版运行时代码先支持 `--hicache-ratio`：target 与 late-created draft 使用相同
+logical page 数，因此 Host/L1 的四段 payload 总字节比例仍等于该 ratio。固定
+`--hicache-size` 在 draft 创建前无法正确按四段总字节计算，第一版会显式拒绝，后续
+改为延迟构造 logical pool 后再支持，不能把该值错误地分别用于 target 和 draft。
+Mooncake `standalone_storage` 同样在 draft 创建前固定 segment 大小，第一版会显式
+拒绝该组合；外部 Mooncake Store 的注册内存模式不受此限制。
+
+### 代码边界
+
+实现 PR 需要完成：
+
+1. 为 device pool 增加 SFA C8 page payload descriptor。
+2. 在 HiCache assembler 中增加 P-only SFA C8 strategy，阻止进入 BF16 MLA pool。
+3. 实现 target 权威 allocator、四 region、单 valid 状态的 host pool。
+4. 实现四段 payload 的 indexed D2H/H2D 路径。
+5. 为 storage backend 增加单 key multi-buffer logical-page 接口。
+6. Mooncake backend 使用现有 multi-buffer zero-copy API。
+
+第一版复用 `transfer_kv_dim_exchange` 的 `aclrtMemcpy2dAsync` 路径：packed C8
+作为 K region，V 为空，LI 作为 index region；target 与 draft 的四个 region 由同一
+logical page key 通过 Mooncake multi-buffer API 读写。第一阶段不修改 D 侧缓存、
+retract/rebootstrap、SFA 算子、P-to-D packed C8 传输、CUDA/NPU Graph 或调度策略。
+
+## 验证
+
+实现必须验证：
+
+1. 真实 dtype、shape、row bytes、layer mapping 和 page alignment。
+2. 127/128/129、255/256/257 token 页边界的逐字节 L1→L2→L1 round trip。
+3. cold、L1、L2、L3 的 last-prefill logits 与固定采样输出一致。
+4. 1K、8K、16K、64K、126K、200K prefix 和 chunked prefill。
+5. physical page remap、并发淘汰、取消和任一 buffer 传输失败。
+6. P-only HiCache 后，现有 C8 P→D 传输和 D 侧 NEXTN 正确。
+7. L2/L3 miss、timeout 或后端不可用时稳定回退到 recompute。
+
+先交付 L2，再接 Mooncake L3。每个阶段均使用独立 candidate deployment，保留当前
+tagged baseline；cold input throughput 回退不得超过 3%，Decode P90 TPOT 回退不得
+超过 5%。

@@ -121,6 +121,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         )
 

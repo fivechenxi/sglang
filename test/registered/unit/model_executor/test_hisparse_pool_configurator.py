@@ -28,6 +28,8 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         hf_config.get_text_config = lambda: hf_config
         kvc = MagicMock(
             use_mla_backend=True,
+            device="cuda",
+            sfa_c8_enabled=False,
             kv_cache_dtype=kv_cache_dtype,
             model_config=SimpleNamespace(
                 kv_lora_rank=512,

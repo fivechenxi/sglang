@@ -40,6 +40,15 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        if !config.pd_prefill_admission_chars_per_token.is_finite()
+            || config.pd_prefill_admission_chars_per_token <= 0.0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "pd_prefill_admission_chars_per_token".to_string(),
+                value: config.pd_prefill_admission_chars_per_token.to_string(),
+                reason: "Must be finite and > 0".to_string(),
+            });
+        }
 
         Ok(())
     }

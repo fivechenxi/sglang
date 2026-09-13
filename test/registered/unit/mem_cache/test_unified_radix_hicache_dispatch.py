@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _DsaStrategy,
     _MambaStrategy,
     _MiniMaxSparseStrategy,
+    _NPUSFAC8Strategy,
     _PlainKvStrategy,
     _select_strategy,
     _SwaStrategy,
@@ -71,6 +72,12 @@ class TestUnifiedRadixHiCacheDispatch(unittest.TestCase):
         kvcache = _mock_kvcache(DSATokenToKVPool)
         strategy = _select_strategy(kvcache, {FULL})
         self.assertIsInstance(strategy, _DsaStrategy)
+
+    def test_npu_sfa_c8_precedes_plain_mla(self):
+        kvcache = MagicMock()
+        kvcache.sfa_c8_enabled = True
+        strategy = _select_strategy(kvcache, {FULL})
+        self.assertIsInstance(strategy, _NPUSFAC8Strategy)
 
     def test_minimax_sparse(self):
         from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool

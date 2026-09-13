@@ -213,6 +213,105 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// Select a worker without mutating cache-affinity state. PD admission uses
+    /// this before deciding whether the request is allowed to reach either
+    /// backend; rejected requests must never become apparent cache hits.
+    pub fn preview_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: &str,
+    ) -> Option<(usize, usize)> {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        let &pivot_idx = healthy_indices.first()?;
+        let tree_key = tree_key_for_worker(workers[pivot_idx].as_ref());
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
+        let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
+            && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
+
+        let tree = self.trees.get(&tree_key).map(|entry| entry.value().clone());
+        let selected_idx = if is_imbalanced {
+            healthy_indices
+                .iter()
+                .min_by_key(|&&idx| workers[idx].load())
+                .copied()?
+        } else if let Some(tree) = &tree {
+            let result = tree.prefix_match_with_counts(request_text);
+            let match_rate = if result.input_char_count == 0 {
+                0.0
+            } else {
+                result.matched_char_count as f32 / result.input_char_count as f32
+            };
+            if match_rate > self.config.cache_threshold {
+                workers
+                    .iter()
+                    .position(|worker| worker.url() == result.tenant.as_ref())
+                    .filter(|&idx| workers[idx].is_healthy())
+                    .unwrap_or(pivot_idx)
+            } else {
+                healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())
+                    .copied()?
+            }
+        } else {
+            pivot_idx
+        };
+
+        let matched_chars = tree
+            .map(|tree| {
+                tree.prefix_match_tenant(request_text, workers[selected_idx].url())
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0);
+        Some((selected_idx, matched_chars))
+    }
+
+    /// Return the approximate prefix match for one concrete cache domain
+    /// without mutating affinity state. Admission fallback uses this when the
+    /// preferred P-DP is full and it must evaluate another physical P-DP.
+    pub fn preview_matched_chars_for_worker(
+        &self,
+        worker: &dyn Worker,
+        request_text: &str,
+    ) -> usize {
+        let tree_key = tree_key_for_worker(worker);
+        self.trees
+            .get(&tree_key)
+            .map(|tree| {
+                tree.prefix_match_tenant(request_text, worker.url())
+                    .chars()
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Commit cache-affinity state after prefill has completed successfully.
+    pub fn record_selected_request(&self, worker: &dyn Worker, request_text: &str) {
+        let tree_key = tree_key_for_worker(worker);
+        let tree = self
+            .trees
+            .entry(tree_key.clone())
+            .or_insert_with(|| Arc::new(Tree::new()))
+            .clone();
+        tree.insert(request_text, worker.url());
+        if let Some(ref mesh_sync) = self.mesh_sync {
+            use smg_mesh::tree_ops::TreeInsertOp;
+            let op = TreeOperation::Insert(TreeInsertOp {
+                text: request_text.to_owned(),
+                tenant: worker.url().to_owned(),
+            });
+            if let Err(error) = mesh_sync.sync_tree_operation(tree_key, op) {
+                warn!("Failed to sync tree insert operation to mesh: {}", error);
+            }
+        }
+        worker.increment_processed();
+    }
+
     /// Restore tree state from mesh store
     /// This is called during initialization to rebuild trees from synchronized state
     fn restore_tree_state_from_mesh(&self) {
@@ -603,6 +702,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(idx1, idx3);
+    }
+
+    #[test]
+    fn preview_does_not_publish_rejected_request() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
+            BasicWorkerBuilder::new("http://p0:8000")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: None,
+                })
+                .build(),
+        )];
+        policy.init_workers(&workers);
+
+        let (idx, first_match) = policy.preview_worker(&workers, "cold prompt").unwrap();
+        assert_eq!(first_match, 0);
+        let (_, second_match) = policy.preview_worker(&workers, "cold prompt").unwrap();
+        assert_eq!(second_match, 0, "preview must be side-effect free");
+
+        policy.record_selected_request(workers[idx].as_ref(), "cold prompt");
+        let (_, committed_match) = policy.preview_worker(&workers, "cold prompt").unwrap();
+        assert_eq!(committed_match, "cold prompt".chars().count());
     }
 
     #[tokio::test]

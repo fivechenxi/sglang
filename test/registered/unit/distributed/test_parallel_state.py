@@ -268,6 +268,34 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
+def test_custom_parallel_group_uses_world_cpu_group_for_metadata_exchange():
+    cpu_group = object()
+    created_group = object()
+
+    def fake_all_gather_object(outputs, local_config, *, group=None):
+        assert group is cpu_group
+        outputs[:] = [local_config, local_config]
+
+    mock_world = Mock()
+    mock_world.cpu_group = cpu_group
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch(
+            "torch.distributed.all_gather_object",
+            side_effect=fake_all_gather_object,
+        ) as all_gather_object,
+        patch("torch.distributed.new_group", return_value=created_group),
+        patch.object(parallel_state, "get_world_group", return_value=mock_world),
+    ):
+        result = parallel_state.create_custom_parallel_group([0, 1])
+
+    assert result is created_group
+    assert all_gather_object.call_count == 1
+
+
 if __name__ == "__main__":
     # Run tests without requiring GPUs
     import sys

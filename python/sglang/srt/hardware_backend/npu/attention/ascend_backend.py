@@ -19,6 +19,10 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
+from sglang.srt.hardware_backend.npu.attention.sfa_c8 import (
+    pack_sfa_c8_kv,
+    run_sfa_c8_attention,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.radix_attention import AttentionType
@@ -497,6 +501,31 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
+        # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
+        # indexer reads a value consistent with actual_seq_lengths_kv /
+        # block_tables (which are also built from the pre-pad batch here).
+        # Without this, eager decode under DP attention pads q to the global
+        # max while kv stays local, causing a shape mismatch in
+        # npu_lightning_indexer.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self.forward_metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+        elif forward_batch.forward_mode.is_decode_or_idle():
+            self.forward_metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i for i in range(forward_batch.seq_lens.shape[0])],
+                dtype=torch.int32,
+                device=self.device,
+            )
+
         if (
             self.use_mla
             and forward_batch.forward_mode.is_extend()
@@ -720,6 +749,27 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = metadata
 
         self.graph_mode = True
+
+    def _pad_topk_indices(
+        self, topk_indices: torch.Tensor, num_tokens: int
+    ) -> torch.Tensor:
+        current_tokens = topk_indices.shape[0]
+        if current_tokens == num_tokens:
+            return topk_indices
+
+        assert current_tokens <= num_tokens, (
+            f"topk_indices rows ({current_tokens}) > num_tokens ({num_tokens}); "
+            "this indicates a mismatch between indexer output and q layout."
+        )
+
+        pad_size = num_tokens - current_tokens
+        padding = torch.full(
+            (pad_size, topk_indices.shape[1]),
+            -1,
+            dtype=topk_indices.dtype,
+            device=topk_indices.device,
+        )
+        return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
@@ -1012,14 +1062,39 @@ class AscendAttnBackend(AttentionBackend):
             and not forward_batch.forward_mode.is_target_verify()
         )
 
+        # NEXTN target verify and draft extend intentionally stay on the
+        # decode-style sparse path.  During NPU graph capture the tensors below
+        # are static graph buffers; pack -> scatter -> QSFA is captured as one
+        # replayable operator chain, while ordinary prompt prefill remains eager.
+
+        sfa_c8_enabled = getattr(self.token_to_kv_pool, "sfa_c8_enabled", False)
+
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
             k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
-            )
+            if sfa_c8_enabled:
+                packed_kv = pack_sfa_c8_kv(
+                    k,
+                    k_rope,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                )
+                # In standalone mode this is the ordinary physical write
+                # mapping. DCP support must replace it with the DCP-local SFA
+                # mapping; it must never reuse a replicated indexer mapping.
+                slot_mapping_sfa = forward_batch.out_cache_loc
+                self.token_to_kv_pool.set_sfa_packed_kv_buffer(
+                    layer.layer_id, slot_mapping_sfa, packed_kv
+                )
+            else:
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
         q_nope, q_pe = q, q_rope
-        k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if sfa_c8_enabled:
+            packed_kv = self.token_to_kv_pool.get_sfa_packed_kv_buffer(layer.layer_id)
+        else:
+            k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         if is_prefill:
             if self.forward_metadata.actual_seq_lengths_q is not None:
@@ -1061,6 +1136,8 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
+            if sfa_c8_enabled:
+                raise RuntimeError("SFA C8 prefill context parallelism is unsupported")
             attn_out = self.do_cp_balance_attn(
                 q_nope,
                 k_nope,
@@ -1072,29 +1149,48 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope,
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_pe,
-                key_rope=k_pe,
-                sparse_indices=topk_indices,
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=actual_seq_qlen.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                    device=q_nope.device, dtype=torch.int32
-                ),
-                block_table=self.forward_metadata.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
+            if sfa_c8_enabled:
+                attn_out = run_sfa_c8_attention(
+                    q_nope,
+                    q_pe,
+                    packed_kv,
+                    topk_indices,
+                    scale_value=layer.scaling,
+                    block_table=self.forward_metadata.block_tables,
+                    actual_seq_lengths_query=actual_seq_qlen.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    rope_head_dim=self.qk_rope_head_dim,
+                )
+            else:
+                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+                    query=q_nope,
+                    key=k_nope,
+                    value=k_nope,
+                    query_rope=q_pe,
+                    key_rope=k_pe,
+                    sparse_indices=topk_indices,
+                    scale_value=layer.scaling,
+                    actual_seq_lengths_query=actual_seq_qlen.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                        device=q_nope.device, dtype=torch.int32
+                    ),
+                    block_table=self.forward_metadata.block_tables,
+                    sparse_block_size=1,
+                    layout_query="TND",
+                    layout_kv="PA_BSND",
+                    sparse_mode=3,
+                    attention_mode=2,
+                    return_softmax_lse=False,
+                )
 
         return attn_out
 

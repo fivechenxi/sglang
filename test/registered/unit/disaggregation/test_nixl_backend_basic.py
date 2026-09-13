@@ -589,6 +589,7 @@ class TestNixlReceiverPoll(CustomTestCase):
         receiver.init_time = None
         receiver.conclude_state = None
         receiver.abort_notified = False
+        receiver._connection_pool_entries = {}
         return receiver, mgr
 
     def test_returns_existing_conclude_state_without_polling_manager(self):
@@ -670,6 +671,11 @@ class TestNixlNodeFailure(CustomTestCase):
             "10.0.0.1:8998_0_0_1": [{"rank_ip": "10.0.0.1"}],
             "10.0.0.2:8998_0_0_0": [{"rank_ip": "10.0.0.2"}],
         }
+        mgr.connection_pool_generations = {
+            "10.0.0.1:8998_0_0_0": "generation-1",
+            "10.0.0.1:8998_0_0_1": "generation-1",
+            "10.0.0.2:8998_0_0_0": "generation-2",
+        }
         mgr.prefill_info_table = {
             "10.0.0.1:8998": object(),
             "10.0.0.2:8998": object(),
@@ -698,6 +704,9 @@ class TestNixlNodeFailure(CustomTestCase):
         self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool)
         self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool)
         self.assertIn("10.0.0.2:8998_0_0_0", mgr.connection_pool)
+        self.assertNotIn("10.0.0.1:8998_0_0_0", mgr.connection_pool_generations)
+        self.assertNotIn("10.0.0.1:8998_0_0_1", mgr.connection_pool_generations)
+        self.assertIn("10.0.0.2:8998_0_0_0", mgr.connection_pool_generations)
         self.assertNotIn("10.0.0.1:8998", mgr.prefill_info_table)
         self.assertNotIn("10.0.0.1:8998", mgr.addr_to_rooms_tracker)
         self.assertEqual(mgr.request_status[3], KVPoll.Failed)

@@ -206,6 +206,29 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def get_dsa_indexer_layer_ids(
+    config: PretrainedConfig,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+) -> list[int]:
+    """Return DSA layers that own a physical indexer KV cache.
+
+    Layers marked ``skip_topk`` reuse the preceding producer's TopK result and
+    never execute their Indexer, so allocating an index cache for them wastes
+    memory.  Keep global layer ids here so PP-local pools can map callers to a
+    compact physical buffer without changing the model-layer API.
+    """
+    assert is_deepseek_dsa(config)
+    if end_layer is None:
+        end_layer = config.num_hidden_layers
+    assert 0 <= start_layer <= end_layer <= config.num_hidden_layers
+    return [
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    ]
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads

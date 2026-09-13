@@ -356,7 +356,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = server_args.hicache_load_back_threshold
+        if self.load_back_threshold < 0:
+            raise ValueError("--hicache-load-back-threshold must be non-negative")
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
@@ -999,10 +1001,10 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
 
-        # Skip if there is nothing to load, or if the Full-KV transfer is too
-        # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        # Skip the whole request when its Full-KV token count is below the
+        # configured threshold. Loading auxiliary state alone would still
+        # force the short-prefix host path and defeat the prefill fallback.
+        if kv_tokens < self.load_back_threshold or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(node_id, ancestor_lock_params)
@@ -1144,6 +1146,54 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> int:
+        """Synchronously probe L3 for the reusable page-aligned prefix.
+
+        Prefill tier admission calls this before starting an asynchronous L3
+        prefetch.  Without it, UnifiedRadixCache requests are conservatively
+        charged as cold input and long L3 hits can be rejected before storage
+        is queried at all.
+        """
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or self.cache_controller.prefetch_rate_limited()
+        ):
+            return 0
+
+        extra_key = self.tree_core.prefetch_anchor_info(last_host_node)
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            PrefetchOperation,
+        )
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        return storage_hit_count - (storage_hit_count % self.page_size)
 
     def prefetch_from_storage(
         self,

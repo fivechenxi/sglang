@@ -1581,6 +1581,7 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    supports_cpu_offload: bool = True
 
     @abc.abstractmethod
     def __init__(
