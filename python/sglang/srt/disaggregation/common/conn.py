@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -267,6 +267,14 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV Cache transfer done signal after bootstrapping.
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+            configured_prealloc_timeout = (
+                envs.SGLANG_DISAGGREGATION_PREALLOC_TIMEOUT.get()
+            )
+            self.prealloc_timeout = (
+                configured_prealloc_timeout
+                if configured_prealloc_timeout is not None
+                else self.waiting_timeout
+            )
             # PD true-retraction rebootstrap: a shared executor + per-thread HTTP
             # sessions used to drive the original prefill worker's ``/generate``
             # endpoint so it recomputes a retracted request's prefix KV under the
@@ -859,7 +867,9 @@ class CommonKVManager(BaseKVManager):
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
         assert (
             end_layer is not None
-        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        ), (
+            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
+        )
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1276,6 +1286,8 @@ class CommonKVReceiver(BaseKVReceiver):
         self.init_time: Optional[float] = None
         self.metadata_sent: bool = False
         self.abort_notified: bool = False
+        self.prealloc_blocked_snapshot: Optional[Dict[str, Any]] = None
+        self.prealloc_blocked_snapshot_at: float = 0.0
         self._connection_pool_entries: Dict[str, List[Dict]] = {}
         self._fetched_bootstrap_generation: Optional[str] = None
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
@@ -1651,6 +1663,9 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.init_time = time.monotonic()
             deadline_start = self.init_time
             timeout_phase = "decode KV preallocation"
+            timeout = getattr(
+                self.kv_mgr, "prealloc_timeout", self.kv_mgr.waiting_timeout
+            )
         else:
             # Destination metadata is sent before P queues and computes the
             # prompt. Only actual P-side chunk progress starts/refreshed the KV
@@ -1659,9 +1674,10 @@ class CommonKVReceiver(BaseKVReceiver):
             if deadline_start is None:
                 return None
             timeout_phase = "KV transfer inactivity"
+            timeout = self.kv_mgr.waiting_timeout
 
         elapsed = time.monotonic() - deadline_start
-        if elapsed < self.kv_mgr.waiting_timeout:
+        if elapsed < timeout:
             return None
         logger.warning_once(
             "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
@@ -1672,6 +1688,16 @@ class CommonKVReceiver(BaseKVReceiver):
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"during {timeout_phase}",
         )
+        if timeout_phase == "decode KV preallocation":
+            snapshot = getattr(self, "prealloc_blocked_snapshot", None)
+            logger.warning(
+                "PD_PREALLOC_TIMEOUT event=d_prealloc_timeout room=%s "
+                "elapsed_s=%.1f timeout_s=%s snapshot=%s",
+                self.bootstrap_room,
+                elapsed,
+                timeout,
+                snapshot,
+            )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.invalidate_cached_bootstrap_infos(disconnect_endpoints=True)
         if (
@@ -1687,6 +1713,8 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        self.prealloc_blocked_snapshot = None
+        self.prealloc_blocked_snapshot_at = 0.0
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_progress_time"):
             self.kv_mgr.transfer_progress_time.pop(self.bootstrap_room, None)
