@@ -672,10 +672,58 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _trace_prealloc_blocked(
         self, reason: str, decode_req: DecodeRequest, **values
     ) -> None:
-        if not envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
-            return
         now = time.monotonic()
         room = decode_req.req.bootstrap_room
+        # Preserve a low-cost rolling snapshot on the receiver itself. The
+        # receiver owns the timeout, so it can emit the exact final allocator
+        # state without relying on P-side notification or global debug logs.
+        last_snapshot_at = getattr(
+            decode_req.kv_receiver, "prealloc_blocked_snapshot_at", 0.0
+        )
+        if now - last_snapshot_at >= 1.0:
+            running_batch = getattr(self.scheduler, "running_batch", None)
+            running_reqs = (
+                len(getattr(running_batch, "reqs", []))
+                if running_batch is not None
+                else 0
+            )
+            queue_position = next(
+                (
+                    index
+                    for index, queued_req in enumerate(self.queue)
+                    if queued_req is decode_req
+                ),
+                -1,
+            )
+            decode_req.kv_receiver.prealloc_blocked_snapshot = {
+                "reason": reason,
+                "rid": decode_req.req.rid,
+                "room": room,
+                "dp_rank": getattr(
+                    getattr(self.scheduler, "ps", None), "dp_rank", None
+                ),
+                "tp_rank": getattr(self, "tp_rank", None),
+                "age_ms": round((now - decode_req.trace_created_at) * 1000, 1),
+                "input_tokens": len(decode_req.req.origin_input_ids),
+                "max_new_tokens": decode_req.req.sampling_params.max_new_tokens,
+                "prealloc_queue": len(self.queue),
+                "queue_position": queue_position,
+                "pending_queue": len(self.pending_reqs),
+                "transfer_queue": len(self.transfer_queue.queue),
+                "retracted_queue": len(self.retracted_queue),
+                "running_reqs": running_reqs,
+                "waiting_reqs": len(getattr(self.scheduler, "waiting_queue", [])),
+                "allocator_available_tokens": (
+                    self.token_to_kv_pool_allocator.available_size()
+                ),
+                "reservation_tokens": self.token_admission.reserved_tokens(),
+                "baseline_decode_reserve": self.num_reserved_decode_tokens,
+                **values,
+            }
+            decode_req.kv_receiver.prealloc_blocked_snapshot_at = now
+
+        if not envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TRACE.get():
+            return
         if now - self._bootstrap_trace_last_log.get(room, 0.0) < 5.0:
             return
         self._bootstrap_trace_last_log[room] = now
@@ -1253,6 +1301,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                     > request_swa_allocatable_tokens
                 ):
+                    self._trace_prealloc_blocked(
+                        "swa_projected_memory",
+                        decode_req,
+                        swa_required=swa_required,
+                        swa_len=swa_len,
+                        max_new_tokens=max_new_tokens,
+                        retractable_swa_tokens=retractable_swa_tokens,
+                        swa_allocatable_tokens=request_swa_allocatable_tokens,
+                    )
                     if prefix_len > 0:
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
