@@ -1677,10 +1677,17 @@ class CommonKVReceiver(BaseKVReceiver):
         elapsed = time.monotonic() - deadline_start
         if elapsed < timeout:
             return None
-        logger.warning_once(
-            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
-            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
-        )
+        if timeout_phase == "decode KV preallocation":
+            logger.warning_once(
+                "Some requests timed out waiting for decode KV preallocation. "
+                "Tune SGLANG_DISAGGREGATION_PREALLOC_TIMEOUT only if a greater "
+                "mean TTFT is acceptable."
+            )
+        else:
+            logger.warning_once(
+                "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
+                "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+            )
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
