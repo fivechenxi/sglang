@@ -867,9 +867,7 @@ class CommonKVManager(BaseKVManager):
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
         assert (
             end_layer is not None
-        ), (
-            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
-        )
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)

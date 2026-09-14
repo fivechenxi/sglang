@@ -167,9 +167,7 @@ class DecodeReqToTokenPool:
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         assert (
             len(reusing) <= 1
-        ), (
-            "only one chunked request may reuse req_pool_idx in a batch"
-        )
+        ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
@@ -1780,9 +1778,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         assert (
             req_pool_indices is not None
-        ), (
-            "req_pool_indices is full! There is a bug in memory estimation."
-        )
+        ), "req_pool_indices is full! There is a bug in memory estimation."
 
         fill_len = self._pre_alloc_fill_len(req)
         req.kv_committed_len = fill_len
@@ -2184,9 +2180,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if decode_req.req.return_sampling_mask:
             assert (
                 output_token_sampling_mask_idx is not None
-            ), (
-                "sampling mask buffer disabled on decode side"
-            )
+            ), "sampling mask buffer disabled on decode side"
             sampling_mask_len = int(output_token_sampling_mask_len[0].item())
             if sampling_mask_len < 0:
                 decode_req.req.output_token_sampling_mask.append(None)
