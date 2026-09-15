@@ -94,7 +94,9 @@ pub struct OutputObservation {
 impl OutputObservation {
     pub fn observe_json(&mut self, value: &Value) {
         self.failed |= value.get("error").is_some()
-            || value.get("object").and_then(Value::as_str) == Some("error");
+            || value.get("object").and_then(Value::as_str) == Some("error")
+            || value.get("status").and_then(Value::as_str) == Some("failed")
+            || value.get("type").and_then(Value::as_str) == Some("response.failed");
         if let Some(tokens) = exact_completion_tokens(value) {
             self.exact_tokens = Some(tokens);
         }
@@ -112,7 +114,9 @@ impl OutputObservation {
             })
             || value
                 .pointer("/meta_info/finish_reason")
-                .is_some_and(|reason| !reason.is_null());
+                .is_some_and(|reason| !reason.is_null())
+            || value.get("status").and_then(Value::as_str) == Some("completed")
+            || value.get("type").and_then(Value::as_str) == Some("response.completed");
     }
 
     pub fn observe_sse_chunk(&mut self, chunk: &[u8]) {
@@ -156,6 +160,7 @@ fn exact_completion_tokens(value: &Value) -> Option<usize> {
     value
         .pointer("/usage/completion_tokens")
         .or_else(|| value.pointer("/usage/output_tokens"))
+        .or_else(|| value.pointer("/response/usage/output_tokens"))
         .or_else(|| value.pointer("/meta_info/completion_tokens"))
         .and_then(Value::as_u64)
         .map(|tokens| tokens as usize)
@@ -164,6 +169,17 @@ fn exact_completion_tokens(value: &Value) -> Option<usize> {
 fn collect_generated_text(value: &Value, output: &mut String) {
     if let Some(text) = value.get("text").and_then(Value::as_str) {
         output.push_str(text);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_text.delta")
+        | Some("response.reasoning_text.delta")
+        | Some("response.reasoning_summary_text.delta")
+        | Some("response.function_call_arguments.delta") => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                output.push_str(delta);
+            }
+        }
+        _ => {}
     }
     let Some(choices) = value.get("choices").and_then(Value::as_array) else {
         return;
@@ -268,5 +284,23 @@ mod tests {
             }]
         }));
         assert_eq!(alias.finish(str::len), "sameanswer".len());
+
+        let mut responses = OutputObservation::default();
+        responses.observe_sse_chunk(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+        );
+        responses.observe_sse_chunk(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"output_tokens\":9}}}\n\n",
+        );
+        assert!(responses.is_completed());
+        assert_eq!(responses.finish(str::len), 9);
+
+        let mut responses_full = OutputObservation::default();
+        responses_full.observe_json(&serde_json::json!({
+            "status": "completed",
+            "usage": {"output_tokens": 7}
+        }));
+        assert!(responses_full.is_completed());
+        assert_eq!(responses_full.finish(str::len), 7);
     }
 }
