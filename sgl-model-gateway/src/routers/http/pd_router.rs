@@ -1688,7 +1688,18 @@ impl PDRouter {
     }
 
     fn build_responses_request_text(body: &ResponsesRequest) -> Option<String> {
-        let text = body.extract_text_for_routing();
+        // Responses renders `instructions` ahead of `input`. Keep both in the
+        // cache-affinity key and the Router's cold-token estimate; using input
+        // alone makes requests with different system instructions look like a
+        // cache hit even though the P worker must recompute from token zero.
+        let input = body.extract_text_for_routing();
+        let instructions = body.instructions.as_deref().filter(|text| !text.is_empty());
+        let text = match (instructions, input.is_empty()) {
+            (Some(instructions), false) => format!("{instructions}\n{input}"),
+            (Some(instructions), true) => instructions.to_string(),
+            (None, false) => input,
+            (None, true) => return None,
+        };
         if text.is_empty() {
             None
         } else {
@@ -1697,12 +1708,10 @@ impl PDRouter {
     }
 
     fn build_responses_decode_extra_text(body: &ResponsesRequest) -> Option<String> {
-        let mut parts = Vec::with_capacity(2);
-        if let Some(instructions) = body.instructions.as_deref() {
-            if !instructions.is_empty() {
-                parts.push(instructions.to_string());
-            }
-        }
+        let mut parts = Vec::with_capacity(1);
+        // `instructions` is already part of request_text above. Tool schemas
+        // are rendered into the prompt too, but the protocol's generic text
+        // extractor deliberately omits them, so account for them separately.
         if let Some(tools) = body.tools.as_ref() {
             if let Ok(serialized) = serde_json::to_string(tools) {
                 parts.push(serialized);
@@ -2610,6 +2619,30 @@ impl RouterTrait for PDRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Stateful Responses operations require the same response store to be
+        // reachable across requests. PD workers currently keep that store in
+        // each D process, while this router has no response-id -> D affinity.
+        // Reject these modes explicitly instead of accepting work that cannot
+        // subsequently be retrieved or continued.
+        if body.background.unwrap_or(false) {
+            return error::bad_request(
+                "unsupported_parameter",
+                "Responses background mode is not supported by the PD Router.",
+            );
+        }
+        if body.previous_response_id.is_some() {
+            return error::bad_request(
+                "unsupported_parameter",
+                "Responses previous_response_id is not supported by the PD Router.",
+            );
+        }
+        if body.conversation.is_some() {
+            return error::bad_request(
+                "unsupported_parameter",
+                "Responses conversation mode is not supported by the PD Router.",
+            );
+        }
+
         let context = PDRequestContext {
             route: "/v1/responses",
             batch_size: None,
@@ -2920,12 +2953,45 @@ mod tests {
 
         assert_eq!(
             PDRouter::build_responses_request_text(&body).as_deref(),
-            Some("hello from responses")
+            Some("unique-system-instruction\nhello from responses")
         );
         let decode_extra = PDRouter::build_responses_decode_extra_text(&body)
-            .expect("instructions and tool schema must count toward D KV admission");
-        assert!(decode_extra.contains("unique-system-instruction"));
+            .expect("tool schema must count toward D KV admission");
+        assert!(!decode_extra.contains("unique-system-instruction"));
         assert!(decode_extra.contains("unique-responses-tool"));
+    }
+
+    #[tokio::test]
+    async fn test_responses_rejects_stateful_modes_without_decode_affinity() {
+        let router = create_test_pd_router();
+
+        for unsupported in [
+            json!({
+                "model": "test-model",
+                "input": "hello",
+                "background": true
+            }),
+            json!({
+                "model": "test-model",
+                "input": "hello",
+                "previous_response_id": "resp_previous"
+            }),
+            json!({
+                "model": "test-model",
+                "input": "hello",
+                "conversation": "conv_previous"
+            }),
+        ] {
+            let body: ResponsesRequest =
+                serde_json::from_value(unsupported).expect("valid Responses request");
+            let response = router.route_responses(None, &body, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"]["code"], "unsupported_parameter");
+        }
     }
 
     #[tokio::test]
@@ -3534,6 +3600,53 @@ mod tests {
         assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
         assert!(matches!(prefill_request.body, Cow::Owned(_)));
         assert!(matches!(decode_request.body, Cow::Borrowed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_responses_keeps_decode_mode_and_uses_internal_prefill_stream() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "model": "model",
+            "input": "hello",
+            "instructions": "be concise",
+            "stream": false,
+            "store": false,
+            "bootstrap_host": "prefill",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/responses", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            prefill_request.endpoint_url,
+            "http://prefill:30000/v1/responses"
+        );
+        assert_eq!(prefill_request.body["stream"], true);
+        assert_eq!(prefill_request.body["pd_prefill_admission_ack"], true);
+        assert_eq!(prefill_request.body["input"], "hello");
+        assert_eq!(prefill_request.body["instructions"], "be concise");
+
+        assert_eq!(
+            decode_request.endpoint_url,
+            "http://decode:30001/v1/responses"
+        );
+        assert_eq!(decode_request.body["stream"], false);
+        assert!(decode_request
+            .body
+            .get("pd_prefill_admission_ack")
+            .is_none());
+        assert_eq!(decode_request.body["bootstrap_room"], 1234);
     }
 
     #[test]

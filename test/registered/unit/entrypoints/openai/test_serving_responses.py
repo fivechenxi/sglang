@@ -130,6 +130,37 @@ class PDPrefillStreamTestCase(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 429)
         self.assertEqual(str(raised.exception), "cold tier full")
 
+    def test_create_responses_returns_400_for_validation_before_ack(self):
+        serving = make_serving()
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="rendered prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+        )
+
+        async def fake_generate(*args, **kwargs):
+            raise ValueError("context length exceeded")
+            yield  # pragma: no cover
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            stream=True,
+            store=False,
+            pd_prefill_admission_ack=True,
+        )
+
+        result = asyncio.run(serving.create_responses(request))
+        self.assertEqual(result.status_code, 400)
+        self.assertIn(b"context length exceeded", result.body)
+
 
 class InputMessageConstructionTestCase(unittest.TestCase):
     def test_previous_response_replays_assistant_text_not_instructions(self):
