@@ -410,6 +410,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         err_type="PrefillAdmissionRejected",
                         status_code=e.status_code,
                     )
+                except ValueError as e:
+                    # Match the Chat Completions streaming path: tokenizer and
+                    # context validation still runs lazily on the first engine
+                    # iteration, so convert it before HTTP 200 is committed.
+                    return self.create_error_response(str(e))
 
                 async def prepend_first_chunk():
                     yield first_chunk
