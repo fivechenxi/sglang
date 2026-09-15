@@ -9,6 +9,46 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class ResponsesRequestTestCase(unittest.TestCase):
+    def test_pd_internal_fields_are_preserved(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            stream=True,
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=42,
+            pd_prefill_admission_ack=True,
+            decode_token_reservation_id="lease-1",
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+            store=False,
+        )
+
+        self.assertEqual(request.bootstrap_room, 42)
+        self.assertTrue(request.pd_prefill_admission_ack)
+        self.assertEqual(request.decode_token_reservation_id, "lease-1")
+        self.assertEqual(request.routed_dp_rank, 3)
+        self.assertEqual(request.disagg_prefill_dp_rank, 2)
+
+    def test_legacy_dp_rank_wire_field_is_normalized(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            data_parallel_rank=3,
+            store=False,
+        )
+        self.assertEqual(request.data_parallel_rank, 3)
+        self.assertEqual(request.routed_dp_rank, 3)
+
+        explicit = ResponsesRequest(
+            model="x",
+            input="hi",
+            data_parallel_rank=3,
+            routed_dp_rank=1,
+            store=False,
+        )
+        self.assertEqual(explicit.routed_dp_rank, 1)
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",
