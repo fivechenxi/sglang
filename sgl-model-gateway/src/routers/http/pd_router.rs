@@ -48,6 +48,7 @@ use crate::{
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::RerankRequest,
+        responses::ResponsesRequest,
     },
     routers::{
         error,
@@ -1686,6 +1687,30 @@ impl PDRouter {
         }
     }
 
+    fn build_responses_request_text(body: &ResponsesRequest) -> Option<String> {
+        let text = body.extract_text_for_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn build_responses_decode_extra_text(body: &ResponsesRequest) -> Option<String> {
+        let mut parts = Vec::with_capacity(2);
+        if let Some(instructions) = body.instructions.as_deref() {
+            if !instructions.is_empty() {
+                parts.push(instructions.to_string());
+            }
+        }
+        if let Some(tools) = body.tools.as_ref() {
+            if let Ok(serialized) = serde_json::to_string(tools) {
+                parts.push(serialized);
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -2579,6 +2604,36 @@ impl RouterTrait for PDRouter {
         self.execute_dual_dispatch(headers, body, context).await
     }
 
+    async fn route_responses(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let context = PDRequestContext {
+            route: "/v1/responses",
+            batch_size: None,
+            is_stream: body.stream.unwrap_or(false),
+            // Responses logprobs are output events produced by D. Unlike the
+            // legacy Chat path, there is no prompt-logprob array to merge from P.
+            return_logprob: false,
+            request_text: if self.policies_need_request_text() {
+                Self::build_responses_request_text(body)
+            } else {
+                None
+            },
+            decode_extra_text: Self::build_responses_decode_extra_text(body),
+            input_tokens: None,
+            input_multiplier: 1,
+            output_multiplier: 1,
+            max_output_tokens: body.max_output_tokens.unwrap_or(4096) as usize,
+            model_id,
+            headers: headers.cloned(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
@@ -2847,6 +2902,32 @@ mod tests {
         assert!(decode_extra.contains("unique-tool-schema-marker"));
     }
 
+    #[test]
+    fn test_responses_request_text_and_decode_extras() {
+        let body: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "instructions": "unique-system-instruction",
+            "input": "hello from responses",
+            "max_output_tokens": 64,
+            "tools": [{
+                "type": "function",
+                "name": "lookup_inventory",
+                "description": "unique-responses-tool",
+                "parameters": {"type": "object"}
+            }]
+        }))
+        .expect("valid Responses request");
+
+        assert_eq!(
+            PDRouter::build_responses_request_text(&body).as_deref(),
+            Some("hello from responses")
+        );
+        let decode_extra = PDRouter::build_responses_decode_extra_text(&body)
+            .expect("instructions and tool schema must count toward D KV admission");
+        assert!(decode_extra.contains("unique-system-instruction"));
+        assert!(decode_extra.contains("unique-responses-tool"));
+    }
+
     #[tokio::test]
     async fn test_select_healthy_prefill_worker() {
         let router = create_test_pd_router();
@@ -2977,6 +3058,47 @@ mod tests {
             "local admission 429 must bypass the generic 429 retry policy"
         );
 
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "prefill_admission_limited");
+    }
+
+    #[tokio::test]
+    async fn test_responses_uses_pd_admission_instead_of_default_501() {
+        let mut router = create_test_pd_router();
+        router.prefill_admission = PrefillAdmissionController::new(1, 1, 0, 1);
+        router.prefill_admission_chars_per_token = 1.0;
+
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:9".to_string(),
+                WorkerType::Prefill {
+                    bootstrap_port: None,
+                },
+                true,
+            )));
+        router
+            .worker_registry
+            .register(Arc::from(create_test_worker(
+                "http://127.0.0.1:10".to_string(),
+                WorkerType::Decode,
+                true,
+            )));
+
+        let body: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "this responses request is cold",
+            "max_output_tokens": 1,
+            "stream": true,
+            "store": false
+        }))
+        .expect("valid Responses request");
+
+        let response = router.route_responses(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
