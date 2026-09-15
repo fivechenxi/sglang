@@ -2580,9 +2580,7 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        let worker_body = Self::build_stateless_responses_request(body);
-        self.execute_dual_dispatch(headers, &worker_body, context)
-            .await
+        self.execute_dual_dispatch(headers, body, context).await
     }
 
     #[allow(deprecated)]
@@ -2676,7 +2674,9 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let worker_body = Self::build_stateless_responses_request(body);
+        self.execute_dual_dispatch(headers, &worker_body, context)
+            .await
     }
 
     async fn route_completion(
