@@ -1720,6 +1720,16 @@ impl PDRouter {
         (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
+    fn build_stateless_responses_request(body: &ResponsesRequest) -> ResponsesRequest {
+        let mut worker_body = body.clone();
+        // SGLang's Responses store is process-local and has no TTL. The PD
+        // Router cannot route a later response id back to the D process that
+        // created it, so retaining these unreachable entries would leak D host
+        // memory (the Responses protocol defaults store to true).
+        worker_body.store = Some(false);
+        worker_body
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -2570,7 +2580,9 @@ impl RouterTrait for PDRouter {
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let worker_body = Self::build_stateless_responses_request(body);
+        self.execute_dual_dispatch(headers, &worker_body, context)
+            .await
     }
 
     #[allow(deprecated)]
@@ -2992,6 +3004,20 @@ mod tests {
             let payload: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(payload["error"]["code"], "unsupported_parameter");
         }
+    }
+
+    #[test]
+    fn test_responses_worker_request_disables_unreachable_process_local_store() {
+        let body: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello",
+            "store": true
+        }))
+        .expect("valid Responses request");
+
+        let worker_body = PDRouter::build_stateless_responses_request(&body);
+        assert_eq!(body.store, Some(true));
+        assert_eq!(worker_body.store, Some(false));
     }
 
     #[tokio::test]
