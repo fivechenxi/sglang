@@ -16,11 +16,119 @@ from sglang.srt.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ResponsesRequest,
 )
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
+from sglang.srt.entrypoints.openai.serving_responses import (
+    OpenAIServingResponses,
+    _PrefillAdmissionRejected,
+)
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class PDPrefillStreamTestCase(unittest.TestCase):
+    def test_create_responses_propagates_pd_fields_before_ack(self):
+        serving = make_serving()
+        captured = {}
+        serving._process_messages = Mock(
+            return_value=MessageProcessingResult(
+                prompt="rendered prompt",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+        )
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["adapted_request"] = adapted_request
+            yield {"pd_prefill_admitted": True}
+            yield {"text": "", "meta_info": {"cached_tokens": 128}}
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="hello",
+            stream=True,
+            store=False,
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=42,
+            pd_prefill_admission_ack=True,
+            decode_token_reservation_id="lease-1",
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+
+        async def create_and_collect():
+            result = await serving.create_responses(request)
+            return [chunk async for chunk in result]
+
+        chunks = asyncio.run(create_and_collect())
+        adapted = captured["adapted_request"]
+        self.assertEqual(adapted.bootstrap_host, "prefill.internal")
+        self.assertEqual(adapted.bootstrap_port, 8998)
+        self.assertEqual(adapted.bootstrap_room, 42)
+        self.assertTrue(adapted.pd_prefill_admission_ack)
+        self.assertEqual(adapted.decode_token_reservation_id, "lease-1")
+        self.assertEqual(adapted.routed_dp_rank, 3)
+        self.assertEqual(adapted.disagg_prefill_dp_rank, 2)
+        self.assertEqual(chunks[0], ": pd-prefill-admitted\n\n")
+
+    def test_internal_stream_preserves_ack_and_scheduler_metadata(self):
+        serving = make_serving()
+
+        async def result_generator():
+            yield {"pd_prefill_admitted": True}
+            yield {"text": "", "meta_info": {"cached_tokens": 128}}
+
+        async def collect():
+            return [
+                chunk
+                async for chunk in serving._responses_pd_prefill_stream_generator(
+                    result_generator()
+                )
+            ]
+
+        chunks = asyncio.run(collect())
+        self.assertEqual(chunks[0], ": pd-prefill-admitted\n\n")
+        self.assertIn('"cached_tokens":128', chunks[1])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def test_internal_stream_raises_admission_status_before_ack(self):
+        serving = make_serving()
+
+        async def result_generator():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": 429,
+                        "message": "cold tier full",
+                    }
+                },
+            }
+
+        async def consume_first():
+            generator = serving._responses_pd_prefill_stream_generator(
+                result_generator()
+            )
+            return await generator.__anext__()
+
+        with self.assertRaises(_PrefillAdmissionRejected) as raised:
+            asyncio.run(consume_first())
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(str(raised.exception), "cold tier full")
 
 
 class InputMessageConstructionTestCase(unittest.TestCase):
