@@ -30,6 +30,25 @@ class ResponsesRequestTestCase(unittest.TestCase):
         self.assertEqual(request.routed_dp_rank, 3)
         self.assertEqual(request.disagg_prefill_dp_rank, 2)
 
+    def test_legacy_dp_rank_wire_field_is_normalized(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            data_parallel_rank=3,
+            store=False,
+        )
+        self.assertEqual(request.data_parallel_rank, 3)
+        self.assertEqual(request.routed_dp_rank, 3)
+
+        explicit = ResponsesRequest(
+            model="x",
+            input="hi",
+            data_parallel_rank=3,
+            routed_dp_rank=1,
+            store=False,
+        )
+        self.assertEqual(explicit.routed_dp_rank, 1)
+
     def test_function_tool_accepted(self):
         request = ResponsesRequest(
             model="x",

@@ -65,7 +65,7 @@ class PDPrefillStreamTestCase(unittest.TestCase):
             bootstrap_room=42,
             pd_prefill_admission_ack=True,
             decode_token_reservation_id="lease-1",
-            routed_dp_rank=3,
+            data_parallel_rank=3,
             disagg_prefill_dp_rank=2,
         )
 
