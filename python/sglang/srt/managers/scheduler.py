@@ -69,6 +69,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -2668,6 +2669,28 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if is_aborted(req):
+                # The request can already be aborted before it reaches the queue.
+                # Input length validation (validate_input_length) calls
+                # set_finish_with_abort() and still enqueues the request, and
+                # set_finish_with_abort() collapses origin_input_ids down to a
+                # single token so the long prefill is skipped.
+                #
+                # Reserving tier admission here would therefore evaluate a
+                # 1-token request: neither the cold-token budget nor the
+                # bootstrap queue's own KV-capacity check can reject it, even
+                # though the request as submitted was far too long. The
+                # admission ACK would then make the router start a decode
+                # instance that registers for the ORIGINAL length, while this
+                # prefill worker only ever holds one token. That mismatch is what
+                # lets the decode side accept the shortened transfer and read KV
+                # blocks owned by other requests.
+                #
+                # Retire the request and report the terminal abort instead of
+                # reserving admission, ACKing the router and entering bootstrap.
+                self._retire_aborted_prefill_result(req)
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
             if not self._reserve_prefill_tier_admission(req):
                 return
             if getattr(req, "pd_prefill_admission_ack", False) is True:
