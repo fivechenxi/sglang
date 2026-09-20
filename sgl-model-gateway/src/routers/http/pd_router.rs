@@ -18,6 +18,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
+use uuid::Uuid;
 
 use super::{
     decode_admission::{
@@ -580,6 +581,26 @@ impl PDRouter {
         Ok(original)
     }
 
+    fn ensure_responses_request_id(
+        mut request: Value,
+        generated_request_id: &str,
+    ) -> Result<Value, String> {
+        let object = request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        let has_valid_request_id = object
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|request_id| !request_id.is_empty());
+        if !has_valid_request_id {
+            object.insert(
+                "request_id".to_string(),
+                Value::String(generated_request_id.to_string()),
+            );
+        }
+        Ok(request)
+    }
+
     fn inject_prefill_dp_rank_for_decode<'a>(
         decode_request: Cow<'a, Value>,
         prefill_worker: &dyn Worker,
@@ -669,6 +690,14 @@ impl PDRouter {
         let route = context.route;
         let model = context.model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
+        // The public Rust Responses protocol intentionally contains only
+        // OpenAI fields, while SGLang's P/D transport also needs one stable
+        // internal request ID. Without injecting it here, P and D each create
+        // a different Python-side default `resp_*` ID and the P bootstrap can
+        // never match the D registration. Keep it outside the retry closure so
+        // every retry and both workers share the same ID.
+        let responses_request_id =
+            (route == "/v1/responses").then(|| format!("resp_{}", Uuid::new_v4().simple()));
 
         // Record request start (Layer 2)
         Metrics::record_router_request(
@@ -693,6 +722,7 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let rejection_seen_by_attempt = Arc::clone(&rejection_seen_by_attempt);
                     let context = context.clone();
+                    let responses_request_id = responses_request_id.clone();
                     async move {
                         let mut selected = match self
                             .select_pd_pair(
@@ -747,6 +777,14 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+
+                        if let Some(request_id) = responses_request_id.as_deref() {
+                            json_request =
+                                match Self::ensure_responses_request_id(json_request, request_id) {
+                                    Ok(value) => value,
+                                    Err(e) => return Self::handle_serialization_error(e),
+                                };
+                        }
 
                         if let Some(guard) = remote_decode_admission_guard.as_ref() {
                             let Some(object) = json_request.as_object_mut() else {
@@ -3020,6 +3058,47 @@ mod tests {
         assert_eq!(worker_body.store, Some(false));
     }
 
+    #[test]
+    fn test_responses_internal_request_id_is_stable_and_preserves_explicit_value() {
+        let generated = "resp_router_stable";
+        let first = PDRouter::ensure_responses_request_id(
+            json!({"model": "test-model", "input": "hello"}),
+            generated,
+        )
+        .unwrap();
+        let retry = PDRouter::ensure_responses_request_id(
+            json!({"model": "test-model", "input": "hello"}),
+            generated,
+        )
+        .unwrap();
+        assert_eq!(first["request_id"], generated);
+        assert_eq!(retry["request_id"], generated);
+
+        let explicit = PDRouter::ensure_responses_request_id(
+            json!({
+                "model": "test-model",
+                "input": "hello",
+                "request_id": "resp_explicit"
+            }),
+            generated,
+        )
+        .unwrap();
+        assert_eq!(explicit["request_id"], "resp_explicit");
+
+        for invalid in [Value::Null, Value::String(String::new())] {
+            let repaired = PDRouter::ensure_responses_request_id(
+                json!({
+                    "model": "test-model",
+                    "input": "hello",
+                    "request_id": invalid,
+                }),
+                generated,
+            )
+            .unwrap();
+            assert_eq!(repaired["request_id"], generated);
+        }
+    }
+
     #[tokio::test]
     async fn test_select_healthy_prefill_worker() {
         let router = create_test_pd_router();
@@ -3638,16 +3717,20 @@ mod tests {
         let decode = BasicWorkerBuilder::new("http://decode:30001")
             .worker_type(WorkerType::Decode)
             .build();
-        let request = json!({
-            "model": "model",
-            "input": "hello",
-            "instructions": "be concise",
-            "stream": false,
-            "store": false,
-            "bootstrap_host": "prefill",
-            "bootstrap_port": 8998,
-            "bootstrap_room": 1234,
-        });
+        let request = PDRouter::ensure_responses_request_id(
+            json!({
+                "model": "model",
+                "input": "hello",
+                "instructions": "be concise",
+                "stream": false,
+                "store": false,
+                "bootstrap_host": "prefill",
+                "bootstrap_port": 8998,
+                "bootstrap_room": 1234,
+            }),
+            "resp_shared_pd",
+        )
+        .unwrap();
 
         let (prefill_request, decode_request) =
             PDRouter::prepare_pd_worker_requests("/v1/responses", &request, &prefill, &decode)
@@ -3662,12 +3745,14 @@ mod tests {
         assert_eq!(prefill_request.body["pd_prefill_admission_ack"], true);
         assert_eq!(prefill_request.body["input"], "hello");
         assert_eq!(prefill_request.body["instructions"], "be concise");
+        assert_eq!(prefill_request.body["request_id"], "resp_shared_pd");
 
         assert_eq!(
             decode_request.endpoint_url,
             "http://decode:30001/v1/responses"
         );
         assert_eq!(decode_request.body["stream"], false);
+        assert_eq!(decode_request.body["request_id"], "resp_shared_pd");
         assert!(decode_request
             .body
             .get("pd_prefill_admission_ack")
