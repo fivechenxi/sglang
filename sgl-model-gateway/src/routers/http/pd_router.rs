@@ -2173,6 +2173,53 @@ impl PDRouter {
         response
     }
 
+    /// SGLang reports a request that exceeds one P-DP's physical token pool as
+    /// HTTP 400 even though the request is valid for the model. In a routed PD
+    /// deployment this is a capacity rejection: callers must be allowed to
+    /// retry another backend. Keep ordinary malformed/unsupported requests as
+    /// HTTP 400 by requiring both the structured SGLang error type and the
+    /// specific physical-length diagnostic.
+    fn is_prefill_physical_capacity_rejection(error_body: &str) -> bool {
+        let Ok(error) = serde_json::from_str::<Value>(error_body) else {
+            return false;
+        };
+
+        if error.get("type").and_then(Value::as_str) != Some("PrefillAdmissionRejected") {
+            return false;
+        }
+
+        let Some(message) = error.get("message").and_then(Value::as_str) else {
+            return false;
+        };
+
+        message.contains("Input length (")
+            && message.contains("exceeds the maximum allowed length (")
+    }
+
+    fn prefill_error_response(&self, status: StatusCode, error_body: String) -> Response {
+        let message = format!("Prefill server error ({}): {}", status, error_body);
+        match status {
+            StatusCode::BAD_REQUEST
+                if Self::is_prefill_physical_capacity_rejection(&error_body) =>
+            {
+                self.upstream_prefill_admission_rejected_response(message)
+            }
+            StatusCode::BAD_REQUEST => error::bad_request("prefill_bad_request", message),
+            StatusCode::NOT_FOUND => error::not_found("prefill_not_found", message),
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                error::internal_error("prefill_internal_error", message)
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                error::service_unavailable("prefill_unavailable", message)
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                self.upstream_prefill_admission_rejected_response(message)
+            }
+            StatusCode::BAD_GATEWAY => error::bad_gateway("prefill_bad_gateway", message),
+            _ => error::internal_error("prefill_error", message),
+        }
+    }
+
     fn preserve_upstream_prefill_admission_response(
         &self,
         response: Response,
@@ -2231,37 +2278,7 @@ impl PDRouter {
                 prefill_url, prefill_status, error_msg
             );
 
-            // Map prefill_status to appropriate error function
-            let error_response = match prefill_status {
-                StatusCode::BAD_REQUEST => error::bad_request(
-                    "prefill_bad_request",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::NOT_FOUND => error::not_found(
-                    "prefill_not_found",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                    "prefill_internal_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                    "prefill_unavailable",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::TOO_MANY_REQUESTS => self.upstream_prefill_admission_rejected_response(
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                StatusCode::BAD_GATEWAY => error::bad_gateway(
-                    "prefill_bad_gateway",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-                _ => error::internal_error(
-                    "prefill_error",
-                    format!("Prefill server error ({}): {}", prefill_status, error_msg),
-                ),
-            };
-            return Err(error_response);
+            return Err(self.prefill_error_response(prefill_status, error_msg));
         }
 
         // The P HTTP status is committed at the admission ACK. Bootstrap and KV
@@ -3910,6 +3927,64 @@ mod tests {
         // existing retry behavior.
         let generic_429 = StatusCode::TOO_MANY_REQUESTS.into_response();
         assert!(PDRouter::should_retry_response(&generic_429));
+    }
+
+    #[test]
+    fn test_identifies_structured_prefill_physical_capacity_rejection() {
+        let router = create_test_pd_router();
+        let body = json!({
+            "object": "error",
+            "message": "Input length (150013 tokens) exceeds the maximum allowed length (138106 tokens)",
+            "type": "PrefillAdmissionRejected",
+            "param": null,
+            "code": 400
+        })
+        .to_string();
+
+        assert!(PDRouter::is_prefill_physical_capacity_rejection(&body));
+
+        let response = router.prefill_error_response(StatusCode::BAD_REQUEST, body);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
+        assert!(response
+            .extensions()
+            .get::<UpstreamPrefillAdmissionRejected>()
+            .is_some());
+        assert!(!PDRouter::should_retry_response(&response));
+    }
+
+    #[test]
+    fn test_does_not_treat_ordinary_prefill_bad_request_as_capacity_rejection() {
+        let router = create_test_pd_router();
+        let invalid_parameter = json!({
+            "object": "error",
+            "message": "top_p must be between 0 and 1 (got 2)",
+            "type": "InvalidRequestError",
+            "param": "top_p",
+            "code": 400
+        })
+        .to_string();
+        let misleading_message = json!({
+            "object": "error",
+            "message": "Input length (150013 tokens) exceeds the maximum allowed length (138106 tokens)",
+            "type": "InvalidRequestError",
+            "param": null,
+            "code": 400
+        })
+        .to_string();
+
+        assert!(!PDRouter::is_prefill_physical_capacity_rejection(
+            &invalid_parameter
+        ));
+        assert!(!PDRouter::is_prefill_physical_capacity_rejection(
+            &misleading_message
+        ));
+        assert!(!PDRouter::is_prefill_physical_capacity_rejection(
+            "not JSON"
+        ));
+
+        let response = router.prefill_error_response(StatusCode::BAD_REQUEST, invalid_parameter);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
