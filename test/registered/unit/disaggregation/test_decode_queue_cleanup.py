@@ -36,6 +36,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="abort-prealloc",
             finished_reason=FINISH_ABORT("aborted"),
             return_logprob=False,
+            decode_token_reservation_id=None,
         )
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
 
@@ -83,6 +84,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="abort-shared",
             finished_reason=FINISH_ABORT("aborted"),
             return_logprob=False,
+            decode_token_reservation_id=None,
         )
         decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
 
