@@ -790,15 +790,20 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
-                    self.optimistic_release_and_requeue(req)
+                # Abort is terminal. An optimistic bootstrap failure can race
+                # with an already-running chunk, but that must never turn an
+                # aborted request back into a live request through the normal
+                # release/requeue path. Wait for the last in-flight chunk to
+                # become safe, then retire and emit the abort exactly once.
+                if is_aborted(req):
+                    if not still_chunking and self._retire_aborted_prefill_result(req):
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                # Optimistic bootstrap can fail while this overlapped chunk is
-                # already running. Drop aborted chunks instead of sending KV.
-                if is_aborted(req):
+                if req.pending_bootstrap and not still_chunking:
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -1002,11 +1007,10 @@ class SchedulerDisaggregationPrefillMixin:
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release resources held by a request aborted during prefill.
 
-        Returns True when this call retired the request, and False when nothing
-        was left to retire: either the request never allocated anything, or an
-        earlier failure path (for example ``handle_bootstrap_failure``) already
-        released its KV blocks, metadata buffer and Mamba state. In that case
-        the delayed batch result must simply be ignored.
+        Returns True when this call owns the terminal abort and False for a
+        delayed result that was already retired. A freshly staged abort can own
+        the terminal result even before it allocates memory; this is the input
+        validation path that must reject before admission ACK/bootstrap.
 
         Note the abort may be staged either in ``to_finish`` (via
         ``set_finish_with_abort``) or already promoted to ``finished_reason``
@@ -1017,12 +1021,8 @@ class SchedulerDisaggregationPrefillMixin:
         buffer and hybrid Mamba state until the next idle invariant check, and
         the completed prefill result is still pushed into the transfer queue.
         """
-        # Promote the abort staged in to_finish (set_finish_with_abort) into
-        # finished_reason first: the streamed output must carry the terminal
-        # reason even when nothing was allocated yet, otherwise the admission
-        # ACK path (pd_prefill_admission_ack) never sees the rejection and the
-        # router keeps waiting for an admission decision.
-        if req.to_finish is not None and not req.finished():
+        has_staged_abort = req.to_finish is not None and not req.finished()
+        if has_staged_abort:
             req.update_finish_state()
 
         owns_resources = (
@@ -1030,7 +1030,10 @@ class SchedulerDisaggregationPrefillMixin:
             or req.mamba_pool_idx is not None
             or req.metadata_buffer_index >= 0
         )
-        if not owns_resources:
+        has_bootstrap_state = req.pending_bootstrap
+        if not (has_staged_abort or owns_resources or has_bootstrap_state):
+            # A previous failure path already emitted the terminal result and
+            # released both local ownership and protocol state.
             return False
 
         sender = req.disagg_kv_sender

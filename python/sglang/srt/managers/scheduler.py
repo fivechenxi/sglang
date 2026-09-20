@@ -2681,8 +2681,8 @@ class Scheduler(
                 #
                 # Retire the request and report the terminal abort instead of
                 # reserving admission, ACKing the router and entering bootstrap.
-                self._retire_aborted_prefill_result(req)
-                self.output_streamer.stream_output([req], req.return_logprob)
+                if self._retire_aborted_prefill_result(req):
+                    self.output_streamer.stream_output([req], req.return_logprob)
                 return
             if not self._reserve_prefill_tier_admission(req):
                 return
