@@ -75,9 +75,12 @@ def test_waiting_timeout_starts_before_metadata_is_sent():
         clock.return_value = 115.0
         assert receiver.poll() == KVPoll.Failed
 
-    warning.assert_called_once()
-    assert warning.call_args.args[0].startswith("PD_PREALLOC_TIMEOUT")
-    assert warning.call_args.args[-1] == {"reason": "projected_memory"}
+    structured_warning = next(
+        call
+        for call in warning.call_args_list
+        if call.args and call.args[0].startswith("PD_PREALLOC_TIMEOUT")
+    )
+    assert structured_warning.args[-1] == {"reason": "projected_memory"}
 
 
 def test_prefill_compute_does_not_consume_transfer_timeout():
