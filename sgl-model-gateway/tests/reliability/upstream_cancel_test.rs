@@ -2552,16 +2552,15 @@ mod upstream_cancel_tests {
                 ..Default::default()
             })
             .build_unchecked();
+        let mut delayed_decode = TestWorkerConfig::decode(decode_port);
+        delayed_decode.response_delay_ms = 5_000;
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
                 TestWorkerConfig::prefill(prefill_port),
                 // Hold D response headers long enough that the test detects the
                 // old behaviour of waiting only for D.
-                TestWorkerConfig {
-                    response_delay_ms: 5_000,
-                    ..TestWorkerConfig::decode(decode_port)
-                },
+                delayed_decode,
             ],
         )
         .await;
