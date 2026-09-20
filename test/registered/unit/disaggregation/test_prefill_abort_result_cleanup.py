@@ -5,7 +5,9 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -99,9 +101,7 @@ def _free_req(req, tree_cache, is_insert=True):
 
 
 class TestPrefillAbortResultCleanup(unittest.TestCase):
-    @patch(
-        "sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req
-    )
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_aborted_final_result_retires_and_skips_kv(self, release_kv_cache):
         scheduler = _Scheduler()
         req = _FakeReq(to_finish=FINISH_ABORT(message="input too long"))
@@ -123,9 +123,7 @@ class TestPrefillAbortResultCleanup(unittest.TestCase):
         self.assertIsNone(req.to_finish)
         self.assertEqual(req.metadata_buffer_index, -1)
 
-    @patch(
-        "sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req
-    )
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_delayed_result_ignores_already_retired_request(self, release_kv_cache):
         scheduler = _Scheduler()
         req = _FakeReq(to_finish=FINISH_ABORT(message="input too long"))
@@ -141,9 +139,7 @@ class TestPrefillAbortResultCleanup(unittest.TestCase):
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.send_kv_chunk.assert_not_called()
 
-    @patch(
-        "sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req
-    )
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_already_finished_abort_without_resources_is_ignored(
         self, release_kv_cache
     ):
@@ -158,9 +154,7 @@ class TestPrefillAbortResultCleanup(unittest.TestCase):
         scheduler.send_kv_chunk.assert_not_called()
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
 
-    @patch(
-        "sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req
-    )
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_grammar_rejection_retires_before_transfer(self, release_kv_cache):
         scheduler = _Scheduler()
         req = _FakeReq(grammar=Mock())
@@ -178,9 +172,7 @@ class TestPrefillAbortResultCleanup(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
 
-    @patch(
-        "sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req
-    )
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_sender_abort_failure_does_not_skip_local_cleanup(self, release_kv_cache):
         scheduler = _Scheduler()
         req = _FakeReq(to_finish=FINISH_ABORT(message="input too long"))
@@ -195,6 +187,103 @@ class TestPrefillAbortResultCleanup(unittest.TestCase):
         scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
         scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
         self.assertTrue(req.finished())
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_aborted_middle_result_is_never_optimistically_requeued(
+        self, release_kv_cache
+    ):
+        scheduler = _Scheduler()
+        scheduler.optimistic_release_and_requeue = Mock()
+        req = _FakeReq(
+            inflight_middle_chunks=1,
+            to_finish=FINISH_ABORT(message="bootstrap failed"),
+        )
+        req.pending_bootstrap = True
+        req.extend_range = SimpleNamespace(end=32)
+        batch = _batch(req)
+
+        scheduler.process_batch_result_disagg_prefill(batch, _result(batch))
+
+        scheduler.optimistic_release_and_requeue.assert_not_called()
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    def test_aborted_middle_result_waits_for_last_inflight_chunk(
+        self, release_kv_cache
+    ):
+        scheduler = _Scheduler()
+        scheduler.optimistic_release_and_requeue = Mock()
+        req = _FakeReq(
+            inflight_middle_chunks=1,
+            to_finish=FINISH_ABORT(message="bootstrap failed"),
+        )
+        req.pending_bootstrap = True
+        req.extend_range = SimpleNamespace(end=len(req.origin_input_ids))
+        batch = _batch(req)
+
+        scheduler.process_batch_result_disagg_prefill(batch, _result(batch))
+
+        release_kv_cache.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_not_called()
+        scheduler.optimistic_release_and_requeue.assert_not_called()
+
+        scheduler.process_batch_result_disagg_prefill(batch, _result(batch))
+
+        release_kv_cache.assert_called_once_with(
+            req, scheduler.tree_cache, is_insert=False
+        )
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        scheduler.optimistic_release_and_requeue.assert_not_called()
+
+    def test_mamba_only_allocation_is_released(self):
+        scheduler = _Scheduler()
+        scheduler.tree_cache.supports_mamba.return_value = True
+        req = _FakeReq(
+            allocated=False,
+            to_finish=FINISH_ABORT(message="input too long"),
+        )
+        req.mamba_pool_idx = torch.tensor([3])
+        batch = _batch(req)
+
+        scheduler.process_batch_result_disagg_prefill(batch, _result(batch))
+
+        scheduler.tree_cache.req_to_token_pool.mamba_allocator.free.assert_called_once()
+        self.assertIsNone(req.mamba_pool_idx)
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+
+    @patch("sglang.srt.disaggregation.prefill.release_kv_cache")
+    def test_prequeue_abort_skips_admission_ack_prefetch_and_bootstrap(
+        self, release_kv_cache
+    ):
+        scheduler = _Scheduler()
+        scheduler._set_or_validate_priority = Mock(return_value=True)
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler._reserve_prefill_tier_admission = Mock(return_value=True)
+        scheduler._prefetch_kvcache = Mock()
+        scheduler.disagg_prefill_bootstrap_queue = Mock()
+        scheduler.ipc_channels = Mock()
+        scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
+        req = _FakeReq(
+            allocated=False,
+            to_finish=FINISH_ABORT(message="input too long"),
+        )
+
+        Scheduler._add_request_to_queue(scheduler, req)
+
+        scheduler._reserve_prefill_tier_admission.assert_not_called()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler._prefetch_kvcache.assert_not_called()
+        scheduler.disagg_prefill_bootstrap_queue.add.assert_not_called()
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        release_kv_cache.assert_not_called()
+
+        # A delayed duplicate reaches the guard after local state has already
+        # been retired. It must not emit a second terminal response.
+        Scheduler._add_request_to_queue(scheduler, req)
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
 
 
 if __name__ == "__main__":
