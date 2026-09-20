@@ -671,6 +671,7 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output = None
 
         logprob_pt = 0
+        aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
         draft_input = result.next_draft_input
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -695,6 +696,20 @@ class SchedulerDisaggregationPrefillMixin:
             if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
+                # A request can already be aborted at this point, e.g. an input
+                # length validation failure calls set_finish_with_abort(), which
+                # collapses origin_input_ids down to a single token, while the
+                # request still went through the bootstrap handshake. The decode
+                # side registered for the ORIGINAL request length, so forwarding
+                # this shortened result would let decode accept the transfer and
+                # read KV blocks owned by other requests. Retire the request and
+                # drop the delayed result instead of sending KV.
+                if is_aborted(req):
+                    if self._retire_aborted_prefill_result(req):
+                        aborted_reqs.append(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
@@ -702,6 +717,29 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        error_message = (
+                            f"Grammar accept_token failed for req {req.rid} "
+                            f"with token {next_token_id}: {e}"
+                        )
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    req.grammar.finished = req.finished()
+                    if is_aborted(req):
+                        # A grammar rejection aborts the request mid-batch. The
+                        # same ownership hazard applies: decode registered for
+                        # the full length, so this result must not be forwarded.
+                        if self._retire_aborted_prefill_result(req):
+                            aborted_reqs.append(req)
+                        advance_logprob_pt(i, req)
+                        continue
+
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and draft_input is not None:
@@ -740,18 +778,6 @@ class SchedulerDisaggregationPrefillMixin:
                 if not req.pending_bootstrap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
-
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(next_token_id)
-                    except ValueError as e:
-                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                    req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
                 req.inflight_middle_chunks -= 1
@@ -764,15 +790,20 @@ class SchedulerDisaggregationPrefillMixin:
                     req.extend_range is not None
                     and req.extend_range.end >= len(req.origin_input_ids)
                 )
-                if req.pending_bootstrap and not still_chunking:
-                    self.optimistic_release_and_requeue(req)
+                # Abort is terminal. An optimistic bootstrap failure can race
+                # with an already-running chunk, but that must never turn an
+                # aborted request back into a live request through the normal
+                # release/requeue path. Wait for the last in-flight chunk to
+                # become safe, then retire and emit the abort exactly once.
+                if is_aborted(req):
+                    if not still_chunking and self._retire_aborted_prefill_result(req):
+                        aborted_reqs.append(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
-                # Optimistic bootstrap can fail while this overlapped chunk is
-                # already running. Drop aborted chunks instead of sending KV.
-                if is_aborted(req):
+                if req.pending_bootstrap and not still_chunking:
+                    self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
@@ -800,6 +831,15 @@ class SchedulerDisaggregationPrefillMixin:
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if aborted_reqs:
+            # Emit the terminal abort exactly once. The requests were retired
+            # above and their resources released, so their delayed prefill
+            # results must not surface as normal successes.
+            self.output_streamer.stream_output(
+                aborted_reqs,
+                any(req.return_logprob for req in aborted_reqs),
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -963,6 +1003,58 @@ class SchedulerDisaggregationPrefillMixin:
                 transferred_rids.append(req.rid)
 
         return transferred_rids
+
+    def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
+        """Release resources held by a request aborted during prefill.
+
+        Returns True when this call owns the terminal abort and False for a
+        delayed result that was already retired. A freshly staged abort can own
+        the terminal result even before it allocates memory; this is the input
+        validation path that must reject before admission ACK/bootstrap.
+
+        Note the abort may be staged either in ``to_finish`` (via
+        ``set_finish_with_abort``) or already promoted to ``finished_reason``
+        (via ``prepare_abort``), so ownership cannot be inferred from the
+        finish state alone.
+
+        Without this, an aborted request keeps owning its KV blocks, metadata
+        buffer and hybrid Mamba state until the next idle invariant check, and
+        the completed prefill result is still pushed into the transfer queue.
+        """
+        has_staged_abort = req.to_finish is not None and not req.finished()
+        if has_staged_abort:
+            req.update_finish_state()
+
+        owns_resources = (
+            req.req_pool_idx is not None
+            or req.mamba_pool_idx is not None
+            or req.metadata_buffer_index >= 0
+        )
+        has_bootstrap_state = req.pending_bootstrap
+        if not (has_staged_abort or owns_resources or has_bootstrap_state):
+            # A previous failure path already emitted the terminal result and
+            # released both local ownership and protocol state.
+            return False
+
+        sender = req.disagg_kv_sender
+        if sender is not None:
+            try:
+                sender.abort()
+            except Exception:
+                # Transport notification is best effort. Local ownership must
+                # still be released, otherwise the next idle invariant check
+                # reports leaked KV/Mamba state and restarts the scheduler.
+                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+
+        req.time_stats.set_completion_time()
+        self._release_prefill_tier_admission(req.rid)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        req.pending_bootstrap = False
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
         error_message = (

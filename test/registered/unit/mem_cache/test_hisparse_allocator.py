@@ -63,6 +63,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        queue.token_admission = SimpleNamespace(
+            reserved_tokens=MagicMock(return_value=0)
+        )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._need_space_for_single_req = MagicMock(return_value=0)
         queue._active_reserved_tokens = MagicMock(return_value=0)

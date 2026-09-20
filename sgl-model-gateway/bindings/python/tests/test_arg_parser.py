@@ -612,6 +612,7 @@ class TestParseRouterArgs:
                 "150000",
                 "--pd-decode-admission-token-overhead",
                 "640",
+                "--pd-decode-admission-remote",
             ]
         )
         assert router_args.pd_prefill_admission_max_cold_tokens == 65536
@@ -621,6 +622,7 @@ class TestParseRouterArgs:
         assert router_args.pd_prefill_admission_retry_after_secs == 3
         assert router_args.pd_decode_admission_max_tokens == 150000
         assert router_args.pd_decode_admission_token_overhead == 640
+        assert router_args.pd_decode_admission_remote is True
 
     def test_parse_cors_args(self):
         """Test parsing CORS arguments."""

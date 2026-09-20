@@ -760,6 +760,7 @@ class OpenAIServingChat(OpenAIServingBase):
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             pd_prefill_admission_ack=request.pd_prefill_admission_ack,
+            decode_token_reservation_id=request.decode_token_reservation_id,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
             lora_path=lora_path,

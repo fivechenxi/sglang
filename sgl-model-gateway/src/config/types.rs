@@ -65,14 +65,19 @@ pub struct RouterConfig {
     /// Retry-After value returned by fail-fast admission 429 responses.
     #[serde(default = "default_pd_prefill_admission_retry_after_secs")]
     pub pd_prefill_admission_retry_after_secs: u64,
-    /// Per decode-DP in-flight KV token budget. The reservation covers the
-    /// entire response lifetime. Zero disables decode admission.
+    /// Per decode-DP in-flight KV token fallback. It also handles batched
+    /// requests until the remote protocol supports per-child reservation IDs.
+    /// Zero disables local decode admission.
     #[serde(default)]
     pub pd_decode_admission_max_tokens: usize,
-    /// Conservative token overhead added to every decode reservation for chat
-    /// templates and protocol tokens not present in routing text.
+    /// Output-token fallback used before the Router has enough P90 samples.
+    /// Must be non-zero when remote Decode admission is enabled.
     #[serde(default)]
     pub pd_decode_admission_token_overhead: usize,
+    /// Use Decode-issued real-time atomic reservations. Endpoint failures
+    /// fall back to the legacy Router-local budget during staged rollout.
+    #[serde(default)]
+    pub pd_decode_admission_remote: bool,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
@@ -572,6 +577,7 @@ impl Default for RouterConfig {
             pd_prefill_admission_retry_after_secs: default_pd_prefill_admission_retry_after_secs(),
             pd_decode_admission_max_tokens: 0,
             pd_decode_admission_token_overhead: 0,
+            pd_decode_admission_remote: false,
             rate_limit_tokens_per_second: None,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),

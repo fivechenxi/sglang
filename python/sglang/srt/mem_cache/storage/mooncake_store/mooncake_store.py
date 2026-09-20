@@ -418,10 +418,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             # Use the backend tag and model name as a prefix to isolate tenants
             # and models sharing one store.
+            self.extra_backend_tag = (
+                str(extra_config["extra_backend_tag"])
+                if extra_config and extra_config.get("extra_backend_tag") is not None
+                else None
+            )
             self.config_prefix = None
             config_prefix_parts = []
-            if extra_config and extra_config.get("extra_backend_tag") is not None:
-                config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
+            if self.extra_backend_tag is not None:
+                config_prefix_parts.append(self.extra_backend_tag)
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)

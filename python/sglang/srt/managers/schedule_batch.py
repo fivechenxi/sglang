@@ -1046,6 +1046,12 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        # Decode-side capacity reservation. The opaque ID exists only until
+        # physical preallocation; afterwards the unmaterialized output
+        # headroom above the normal per-request reserve is tracked locally.
+        self.decode_token_reservation_id: Optional[str] = None
+        self.decode_token_reservation_extra: int = 0
+        self.decode_token_reservation_base_kv_len: int = 0
         # Decode-local: the already-emitted boundary token to replay when a
         # retracted request is rebootstrapped. Set in pause_generation(retract)
         # and consumed in the decode transfer commit; never plumbed to prefill.

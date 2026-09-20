@@ -254,6 +254,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pd_decode_admission_remote(mut self, remote: bool) -> Self {
+        self.config.pd_decode_admission_remote = remote;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self

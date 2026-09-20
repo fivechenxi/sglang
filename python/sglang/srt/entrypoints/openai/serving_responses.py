@@ -80,6 +80,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _PrefillAdmissionRejected(Exception):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -359,6 +365,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         ),
                         sampling_params=sampling_params,
                         stream=request.stream,
+                        pd_prefill_admission_ack=request.pd_prefill_admission_ack,
+                        decode_token_reservation_id=request.decode_token_reservation_id,
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=request.routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         rid=request.request_id,
                         session_id=request.session_id,
                         extra_key=self._compute_extra_key(request),
@@ -380,6 +393,35 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             assert len(generators) == 1
             (result_generator,) = generators
+
+            if request.pd_prefill_admission_ack:
+                # The P-side Responses request is an internal metadata stream,
+                # not a client-visible Responses event stream. Prime it before
+                # returning so an admission rejection can preserve its HTTP
+                # status instead of being hidden behind an already-sent 200.
+                generator = self._responses_pd_prefill_stream_generator(
+                    result_generator
+                )
+                try:
+                    first_chunk = await generator.__anext__()
+                except _PrefillAdmissionRejected as e:
+                    return self.create_error_response(
+                        str(e),
+                        err_type="PrefillAdmissionRejected",
+                        status_code=e.status_code,
+                    )
+                except ValueError as e:
+                    # Match the Chat Completions streaming path: tokenizer and
+                    # context validation still runs lazily on the first engine
+                    # iteration, so convert it before HTTP 200 is committed.
+                    return self.create_error_response(str(e))
+
+                async def prepend_first_chunk():
+                    yield first_chunk
+                    async for chunk in generator:
+                        yield chunk
+
+                return prepend_first_chunk()
 
             # Store the input messages
             if request.store:
@@ -456,6 +498,41 @@ class OpenAIServingResponses(OpenAIServingChat):
             except Exception as e:
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
+
+    async def _responses_pd_prefill_stream_generator(
+        self, result_generator: AsyncIterator[Any]
+    ) -> AsyncGenerator[str, None]:
+        stream_started = False
+        async for content in result_generator:
+            if not isinstance(content, dict):
+                content = getattr(content, "last_output", None)
+            if not isinstance(content, dict):
+                continue
+
+            if content.get("pd_prefill_admitted"):
+                # An SSE comment commits HTTP 200 only after scheduler-side
+                # L1/L2/L3 admission succeeds. It remains invisible to public
+                # Responses clients because only the PD Router consumes it.
+                stream_started = True
+                yield ": pd-prefill-admitted\n\n"
+                continue
+
+            finish_reason = content.get("meta_info", {}).get("finish_reason")
+            status_code = finish_reason.get("status_code") if finish_reason else None
+            if (
+                finish_reason
+                and finish_reason.get("type") == "abort"
+                and isinstance(status_code, int)
+                and not stream_started
+            ):
+                raise _PrefillAdmissionRejected(
+                    finish_reason.get("message", "Prefill admission rejected."),
+                    status_code,
+                )
+
+            yield f"data: {orjson.dumps(content).decode()}\n\n"
+
+        yield "data: [DONE]\n\n"
 
     async def _make_request(
         self,
@@ -2356,6 +2433,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             async for res in generator:
+                if adapted_request.pd_prefill_admission_ack:
+                    # P's scheduler metadata must remain raw so the internal
+                    # admission ACK and terminal transfer status are not parsed
+                    # as public Responses output (or Harmony messages).
+                    yield res
+                    continue
                 context.append_output(res)
                 # NOTE(woosuk): The stop condition is handled by the engine.
                 yield context
@@ -2386,6 +2469,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                pd_prefill_admission_ack=adapted_request.pd_prefill_admission_ack,
+                decode_token_reservation_id=adapted_request.decode_token_reservation_id,
+                bootstrap_host=adapted_request.bootstrap_host,
+                bootstrap_port=adapted_request.bootstrap_port,
+                bootstrap_room=adapted_request.bootstrap_room,
+                routed_dp_rank=adapted_request.routed_dp_rank,
+                disagg_prefill_dp_rank=adapted_request.disagg_prefill_dp_rank,
             )
 
             # Update sampling params with reduced max_tokens

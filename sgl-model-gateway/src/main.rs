@@ -373,13 +373,17 @@ struct CliArgs {
     #[arg(long, default_value_t = 1, help_heading = "PD Disaggregation")]
     pd_prefill_admission_retry_after_secs: u64,
 
-    /// Per-decode-DP in-flight KV token budget (0 disables)
+    /// Per-decode-DP local KV token fallback; required by remote admission
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     pd_decode_admission_max_tokens: usize,
 
-    /// Safety overhead added to each decode token reservation
+    /// Output-token fallback before the Router has enough P90 samples
     #[arg(long, default_value_t = 0, help_heading = "PD Disaggregation")]
     pd_decode_admission_token_overhead: usize,
+
+    /// Use Decode-issued real-time atomic token reservations
+    #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
+    pd_decode_admission_remote: bool,
 
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
@@ -1061,6 +1065,7 @@ impl CliArgs {
                 self.pd_decode_admission_max_tokens,
                 self.pd_decode_admission_token_overhead,
             )
+            .pd_decode_admission_remote(self.pd_decode_admission_remote)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,

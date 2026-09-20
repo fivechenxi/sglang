@@ -372,6 +372,8 @@ class CompletionRequest(BaseModel):
     bootstrap_room: Optional[Union[List[int], int]] = None
     # Internal PD Router handshake; see ChatCompletionRequest counterpart.
     pd_prefill_admission_ack: bool = False
+    # Internal PD Router field; not part of the public API contract.
+    decode_token_reservation_id: Optional[str] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -838,6 +840,8 @@ class ChatCompletionRequest(BaseModel):
     # Internal PD Router handshake. P emits a response only after its actual
     # cache-tier admission succeeds, allowing Router to defer D allocation.
     pd_prefill_admission_ack: bool = False
+    # Internal PD Router field; not part of the public API contract.
+    decode_token_reservation_id: Optional[str] = None
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
@@ -1511,6 +1515,21 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
+    # Internal fields used by the HTTP PD Router. They are intentionally
+    # accepted on the Responses API as well as Chat Completions so the native
+    # Responses formatter can still run while generation is split across P/D.
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+    pd_prefill_admission_ack: bool = False
+    decode_token_reservation_id: Optional[str] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+    # DPAwareWorker currently injects this legacy wire name. Normalize it to
+    # routed_dp_rank so Responses follows the same DP routing contract as Chat
+    # Completions and Completions.
+    data_parallel_rank: Optional[int] = None
+
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -1527,6 +1546,11 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
