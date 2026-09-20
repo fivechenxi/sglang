@@ -420,8 +420,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # and models sharing one store.
             self.extra_backend_tag = (
                 str(extra_config["extra_backend_tag"])
-                if extra_config
-                and extra_config.get("extra_backend_tag") is not None
+                if extra_config and extra_config.get("extra_backend_tag") is not None
                 else None
             )
             self.config_prefix = None
