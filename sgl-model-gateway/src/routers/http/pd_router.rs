@@ -1765,6 +1765,15 @@ impl PDRouter {
         // created it, so retaining these unreachable entries would leak D host
         // memory (the Responses protocol defaults store to true).
         worker_body.store = Some(false);
+        // The public Responses API treats an omitted `stream` as false, but
+        // SGLang converts this request into a ChatCompletionRequest whose
+        // `stream` field is a non-optional bool.  Serializing None as JSON null
+        // makes D reject the request before it registers the PD bootstrap room,
+        // leaving P to time out while waiting for a peer that never existed.
+        // Materialize the protocol default before dispatching to either worker.
+        if worker_body.stream.is_none() {
+            worker_body.stream = Some(false);
+        }
         worker_body
     }
 
@@ -3056,6 +3065,17 @@ mod tests {
         let worker_body = PDRouter::build_stateless_responses_request(&body);
         assert_eq!(body.store, Some(true));
         assert_eq!(worker_body.store, Some(false));
+        assert_eq!(body.stream, None);
+        assert_eq!(worker_body.stream, Some(false));
+
+        let streaming_body: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello",
+            "stream": true
+        }))
+        .expect("valid streaming Responses request");
+        let streaming_worker_body = PDRouter::build_stateless_responses_request(&streaming_body);
+        assert_eq!(streaming_worker_body.stream, Some(true));
     }
 
     #[test]
