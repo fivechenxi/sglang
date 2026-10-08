@@ -241,6 +241,10 @@ class BaseSpecWorker(ABC):
         # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
+    def requires_dp_attention_eager_forward(self, batch) -> bool:
+        """Whether this rank must use eager draft forwarding for this batch."""
+        return False
+
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
