@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -1097,7 +1098,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         failed_reqs = []
         preallocated_reqs = []
+        preallocated_tokens = 0
         indices_to_remove = set()
+
+        max_inflight_transfers = int(
+            os.getenv("SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS", "0")
+        )
+        max_inflight_transfer_tokens = int(
+            os.getenv("SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS", "0")
+        )
+        existing_inflight_transfers = len(self.transfer_queue.queue)
+        existing_inflight_transfer_tokens = sum(
+            self._pre_alloc_fill_len(item.req) for item in self.transfer_queue.queue
+        )
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -1271,6 +1284,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
             if (
+                max_inflight_transfers > 0
+                and existing_inflight_transfers + len(preallocated_reqs)
+                >= max_inflight_transfers
+            ):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
+            projected_inflight_transfer_tokens = (
+                existing_inflight_transfer_tokens
+                + preallocated_tokens
+                + required_alloc_tokens
+            )
+            if (
+                max_inflight_transfer_tokens > 0
+                and projected_inflight_transfer_tokens > max_inflight_transfer_tokens
+                and (existing_inflight_transfers > 0 or preallocated_reqs)
+            ):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
+            if (
                 max(
                     required_tokens_for_request,
                     origin_input_len
@@ -1335,6 +1371,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            preallocated_tokens += required_alloc_tokens
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
