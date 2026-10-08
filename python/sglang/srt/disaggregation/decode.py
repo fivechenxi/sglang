@@ -1107,10 +1107,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_inflight_transfer_tokens = int(
             os.getenv("SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS", "0")
         )
-        existing_inflight_transfers = len(self.transfer_queue.queue)
-        existing_inflight_transfer_tokens = sum(
-            self._pre_alloc_fill_len(item.req) for item in self.transfer_queue.queue
-        )
+        if max_inflight_transfers > 0 or max_inflight_transfer_tokens > 0:
+            existing_inflight_transfers = len(self.transfer_queue.queue)
+            existing_inflight_transfer_tokens = sum(
+                self._pre_alloc_fill_len(item.req) for item in self.transfer_queue.queue
+            )
+        else:
+            existing_inflight_transfers = 0
+            existing_inflight_transfer_tokens = 0
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
