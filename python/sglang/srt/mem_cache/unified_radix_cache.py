@@ -1687,6 +1687,7 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1709,7 +1710,12 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
-        ).page_aligned(self.page_size)
+        )
+        if storage_hit_end is not None:
+            # Slice logical keys, not raw token IDs: H bigrams need H+1 IDs.
+            hit_length = max(0, storage_hit_end - len(matched_prefix_tokens or []))
+            prefetch_key = prefetch_key[:hit_length]
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:

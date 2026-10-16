@@ -1369,6 +1369,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if self.scheduler.enable_decode_hicache:
+                # L3 lookup is only an offer. Do not commit a prefix that the
+                # local prefetch declined (or whose raw bigram span was wrong).
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1377,8 +1383,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             preallocated_tokens += required_alloc_tokens
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.

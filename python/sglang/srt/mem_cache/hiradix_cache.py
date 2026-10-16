@@ -1780,6 +1780,7 @@ class HiRadixCache(RadixCache):
         # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1787,6 +1788,11 @@ class HiRadixCache(RadixCache):
             is_bigram=self.is_eagle,
             cache_salt=last_host_node.key.cache_salt,
         )
+        if storage_hit_end is not None:
+            # The queried end is in logical KV units. RadixKey slicing keeps
+            # the extra raw boundary token needed by EAGLE bigram keys.
+            hit_length = max(0, storage_hit_end - len(matched_prefix_tokens or []))
+            prefetch_key = prefetch_key[:hit_length]
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)

@@ -105,7 +105,7 @@ class DecodeHiCachePreallocMixin:
     ) -> None:
         """Issue L3 storage prefetch after admission succeeds.
 
-        On failure, degrades to L2-only restore by clearing l3 fields.
+        Promise L3 tokens only if their prefetch was actually registered.
         """
         if (
             prefix_match is None
@@ -115,9 +115,6 @@ class DecodeHiCachePreallocMixin:
             return
         try:
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
-            suffix = req.origin_input_ids[
-                matched_len : matched_len + prefix_match.l3_storage_hit_length
-            ]
             last_hash = self.tree_cache.get_last_hash_value(prefix_match.last_host_node)
             prefix_keys = (
                 self.tree_cache.get_prefix_hash_values(prefix_match.last_host_node)
@@ -127,15 +124,21 @@ class DecodeHiCachePreallocMixin:
             self.tree_cache.prefetch_from_storage(
                 req.rid,
                 prefix_match.last_host_node,
-                suffix,
+                req.origin_input_ids[matched_len:],
                 last_hash,
                 prefix_keys,
+                matched_prefix_tokens=req.origin_input_ids[:matched_len],
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
+                storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
             )
             prefix_match.prefetch_registered = (
                 req.rid in self.tree_cache.ongoing_prefetch
             )
+            if not prefix_match.prefetch_registered:
+                # A short hit, rate limit or host allocation failure can decline
+                # prefetch without raising. Prefill must transfer that span.
+                prefix_match.l3_storage_hit_length = 0
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -211,6 +214,20 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+        if len(rematch.device_indices) + rematch.host_hit_length < pm.decode_prefix_len:
+            # A storage eviction/short read can invalidate the earlier offer.
+            # Reject before init_load_back enqueues DMA: returning FAILED after
+            # enqueue would strand its load queue and pins without starting it.
+            logger.warning(
+                "HiCache restore coverage shortfall for rid=%s: device=%d, host=%d, "
+                "expected=%d; no load_back queued",
+                dr.req.rid,
+                len(rematch.device_indices),
+                rematch.host_hit_length,
+                pm.decode_prefix_len,
+            )
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
