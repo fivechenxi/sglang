@@ -79,6 +79,15 @@ def handle_context_parallelism(server_args: Any):
         )
 
     view = resolved_view(server_args)
+    if getattr(cfg, "enable_cp_decode_attn_tp", False) and view.attn_cp_size > 1:
+        attn_tp_size = cfg.tp_size // (cfg.dp_size * view.attn_cp_size)
+        if attn_tp_size != 1:
+            raise ValueError(
+                "--enable-cp-decode-attn-tp requires replicated attention weights "
+                "(attention TP=1); disable this flag for composite CP x TP "
+                f"layouts (CP={view.attn_cp_size}, attention TP={attn_tp_size}). "
+                "Prefill CP x TP remains supported without this decode flag."
+            )
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
         assert (

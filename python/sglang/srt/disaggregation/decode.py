@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -41,8 +42,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
-    HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+    reduce_hicache_restore_polls,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -301,7 +302,6 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
-    hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
@@ -1097,7 +1097,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         failed_reqs = []
         preallocated_reqs = []
+        preallocated_tokens = 0
         indices_to_remove = set()
+
+        max_inflight_transfers = int(
+            os.getenv("SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFERS", "0")
+        )
+        max_inflight_transfer_tokens = int(
+            os.getenv("SGLANG_DISAGG_DECODE_MAX_INFLIGHT_TRANSFER_TOKENS", "0")
+        )
+        if max_inflight_transfers > 0 or max_inflight_transfer_tokens > 0:
+            existing_inflight_transfers = len(self.transfer_queue.queue)
+            existing_inflight_transfer_tokens = sum(
+                self._pre_alloc_fill_len(item.req) for item in self.transfer_queue.queue
+            )
+        else:
+            existing_inflight_transfers = 0
+            existing_inflight_transfer_tokens = 0
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
@@ -1271,6 +1287,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
             if (
+                max_inflight_transfers > 0
+                and existing_inflight_transfers + len(preallocated_reqs)
+                >= max_inflight_transfers
+            ):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
+            projected_inflight_transfer_tokens = (
+                existing_inflight_transfer_tokens
+                + preallocated_tokens
+                + required_alloc_tokens
+            )
+            if (
+                max_inflight_transfer_tokens > 0
+                and projected_inflight_transfer_tokens > max_inflight_transfer_tokens
+                and (existing_inflight_transfers > 0 or preallocated_reqs)
+            ):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
+
+            if (
                 max(
                     required_tokens_for_request,
                     origin_input_len
@@ -1329,15 +1368,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if self.scheduler.enable_decode_hicache:
+                # L3 lookup is only an offer. Do not commit a prefix that the
+                # local prefetch declined (or whose raw bigram span was wrong).
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            preallocated_tokens += required_alloc_tokens
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -2210,26 +2254,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
+    def _pollers(self) -> list:
+        return [dr.kv_receiver for dr in self.queue]
+
     def _poll_with_metadata_gate(self) -> List[int]:
-        pollers = (
-            [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
-            if self.scheduler.enable_decode_hicache
-            else [dr.kv_receiver for dr in self.queue]
-        )
-        return poll_and_all_reduce(
-            pollers,
+        polls = poll_and_all_reduce(
+            self._pollers(),
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
         )
+        if self.scheduler.enable_decode_hicache:
+            polls = reduce_hicache_restore_polls(polls, self.queue, self.gloo_group)
+        return polls
 
     def _poll_with_staging(self) -> list:
-        return poll_and_all_reduce_with_staging(
+        polls = poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
+            pollers=self._pollers(),
         )
+        if self.scheduler.enable_decode_hicache:
+            polls = reduce_hicache_restore_polls(polls, self.queue, self.gloo_group)
+        return polls
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
@@ -2269,22 +2318,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
-            hicache_restore_status = decode_req.hicache_restore_status
-            if (
-                poll == KVPoll.Failed
-                or hicache_restore_status == HiCacheRestoreResult.FAILED
-            ):
+            if poll == KVPoll.Failed:
                 error_message = (
                     f"Decode transfer failed for request rank={self.tp_rank} "
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
-                if poll == KVPoll.Failed:
-                    try:
-                        decode_req.kv_receiver.failure_exception()
-                    except Exception as e:
-                        error_message += f" with exception {e}"
-                        is_propagated = getattr(e, "is_from_another_rank", False)
+                try:
+                    decode_req.kv_receiver.failure_exception()
+                except Exception as e:
+                    error_message += f" with exception {e}"
+                    is_propagated = getattr(e, "is_from_another_rank", False)
+                if decode_req.hicache_restore_status == HiCacheRestoreResult.FAILED:
+                    is_propagated = False
+                    error_message += " (HiCache local restore failed on this rank)"
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
                 if is_propagated:
@@ -2323,11 +2370,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                if (
-                    self.scheduler.enable_decode_hicache
-                    and hicache_restore_status == HiCacheRestoreResult.PENDING
-                ):
-                    continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
@@ -2583,6 +2625,11 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             running_batch = self.update_running_batch(running_batch)
             ret = running_batch if not running_batch.is_empty() else None
+
+        if ret is not None and self.draft_worker is not None:
+            ret.force_disable_draft_cuda_graph = (
+                self.draft_worker.requires_dp_attention_eager_forward(ret)
+            )
 
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(ret)
         if ret:

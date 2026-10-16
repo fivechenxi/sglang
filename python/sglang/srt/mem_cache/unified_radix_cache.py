@@ -1687,6 +1687,7 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -1709,7 +1710,12 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
-        ).page_aligned(self.page_size)
+        )
+        if storage_hit_end is not None:
+            # Slice logical keys, not raw token IDs: H bigrams need H+1 IDs.
+            hit_length = max(0, storage_hit_end - len(matched_prefix_tokens or []))
+            prefetch_key = prefetch_key[:hit_length]
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
@@ -2873,8 +2879,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Mirrors ``HiRadixCache`` so the disagg decode restore state machine
         (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
+        implementations. Collective tree-side reclamation runs in the
+        scheduler's unconditional ``check_hicache_events`` call, not here:
+        ranks can query different events and see different readiness.
         """
         if consumer_index < 0 or self.cache_controller is None:
             return True
@@ -2882,11 +2889,23 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
+        return finish_event.query()
 
-        self.loading_check()
-        return True
+    def is_load_back_ready(self, node_handle: NodeId) -> bool:
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            load_back_paths_ready,
+            unfinished_load_back_ids,
+        )
+
+        if not self.ongoing_load_back:
+            return True
+        pending = unfinished_load_back_ids(
+            self.ongoing_load_back, self.cache_controller.ack_load_queue
+        )
+        return load_back_paths_ready(
+            self.resolve_node_handle(node_handle),
+            (self.resolve_node_handle(nid) for nid in pending),
+        )
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

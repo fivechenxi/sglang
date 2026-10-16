@@ -65,10 +65,13 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 assert (
                     cfg.tp_size <= 8
                 ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
-                # DSACPLayerCommunicator does not all-reduce attention-TP
-                # partial o_proj outputs before replicated dense FFNs.
-                attn_cp_size = cfg.tp_size // cfg.dp_size
+                # CP=1 is the legacy default/auto sentinel when prefill CP is
+                # enabled. Preserve explicit CP>1 (including CP4 x attention
+                # TP2); its reductions are handled by DSACPLayerCommunicator.
+                requested_cp = getattr(cfg, "attn_cp_size", 1)
+                attn_cp_size = (
+                    cfg.tp_size // cfg.dp_size if requested_cp == 1 else requested_cp
+                )
                 overrides["attn_cp_size"] = attn_cp_size
                 logger.warning(
                     "Enabled DSA context parallel: "

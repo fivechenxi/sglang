@@ -171,6 +171,35 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _restore_decode_dp_padding(
+    output: torch.Tensor, num_padding_rows: int
+) -> torch.Tensor:
+    if num_padding_rows == 0:
+        return output
+    return torch.cat(
+        [output, output.new_zeros((num_padding_rows, *output.shape[1:]))], dim=0
+    )
+
+
+def _trim_trtllm_decode_dp_padding(
+    q_all: torch.Tensor,
+    topk_indices: Optional[torch.Tensor],
+    real_batch_size: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
+    physical_batch_size = q_all.shape[0]
+    assert real_batch_size <= physical_batch_size
+    if topk_indices is not None:
+        assert real_batch_size <= topk_indices.shape[0]
+    num_padding_rows = physical_batch_size - real_batch_size
+    if num_padding_rows == 0:
+        return q_all, topk_indices, 0
+    return (
+        q_all[:real_batch_size],
+        topk_indices[:real_batch_size] if topk_indices is not None else None,
+        num_padding_rows,
+    )
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -2256,6 +2285,29 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        num_decode_padding_rows = 0
+        if self.dsa_decode_impl == "flashinfer_sparse_mla":
+            # Eager DP attention pads activations for MLP collectives, while
+            # pre-planned DSA metadata contains only real local requests.
+            physical_batch_size = q_nope.shape[0]
+            # The compact table retains the same query rows (including MTP)
+            # when fused graph decode drops page_table_1. Do not use DSA seq
+            # lengths here: eager DP may pad those to the physical batch too.
+            real_batch_size = metadata.real_page_table.shape[0]
+            assert real_batch_size <= physical_batch_size
+            num_decode_padding_rows = physical_batch_size - real_batch_size
+            if num_decode_padding_rows:
+                q_nope = q_nope[:real_batch_size]
+                q_rope = q_rope[:real_batch_size]
+                if q_all is not None:
+                    q_all = q_all[:real_batch_size]
+                if topk_indices is not None:
+                    topk_indices = topk_indices[:real_batch_size]
+            if real_batch_size == 0:
+                return q.new_zeros(
+                    (physical_batch_size, layer.tp_q_head_num, layer.v_head_dim)
+                )
+
         if self.hisparse_coordinator is not None:
             page_table_1 = self.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
@@ -2286,14 +2338,15 @@ class DeepseekSparseAttnBackend(
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
-            return self._forward_flashinfer_sparse_mla(
+            out = self._forward_flashinfer_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
+                seq_lens=metadata.dsa_cache_seqlens_int32[:real_batch_size],
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             )
+            return _restore_decode_dp_padding(out, num_decode_padding_rows)
         elif self.dsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -3194,9 +3247,18 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
+        if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        num_decode_padding_rows = 0
+        if not is_prefill:
+            q_all, topk_indices, num_decode_padding_rows = (
+                _trim_trtllm_decode_dp_padding(
+                    q_all, topk_indices, metadata.cache_seqlens_int32.shape[0]
+                )
+            )
+
         if self.use_fused_topk:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -3212,8 +3274,6 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=metadata.cu_seqlens_q,
             )
         else:
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
@@ -3271,7 +3331,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
         )
 
-        return out
+        return _restore_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int

@@ -65,11 +65,13 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         tree_cache.prefetch_from_storage.assert_called_once_with(
             "req-0",
             22,
-            [4, 5],
+            [4, 5, 6, 7],
             "h2",
             ["h0", "h1"],
+            matched_prefix_tokens=[0, 1, 2, 3],
             extra_key="model",
             cache_salt=None,
+            storage_hit_end=6,
         )
 
     def test_stale_prefetch_anchor_degrades_to_l2(self):
@@ -101,6 +103,34 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         self.assertFalse(prefix_match.prefetch_registered)
         tree_cache.get_prefix_hash_values.assert_not_called()
         tree_cache.prefetch_from_storage.assert_not_called()
+
+    def test_declined_prefetch_preserves_l1_l2_but_does_not_promise_l3(self):
+        tree_cache = SimpleNamespace(
+            hicache_storage_pass_prefix_keys=False,
+            ongoing_prefetch={},
+            get_last_hash_value=Mock(return_value="h2"),
+            prefetch_from_storage=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="declined",
+            origin_input_ids=list(range(1025)),
+            extra_key=None,
+            cache_salt=None,
+        )
+        pm = DecodePrefixMatch(
+            prefix_indices=torch.arange(64),
+            l2_host_hit_length=64,
+            l3_storage_hit_length=512,
+            last_device_node=11,
+            last_host_node=22,
+        )
+        DecodeHiCachePreallocMixin._start_hicache_prefetch(
+            SimpleNamespace(tree_cache=tree_cache), req, pm
+        )
+        self.assertFalse(pm.prefetch_registered)
+        self.assertEqual(pm.l3_storage_hit_length, 0)
+        self.assertEqual(pm.decode_prefix_len, 128)
+        self.assertEqual(pm.restore_token_count, 64)
 
 
 if __name__ == "__main__":

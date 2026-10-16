@@ -1136,18 +1136,31 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete."""
+        """Query local readiness; collective reclamation runs once per scheduler tick."""
         if consumer_index < 0:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
+        # Ranks observe CUDA events at different times. Never enter
+        # loading_check's collective from this rank-local conditional path.
+        return finish_event.query()
 
-        self.loading_check()
-        return True
+    def is_load_back_ready(self, node: TreeNode) -> bool:
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            load_back_paths_ready,
+            unfinished_load_back_ids,
+        )
+
+        if not self.ongoing_load_back:
+            return True
+        pending = unfinished_load_back_ids(
+            self.ongoing_load_back, self.cache_controller.ack_load_queue
+        )
+        return load_back_paths_ready(
+            node, (self.ongoing_load_back[nid] for nid in pending)
+        )
 
     def evictable_size(self):
         return self.evictable_size_
@@ -1780,6 +1793,7 @@ class HiRadixCache(RadixCache):
         # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        storage_hit_end: Optional[int] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1787,6 +1801,11 @@ class HiRadixCache(RadixCache):
             is_bigram=self.is_eagle,
             cache_salt=last_host_node.key.cache_salt,
         )
+        if storage_hit_end is not None:
+            # The queried end is in logical KV units. RadixKey slicing keeps
+            # the extra raw boundary token needed by EAGLE bigram keys.
+            hit_length = max(0, storage_hit_end - len(matched_prefix_tokens or []))
+            prefetch_key = prefetch_key[:hit_length]
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
