@@ -2290,7 +2290,10 @@ class DeepseekSparseAttnBackend(
             # Eager DP attention pads activations for MLP collectives, while
             # pre-planned DSA metadata contains only real local requests.
             physical_batch_size = q_nope.shape[0]
-            real_batch_size = metadata.page_table_1.shape[0]
+            # The compact table retains the same query rows (including MTP)
+            # when fused graph decode drops page_table_1. Do not use DSA seq
+            # lengths here: eager DP may pad those to the physical batch too.
+            real_batch_size = metadata.real_page_table.shape[0]
             assert real_batch_size <= physical_batch_size
             num_decode_padding_rows = physical_batch_size - real_batch_size
             if num_decode_padding_rows:
