@@ -1136,18 +1136,16 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete."""
+        """Query local readiness; collective reclamation runs once per scheduler tick."""
         if consumer_index < 0:
             return True
 
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
-
-        self.loading_check()
-        return True
+        # Ranks observe CUDA events at different times. Never enter
+        # loading_check's collective from this rank-local conditional path.
+        return finish_event.query()
 
     def evictable_size(self):
         return self.evictable_size_

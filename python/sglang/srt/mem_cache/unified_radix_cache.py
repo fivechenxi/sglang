@@ -2879,8 +2879,9 @@ class UnifiedRadixCache(BasePrefixCache):
         Mirrors ``HiRadixCache`` so the disagg decode restore state machine
         (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
         controller-level ``layer_done_counter`` event is shared across cache
-        implementations, while the tree-side bookkeeping runs in
-        ``loading_check``.
+        implementations. Collective tree-side reclamation runs in the
+        scheduler's unconditional ``check_hicache_events`` call, not here:
+        ranks can query different events and see different readiness.
         """
         if consumer_index < 0 or self.cache_controller is None:
             return True
@@ -2888,11 +2889,7 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
-            return False
-
-        self.loading_check()
-        return True
+        return finish_event.query()
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
