@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -35,6 +35,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    attn_tp_all_gather_into_tensor,
     attn_tp_all_reduce,
     get_local_dp_buffer,
 )
@@ -260,10 +261,30 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for decode: full -> attn tp full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
             if get_parallel().attn_tp_size > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                # The MLP output is partial over the full TP group. Reduce it
+                # while scattering TP-sized token shards, then gather only the
+                # shard belonging to this CP rank across its attention-TP group.
+                # TP ranks are ordered [cp0/tp0, cp0/tp1, cp1/tp0, ...].
+                tp_size = get_parallel().tp_size
                 cp_size = get_parallel().attn_cp_size
-                cp_rank = get_parallel().attn_cp_rank
-                hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+                if hidden_states.shape[0] % tp_size:
+                    raise ValueError(
+                        "CP prefill token count must be divisible by TP size: "
+                        f"tokens={hidden_states.shape[0]}, tp_size={tp_size}"
+                    )
+                tp_shard = hidden_states.new_empty(
+                    hidden_states.shape[0] // tp_size,
+                    *hidden_states.shape[1:],
+                )
+                get_tp_group().reduce_scatter_tensor(
+                    tp_shard, hidden_states.contiguous()
+                )
+                cp_shard = hidden_states.new_empty(
+                    hidden_states.shape[0] // cp_size,
+                    *hidden_states.shape[1:],
+                )
+                attn_tp_all_gather_into_tensor(cp_shard, tp_shard)
+                hidden_states = cp_shard
             else:
                 hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
