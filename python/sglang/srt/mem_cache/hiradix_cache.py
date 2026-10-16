@@ -1147,6 +1147,21 @@ class HiRadixCache(RadixCache):
         # loading_check's collective from this rank-local conditional path.
         return finish_event.query()
 
+    def is_load_back_ready(self, node: TreeNode) -> bool:
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            load_back_paths_ready,
+            unfinished_load_back_ids,
+        )
+
+        if not self.ongoing_load_back:
+            return True
+        pending = unfinished_load_back_ids(
+            self.ongoing_load_back, self.cache_controller.ack_load_queue
+        )
+        return load_back_paths_ready(
+            node, (self.ongoing_load_back[nid] for nid in pending)
+        )
+
     def evictable_size(self):
         return self.evictable_size_
 

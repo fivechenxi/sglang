@@ -159,21 +159,30 @@ class DecodeHiCachePreallocMixin:
         )
 
 
-class HiCacheRestoreGatedKVReceiver:
-    """Carry local restore outcomes into the existing cross-rank MIN poll."""
+def reduce_hicache_restore_polls(polls, decode_reqs, group):
+    """Gate *globally completed* transfers on a separate restore consensus.
 
-    def __init__(self, decode_req: DecodeRequest):
-        self.decode_req = decode_req
+    Never mix a rank-local restore failure into the raw transport MIN: another
+    rank may still be receiving RDMA into pages that the failure path frees.
+    ``polls`` must already include transport, staging and metadata consensus.
+    Its values (and hence this conditional collective) are identical on peers.
+    """
+    if KVPoll.Success not in polls:
+        return polls
+    from sglang.srt.disaggregation.utils import _all_reduce_polls
 
-    def poll(self) -> KVPoll:
-        poll = self.decode_req.kv_receiver.poll()
-        if poll == KVPoll.Success:
-            restore_status = self.decode_req.hicache_restore_status
-            if restore_status == HiCacheRestoreResult.PENDING:
-                return KVPoll.Transferring
-            if restore_status == HiCacheRestoreResult.FAILED:
-                return KVPoll.Failed
-        return poll
+    states = {
+        HiCacheRestoreResult.FAILED: KVPoll.Failed,
+        HiCacheRestoreResult.PENDING: KVPoll.Transferring,
+        HiCacheRestoreResult.READY: KVPoll.Success,
+    }
+    restore_polls = _all_reduce_polls(
+        [states[dr.hicache_restore_status] for dr in decode_reqs], group
+    )
+    return [
+        restore if raw == KVPoll.Success else raw
+        for raw, restore in zip(polls, restore_polls)
+    ]
 
 
 class DecodeHiCacheTransferMixin:
@@ -257,8 +266,10 @@ class DecodeHiCacheTransferMixin:
         self.tree_cache.inc_lock_ref(restored_node)
 
         if len(new_indices) == 0:
-            # Whole prefix already on device; no DMA needed.
-            dr.hicache_restore_status = HiCacheRestoreResult.READY
+            # Published device indices can belong to another request's queued
+            # or in-flight H2D. No new allocation does not imply data readiness.
+            if self.tree_cache.is_load_back_ready(restored_node):
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
             return False
         return True
 
@@ -273,18 +284,22 @@ class DecodeHiCacheTransferMixin:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
                 continue
             pm = dr.prefix_match
-            if pm is None or not pm.needs_local_restore:
+            if pm is None:
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
+                continue
+            if not pm.needs_local_restore:
+                # A later preallocation may already see the published L1 pages
+                # of an earlier restore, without owning a DMA consumer index.
+                if self.tree_cache.is_load_back_ready(pm.last_device_node):
+                    dr.hicache_restore_status = HiCacheRestoreResult.READY
                 continue
             active.append(dr)
 
-        # Phase A: advance in-flight DMAs to READY.
+        # Phase A: advance restores whose path's H2D events have completed.
         for dr in active:
             if (
                 dr.hicache_restored_node is not None
-                and self.tree_cache.is_load_back_event_done(
-                    dr.hicache_load_consumer_index
-                )
+                and self.tree_cache.is_load_back_ready(dr.hicache_restored_node)
             ):
                 dr.hicache_restore_status = HiCacheRestoreResult.READY
 
@@ -305,14 +320,9 @@ class DecodeHiCacheTransferMixin:
         if not queued:
             return
 
-        # Phase C: kick off merged DMA, bind consumer_index for Phase A polling next tick.
-        consumer_index = self.tree_cache.ready_to_load_host_cache()
-        if consumer_index < 0:
-            for dr in queued:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return
-        for dr in queued:
-            dr.hicache_load_consumer_index = consumer_index
+        # Phase C: start merged DMA. All consumers (including shared L1 hits)
+        # query the completion of the pinned load paths, not a private ring slot.
+        self.tree_cache.ready_to_load_host_cache()
 
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match

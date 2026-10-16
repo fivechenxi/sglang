@@ -41,7 +41,14 @@ class TestDecodeL3RoundTrip(CustomTestCase):
     _run_prefetch_to_completion = UnifiedRadixCacheSuite._run_prefetch_to_completion
 
     def _round_trip(
-        self, *, bigram, hit, expected_promise=None, local_prefix=0, missing_tail=False
+        self,
+        *,
+        bigram,
+        hit,
+        expected_promise=None,
+        local_prefix=0,
+        missing_tail=False,
+        shared_prefix=False,
     ):
         self.cfg = replace(self.cfg, is_eagle=bigram)
         storage = tempfile.TemporaryDirectory(prefix="decode-l3-regression-")
@@ -147,10 +154,36 @@ class TestDecodeL3RoundTrip(CustomTestCase):
         queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(harness, dr)
         self.assertNotEqual(dr.hicache_restore_status, HiCacheRestoreResult.FAILED)
         self.assertTrue(queued)
+        if shared_prefix:
+            # The first request published GPU addresses, but start_loading has
+            # not even been called. A second consumer must not become READY.
+            other_req = self._make_req(req_pool)
+            other_req.origin_input_ids = prompt
+            other = SimpleNamespace(
+                req=other_req,
+                prefix_match=pm,
+                hicache_restore_status=HiCacheRestoreResult.PENDING,
+                hicache_restored_node=None,
+                hicache_load_consumer_index=-1,
+            )
+            self.assertFalse(
+                DecodeHiCacheTransferMixin._try_hicache_queue_load_back(harness, other)
+            )
+            self.assertEqual(other.hicache_restore_status, HiCacheRestoreResult.PENDING)
+            self.assertFalse(cons.is_load_back_ready(other.hicache_restored_node))
         cons.ready_to_load_host_cache()
         for ack in list(cons.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
+        if shared_prefix:
+            self.assertTrue(cons.ongoing_load_back)
+            self.assertTrue(cons.is_load_back_ready(other.hicache_restored_node))
         cons.loading_check()
+        if shared_prefix:
+            self.assertTrue(cons.is_load_back_ready(other.hicache_restored_node))
+            torch.testing.assert_close(
+                other.hicache_restored_kv_indices, dr.hicache_restored_kv_indices
+            )
+            cons.dec_lock_ref(other.hicache_restored_node)
         restored = dr.hicache_restored_kv_indices
         self.assertEqual(len(restored), hit - local_prefix)
         restored_pool = cons_allocator.get_kvcache()
@@ -187,6 +220,9 @@ class TestDecodeL3RoundTrip(CustomTestCase):
 
     def test_short_unigram_hit_is_not_promised(self):
         self._round_trip(bigram=False, hit=128, expected_promise=0)
+
+    def test_shared_prefix_waits_for_queued_h2d(self):
+        self._round_trip(bigram=True, hit=1024, shared_prefix=True)
 
 
 if __name__ == "__main__":

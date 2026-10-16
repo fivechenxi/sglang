@@ -46,6 +46,44 @@ class PrefixCacheTrait(Protocol):
     disable: bool
 
 
+def load_back_paths_ready(node: Any, pending_nodes) -> bool:
+    """Conservatively wait for H2D operations sharing a non-root path segment.
+
+    A load publishes device slots before copying their contents. Its anchor
+    stays pinned until the completion ack is reaped, including split fragments
+    inserted on its path. Inspecting live paths works for both cache cores and
+    avoids retaining recyclable layer-event indices. Unrelated prefix branches
+    do not block each other. A shared already-ready ancestor may conservatively
+    wait for a descendant's load as well; this is only a restore/admission gate.
+    """
+    path = set()
+    while node is not None and node.parent is not None:
+        path.add(node.id)
+        node = node.parent
+    if not path:
+        return True
+    for pending in pending_nodes:
+        while pending is not None and pending.parent is not None:
+            if pending.id in path:
+                return False
+            pending = pending.parent
+    return True
+
+
+def unfinished_load_back_ids(ongoing_load_back, ack_load_queue) -> set[int]:
+    """Local H2D readiness, independent of cross-rank acknowledgment reaping.
+
+    Queued but not submitted operations have no ack and remain pending. A
+    completed event retires the dependency even if another rank has not caught
+    up enough for loading_check to reclaim the operation's pins yet.
+    """
+    pending = set(ongoing_load_back)
+    for ack in ack_load_queue:
+        if pending.intersection(ack.node_ids) and ack.finish_event.query():
+            pending.difference_update(ack.node_ids)
+    return pending
+
+
 @dataclasses.dataclass
 class MatchPrefixParams:
     """Unified parameters for match_prefix across different cache types"""

@@ -2891,6 +2891,22 @@ class UnifiedRadixCache(BasePrefixCache):
         ].finish_event
         return finish_event.query()
 
+    def is_load_back_ready(self, node_handle: NodeId) -> bool:
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            load_back_paths_ready,
+            unfinished_load_back_ids,
+        )
+
+        if not self.ongoing_load_back:
+            return True
+        pending = unfinished_load_back_ids(
+            self.ongoing_load_back, self.cache_controller.ack_load_queue
+        )
+        return load_back_paths_ready(
+            self.resolve_node_handle(node_handle),
+            (self.resolve_node_handle(nid) for nid in pending),
+        )
+
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
     # TODO: simplify and consolidate in a future refactor.

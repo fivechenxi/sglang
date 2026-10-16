@@ -42,8 +42,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
-    HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
+    reduce_hicache_restore_polls,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -302,7 +302,6 @@ class DecodeRequest:
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
-    hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
@@ -2256,26 +2255,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return
 
     def _pollers(self) -> list:
-        if self.scheduler.enable_decode_hicache:
-            return [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
         return [dr.kv_receiver for dr in self.queue]
 
     def _poll_with_metadata_gate(self) -> List[int]:
-        return poll_and_all_reduce(
+        polls = poll_and_all_reduce(
             self._pollers(),
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
         )
+        if self.scheduler.enable_decode_hicache:
+            polls = reduce_hicache_restore_polls(polls, self.queue, self.gloo_group)
+        return polls
 
     def _poll_with_staging(self) -> list:
-        return poll_and_all_reduce_with_staging(
+        polls = poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
             pollers=self._pollers(),
         )
+        if self.scheduler.enable_decode_hicache:
+            polls = reduce_hicache_restore_polls(polls, self.queue, self.gloo_group)
+        return polls
 
     def _init_staging_handler(self, kv_manager):
         """Create staging handler from kv_manager. Must be called exactly once."""
