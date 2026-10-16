@@ -151,7 +151,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
-    bias = 0
+    bias = one allocator page for DSA under DCP (including replicated pools)
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -168,6 +168,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._reserve_dsa_dcp_page = (
+            kvc.use_mla_backend
+            and is_deepseek_dsa(kvc.model_config.hf_config)
+            and get_parallel().attn_dcp_size > 1
+            and not get_memory().enable_hisparse
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -210,6 +216,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         target_kv_size * draft_num_layers / target_kv_num_layers
                     )
+                    # The target latent KV is per-rank; the replicated draft
+                    # consumes every virtual allocator location. Its indexer
+                    # replication is already priced below, so scale only KV.
+                    if not get_memory().enable_hisparse:
+                        draft_kv_size *= get_parallel().attn_dcp_size
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
@@ -381,6 +392,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             indexer_ratio = parse_hisparse_config().host_to_device_ratio
+        else:
+            # Unlike latent MLA KV, DSA index-K is addressed by global logical
+            # locations. Both target and draft materialize that full span.
+            indexer_ratio = get_parallel().attn_dcp_size
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -432,6 +447,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             if self._cell_size
             else self._zero_kv_max_tokens
         )
+        if self._reserve_dsa_dcp_page:
+            # Target KV has one physical page zero; replicated index/draft
+            # pools have DCP physical pages for that same logical page zero.
+            # Their DCP factors are in _cell_size: reserve it exactly once.
+            max_total_num_tokens -= page_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
