@@ -93,6 +93,20 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _dsa_index_buffer_tokens_for_dcp(
+    max_total_num_tokens: int, page_size: int, dcp_size: int
+) -> int:
+    # PagedTokenToKVPoolAllocator reserves page 0 and may hand out its final
+    # page ID. Each DCP logical page spans dcp_size physical index pages.
+    return max_total_num_tokens * dcp_size + (dcp_size - 1) * page_size
+
+
+def _dsa_index_pages_required(
+    max_total_num_tokens: int, page_size: int, dcp_size: int
+) -> int:
+    return (max_total_num_tokens // page_size + 1) * dcp_size
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     memory_config = get_memory()
     return (
@@ -1512,6 +1526,26 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        dcp_size = get_parallel().attn_dcp_size
+        pool_size = max_total_num_tokens
+        pool_page_size = self.pool_page_size
+        if dcp_size > 1 and not get_memory().enable_hisparse:
+            # _derive_pool_sizes already widens the draft's token count. Price
+            # and allocate the logical span once, not DCP squared. DSA kernels
+            # still use physical 64-token pages, even for a replicated draft.
+            index_base_tokens = max_total_num_tokens // self.loc_space_scale
+            pool_page_size = get_schedule().page_size
+            # The paged allocator addresses logical pages of page_size * DCP,
+            # while the latent MLA KV remains sharded per rank. The DSA index
+            # buffer is indexed by those logical locations during PD transfer
+            # and must cover the allocator's final (nonzero) page ID.
+            pool_kwargs["index_buf_size"] = _dsa_index_buffer_tokens_for_dcp(
+                index_base_tokens, pool_page_size, dcp_size
+            )
+            if self.is_draft_worker:
+                # The latent draft pool must also span the whole logical page
+                # zero and the final allocator page, with physical-page layout.
+                pool_size = pool_kwargs["index_buf_size"]
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
@@ -1520,8 +1554,8 @@ class KVCacheConfigurator:
                 )
             ]
         token_to_kv_pool = PoolCls(
-            max_total_num_tokens,
-            page_size=self.pool_page_size,
+            pool_size,
+            page_size=pool_page_size,
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
@@ -1537,6 +1571,22 @@ class KVCacheConfigurator:
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             **pool_kwargs,
         )
+        if "index_buf_size" in pool_kwargs:
+            required_pages = _dsa_index_pages_required(
+                index_base_tokens, pool_page_size, dcp_size
+            )
+            # Some DSA layers reuse a preceding top-k and intentionally have
+            # a zero-row placeholder; validate every materialized index pool.
+            actual_pages = [
+                buffer.shape[0]
+                for buffer in token_to_kv_pool.index_k_with_scale_buffer
+                if buffer.shape[0] > 0
+            ]
+            if actual_pages and min(actual_pages) < required_pages:
+                raise RuntimeError(
+                    f"DSA index pool has {min(actual_pages)} pages, but the "
+                    f"DCP allocator can address {required_pages} pages"
+                )
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(
