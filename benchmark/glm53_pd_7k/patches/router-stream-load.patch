@@ -1,0 +1,20 @@
+diff --git a/sgl-model-gateway/src/routers/http/pd_router.rs b/sgl-model-gateway/src/routers/http/pd_router.rs
+--- a/sgl-model-gateway/src/routers/http/pd_router.rs
++++ b/sgl-model-gateway/src/routers/http/pd_router.rs
+@@ -652,12 +652,10 @@
+         decode: Arc<dyn Worker>,
+         _start_time: Instant,
+     ) -> Response {
+-        // For non-streaming: use guard for automatic load management
+-        // For streaming: load will be managed in create_streaming_response
+-        let _prefill_guard =
+-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
+-        let _decode_guard =
+-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
++        // Count from dispatch, including the period before streaming headers.
++        // Streaming responses attach their own guards before these drop.
++        let _prefill_guard = WorkerLoadGuard::new(prefill.clone(), headers);
++        let _decode_guard = WorkerLoadGuard::new(decode.clone(), headers);
+ 
+         let mut headers_with_trace = headers.cloned().unwrap_or_default();
+         inject_trace_context_http(&mut headers_with_trace);
