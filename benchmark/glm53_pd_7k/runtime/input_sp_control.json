@@ -1,0 +1,6 @@
+{
+  "target": "input_sp",
+  "mode": "candidate",
+  "verify_input_sp": false,
+  "run_id": "isolated-replay"
+}
