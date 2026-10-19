@@ -1,0 +1,74 @@
+{
+  "format": 1,
+  "scope": "Pinned legacy D recovery plus fixed-base router; not arbitrary current-source patches.",
+  "patches": [
+    {
+      "file": "patches/dcp-cpu-retraction.patch",
+      "path": "python/sglang/srt/layers/dcp/layout.py",
+      "role": "D",
+      "before_sha256": "5b923260c3b187d8e44bdcfff62ddb02ac7c4b5f49eb71704cb31fab478fabe8",
+      "after_sha256": "4e5db06e9ae1d40a237d0910d54610edc619c00d0c2ffb7b720c0f1adf06b8b4",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/dcp-cpu-retraction.patch",
+      "path": "python/sglang/srt/mem_cache/memory_pool.py",
+      "role": "D",
+      "before_sha256": "d91d1cf4abd621a88f4f7db4ec2bf44b2ad6ff02706f65375378e63bb9703c68",
+      "after_sha256": "de396632153a9597c95335a001fef9c05d485169cf7ef36a7da7c78b81d7d2d0",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/draft-kv-retraction.patch",
+      "path": "python/sglang/srt/mem_cache/allocator/base.py",
+      "role": "D",
+      "before_sha256": "8f8239157e3cf30d94da9f103acb72a1ffd39ef7813df83aba882d1d5041d7f4",
+      "after_sha256": "980f1b10258b5362b334a1a94b1a11dcd64589632c8f8c61b2d99737234dbda4",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/draft-kv-retraction.patch",
+      "path": "python/sglang/srt/speculative/base_spec_worker.py",
+      "role": "D",
+      "before_sha256": "5964c707fda5b1a3d435cee03c1a1564434349d3a6c035e24ed8cdf6832952c2",
+      "after_sha256": "7af0c9c2e22b04ab2f07f180616d668bc29390b49425cb1300f45aa1750f7a55",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/draft-kv-retraction.patch",
+      "path": "python/sglang/srt/managers/schedule_batch.py",
+      "role": "D",
+      "before_sha256": "d7d9dac049916b02a852ddfb10e99a88eba1ac5dae3ff66ab1c56b61c70f9954",
+      "after_sha256": "e20948d13750eede5e40ded79b0fad9f27975ef15141a136427934eaeba68748",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/overlap-retraction-boundary.patch",
+      "path": "python/sglang/srt/managers/scheduler.py",
+      "role": "D",
+      "before_sha256": "295c2f9d56c04c664e1af3c2d5a8474b5d00be4f4a49a7e5447258486938ffa2",
+      "after_sha256": "553f50fddceeb12e5dc6328b4ee090aebdbc64c37c0f20a8eebeeb2cec21fed1",
+      "provenance": "Original and measured runtime snapshots; CPU/CUDA and forced-live-retract gates"
+    },
+    {
+      "file": "patches/router-prefill-error-propagation.patch",
+      "path": "sgl-model-gateway/src/routers/http/pd_router.rs",
+      "role": "Router",
+      "before_sha256": "b66ccae8a0d62f63d65752dc0bb4dcf0f36cde9823a8cbb4abc65f1fe86c4aac",
+      "after_sha256": "5c1bc8d2c33334ff0f2b0a7744ab391da94aef7f69720e8e7a6b09100fd0ab42",
+      "base_commit": "0bcd822377da7b5718e674eaf9c870d349424dd1",
+      "prerequisite": "../patches/router-stream-load.patch",
+      "provenance": "Rebuilt with identical normalized Cargo.lock; real HTTP mocks and live P failure/D cancellation"
+    }
+  ],
+  "sources": {
+    "patches/router-prefill-error-propagation.patch": "28edd5b2bb95a89fc2c937799aa5b176981f8ed2b4371a287696ed6a479e7e70",
+    "patches/dcp-cpu-retraction.patch": "6c234eb068e3df0604fd9a684f51e827496f273c432669f99c430a494a174b35",
+    "patches/overlap-retraction-boundary.patch": "1917b8520b3e3edcf75f98b293c9b67e030e78287fb78bd40045c5c8549f1eac",
+    "patches/draft-kv-retraction.patch": "c7a7d47928c759b19f5e77953435f727357de7bccc96e9503facd0d0d9e94e26",
+    "integration/test_retraction.py": "01381e81edc4087e6da02b52f0abe1863273de81ed466822e47b87627b1746ec",
+    "integration/router_error_regression.py": "33911c14e0fae1adce853ab88cd8ebfbde8d948f27f3a211edd0be1688f6feb1",
+    "integration/fixtures/memory_pool.original.py": "4e0043b0b12d76bb2b63a5b46845825e8bd5aeff970b434c5fc7bb3c34eecb3a",
+    "integration/fixtures/schedule_batch.original.py": "9965216d881a36b94a1acbd1b0ee0e6ac43d32771ef6deb7488f32e1c293a442"
+  }
+}
