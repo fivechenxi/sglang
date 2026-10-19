@@ -1,0 +1,55 @@
+diff --git a/python/sglang/srt/layers/dcp/layout.py b/python/sglang/srt/layers/dcp/layout.py
+--- a/python/sglang/srt/layers/dcp/layout.py
++++ b/python/sglang/srt/layers/dcp/layout.py
+@@ -41,6 +41,19 @@
+     return torch.clamp((remaining + dcp_size - 1) // dcp_size, min=0)
+ 
+ 
++def maybe_dcp_kernel_indices(
++    indices: torch.Tensor, dcp_size: int, dcp_rank: int
++) -> torch.Tensor:
++    """Map page-aligned logical runs to the owning rank's physical MLA rows.
++
++    Backport of upstream #39487. Allocator pages are widened by dcp_size;
++    a run can contain reordered pages and a ragged final page.
++    """
++    if dcp_size == 1:
++        return indices
++    return indices[dcp_rank::dcp_size] // dcp_size
++
++
+ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
+     parallel = get_parallel()
+     if parallel.dcp_enabled:
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -4152,6 +4152,15 @@
+             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+ 
+     def get_cpu_copy(self, indices, mamba_indices=None):
++        from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
++
++        # This pinned runtime uses widened logical IDs for every MLA pool.
++        # DSA's separate index-key buffer remains globally indexed: localize
++        # only this parent implementation, not the subclass's caller tensor.
++        parallel = get_parallel()
++        indices = maybe_dcp_kernel_indices(
++            indices, parallel.attn_dcp_size, parallel.attn_dcp_rank
++        )
+         current_platform.synchronize()
+         kv_cache_cpu = []
+         chunk_size = self.cpu_offloading_chunk_size
+@@ -4167,6 +4176,12 @@
+         return kv_cache_cpu
+ 
+     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
++        from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
++
++        parallel = get_parallel()
++        indices = maybe_dcp_kernel_indices(
++            indices, parallel.attn_dcp_size, parallel.attn_dcp_rank
++        )
+         current_platform.synchronize()
+         chunk_size = self.cpu_offloading_chunk_size
+         for layer_id in range(self.layer_num):
