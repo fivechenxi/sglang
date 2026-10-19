@@ -1,0 +1,16 @@
+{
+  "scope": "Short/shared-prefix accuracy routing, not the historical 7K performance configuration",
+  "prefill_policy": "cache_aware",
+  "decode_policy": "cache_aware",
+  "dp_aware": true,
+  "balance_abs_threshold": 0,
+  "balance_rel_threshold": 1.0,
+  "disable_retries": true,
+  "request_timeout_secs": 7200,
+  "notes": [
+    "Use existing dispatch-time load guards. Prefer least load when unequal; cache affinity at ties.",
+    "These thresholds affect both P and D. Re-measure cache reuse and throughput before using for the long-prefix workload.",
+    "Balancing is not output-token admission control. C32 times 64K exceeds total D logical KV capacity.",
+    "Use C1 and an idle fixed P/D pair for the pending matched GPQA diagnosis."
+  ]
+}
