@@ -1,0 +1,21 @@
+{
+  "validated_on": "2026-10-18",
+  "scope": "Local source packaging verification; no serving mutation and no new GPU test",
+  "cpu_unittest_count": 25,
+  "cpu_unittest_pass": true,
+  "patch_reverse_forward_exact_sha_pass": [
+    "bounded-pack.patch",
+    "replicated-pcp-dcp.patch",
+    "gather-preload.patch",
+    "draft-seed-recompute.patch"
+  ],
+  "router_patch_actual_base_apply_and_reverse_pass": true,
+  "router_base_commit": "0bcd822377da7b5718e674eaf9c870d349424dd1",
+  "extracted_operations_equal_measured_runtime_ast": [
+    "bounded_pack.py", "replicated_pcp.py", "draft_seed.py"
+  ],
+  "retained_kernel_and_hook_sha_pass": true,
+  "unified_new_image_built": false,
+  "gpu_regression_reexecuted_for_this_pr": false,
+  "historical_gpu_evidence": "qualification.json"
+}

@@ -1,0 +1,35 @@
+--- a/python/sglang/srt/disaggregation/common/dcp_pack.py
++++ b/python/sglang/srt/disaggregation/common/dcp_pack.py
+@@ -123,4 +123,32 @@
+         max_tokens,
+     )
+ 
++    # Load the exact Triton gather specialization before any long prefill fills
++    # the KV pool. The live path loads this kernel in a transfer thread, where
++    # CUDA module loading can fail when only <1 GiB of device memory remains.
++    if buffers and kv_args.kv_data_ptrs:
++        token_item_lens = [
++            item_len // kv_args.page_size for item_len in kv_args.kv_item_lens
++        ]
++        free_before, _ = torch.cuda.mem_get_info(device)
++        # The stock Triton kernel specializes num_rows. These observed PD
++        # transfer shapes are loaded while headroom is still available.
++        preload_rows = (1, 16, 4274, 4275, 4281, 16384)
++        for rows in preload_rows:
++            preload_bytes = rows * sum(token_item_lens)
++            row_indices = torch.zeros(rows, dtype=torch.int64, device=device)
++            pack = buffers[0].buffer.narrow(0, 0, preload_bytes)
++            copy_mla_rows_into_pack(
++                kv_args.kv_data_ptrs, row_indices, pack, token_item_lens
++            )
++            torch.cuda.synchronize(device)
++        free_after, _ = torch.cuda.mem_get_info(device)
++        logger.info(
++            "PD DCP gather preloaded: layers=%d, rows=%s, free_gpu_before=%.2f GiB, "
++            "free_gpu_after=%.2f GiB",
++            len(kv_args.kv_data_ptrs),
++            preload_rows,
++            free_before / (1024**3),
++            free_after / (1024**3),
++        )
+     return buffers

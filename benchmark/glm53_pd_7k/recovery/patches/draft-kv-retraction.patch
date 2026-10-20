@@ -1,0 +1,94 @@
+diff --git a/python/sglang/srt/mem_cache/allocator/base.py b/python/sglang/srt/mem_cache/allocator/base.py
+--- a/python/sglang/srt/mem_cache/allocator/base.py
++++ b/python/sglang/srt/mem_cache/allocator/base.py
+@@ -25,6 +25,8 @@
+ 
+ 
+ class BaseTokenToKVPoolAllocator(abc.ABC):
++    cpu_retraction_draft_pools: tuple[KVCache, ...] = ()
++
+     @abc.abstractmethod
+     def __init__(
+         self,
+@@ -60,6 +62,16 @@
+     def get_kvcache(self):
+         return self._kvcache
+ 
++    def register_cpu_retraction_draft_pools(self, pools):
++        """Register distinct EAGLE/MTP pools sharing these logical token IDs."""
++        seen = {id(self.get_kvcache())}
++        unique = []
++        for pool in pools:
++            if id(pool) not in seen:
++                seen.add(id(pool))
++                unique.append(pool)
++        self.cpu_retraction_draft_pools = tuple(unique)
++
+     def free_group_begin(self):
+         self.is_not_in_free_group = False
+         self.free_group = []
+diff --git a/python/sglang/srt/speculative/base_spec_worker.py b/python/sglang/srt/speculative/base_spec_worker.py
+--- a/python/sglang/srt/speculative/base_spec_worker.py
++++ b/python/sglang/srt/speculative/base_spec_worker.py
+@@ -9,7 +9,7 @@
+     merge_graph_memory_usage,
+     merge_graph_time_usage,
+ )
+-from sglang.srt.runtime_context import get_exec, get_schedule
++from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.managers.io_struct import (
+@@ -187,6 +187,15 @@
+             )
+         self.req_to_token_pool = req_to_token_pool
+         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
++        algorithm = self.target_worker.model_runner.spec_algorithm
++        if (
++            algorithm.is_eagle()
++            and not algorithm.is_frozen_kv_mtp()
++            and not get_memory().enable_unified_memory
++        ):
++            token_to_kv_pool_allocator.register_cpu_retraction_draft_pools(
++                tuple(runner.token_to_kv_pool for runner in self.draft_worker.draft_runners)
++            )
+ 
+     def init_attention_backends(self):
+         if self.draft_worker is not None:
+diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
+--- a/python/sglang/srt/managers/schedule_batch.py
++++ b/python/sglang/srt/managers/schedule_batch.py
+@@ -1650,18 +1650,31 @@
+             self.req_pool_idx, : self.seqlen - 1
+         ]
+         # Copies over both the kv cache and mamba state if available
+-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
++        target_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+             token_indices, mamba_indices=self.mamba_pool_idx
+         )
++        # Keep the entire snapshot request-owned, so ordinary request teardown
++        # releases draft tensors too. Publish only after every copy succeeds.
++        draft_cpu = tuple(
++            pool.get_cpu_copy(token_indices, mamba_indices=self.mamba_pool_idx)
++            for pool in token_to_kv_pool_allocator.cpu_retraction_draft_pools
++        )
++        self.kv_cache_cpu = (target_cpu, draft_cpu)
+ 
+     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+         token_indices = req_to_token_pool.req_to_token[
+             self.req_pool_idx, : self.seqlen - 1
+         ]
+         # Loads both the kv cache and mamba state if exists
++        target_cpu, draft_cpu = self.kv_cache_cpu
++        pools = token_to_kv_pool_allocator.cpu_retraction_draft_pools
++        if len(pools) != len(draft_cpu):
++            raise RuntimeError("Draft KV pool count changed across CPU retraction")
+         token_to_kv_pool_allocator.load_cpu_copy(
+-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
++            target_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+         )
++        for pool, backup in zip(pools, draft_cpu):
++            pool.load_cpu_copy(backup, token_indices, mamba_indices=self.mamba_pool_idx)
+         del self.kv_cache_cpu
+ 
+     def build_rebootstrap_payload(self) -> dict:

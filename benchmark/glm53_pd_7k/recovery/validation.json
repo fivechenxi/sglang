@@ -1,0 +1,68 @@
+{
+  "date": "2026-10-19",
+  "scope": "Recovery and protocol regressions, not full accuracy/performance qualification",
+  "package": {
+    "existing_cpu_tests": 25,
+    "new_package_tests": 6,
+    "patch_roundtrip": {"patches": 4, "files": 7, "forward_reverse_byte_exact": true},
+    "private_environment_scan": "No private endpoint, credential or deployment path in added bundle"
+  },
+  "retraction": {
+    "packaged_cpu_cuda_tests_rerun": 6,
+    "passed": true,
+    "device": "NVIDIA RTX 6000D",
+    "forced_live_retractions_by_dp": [9, 10, 8, 10],
+    "streamed_arithmetic_answers": {"correct": 32, "total": 32, "done": 32},
+    "forced_retract_disabled_normal_sse": {"passed": 4, "total": 4},
+    "original_command_environment_preserved": true,
+    "forced_gate_server_log_sha256": "519d96a8795359ac8639130b4bda6fd4539952666d3e971886924f83d99c57ab"
+  },
+  "router_build": {
+    "base_commit": "0bcd822377da7b5718e674eaf9c870d349424dd1",
+    "prior_patch": "router-stream-load.patch",
+    "command": "cargo +stable build --locked --offline --release -p sgl-model-gateway-python",
+    "exit_code": 0,
+    "cargo_lock_sha256": "dadeca8e901e28bd735f7e9bbb6cf399f5f7ea25706b24a9c38b04193183dc35",
+    "source_sha256": "5c1bc8d2c33334ff0f2b0a7744ab391da94aef7f69720e8e7a6b09100fd0ab42",
+    "library_sha256": "710b975cabb2b5b8ccbe057ebac03f6e6d59e56d11e8d45a9eef564192431e87"
+  },
+  "router_mock_stock": {
+    "negative_control_reproduced": true,
+    "sse_error_client_timeout_s": 5.268288921099156,
+    "held_decode_distribution": [32, 0, 0, 0],
+    "raw_result_sha256": "af341bac5369c4b14b06de047513866cb15d97aad7baecc9211f19a792ff2e8e"
+  },
+  "router_mock_candidate": {
+    "passed": true,
+    "packaged_test_rerun_passed": true,
+    "failure_cases": ["HTTP500", "HTTP400", "HTTP200 JSON error", "native abort", "chat abort", "invalid JSON", "unexpected SSE", "body disconnect"],
+    "each_error_under_2s_and_paired_decode_closed": true,
+    "normal_cases": ["completion stream", "chat stream", "nonstream", "logprobs path", "client cancel closes P and D"],
+    "held_decode_distribution": [8, 8, 8, 8],
+    "load_zero_at_end": true,
+    "raw_result_sha256": "757c960b0fa32ddd1398beb9df8d29a64ed1e1189bb80dd92076876902913ba7",
+    "mock_warning": "aiohttp reports failed HTTP/2 autodetection before HTTP/1 fallback; all assertions passed"
+  },
+  "live_router": {
+    "http_200_done": 32,
+    "total": 32,
+    "output_tokens_per_request": 128,
+    "decode_max_loads": [8, 8, 8, 8],
+    "load_zero_at_end": true,
+    "raw_result_sha256": "4bb74eb5766f61868b6c4cbd15e022b3328e98c2a0f1651ea7879a3d673026c9",
+    "scope": "Bounded protocol/load test, not answer-quality proof"
+  },
+  "real_decode_cancellation": {
+    "injected_P_only": true,
+    "actual_D_logs_confirm_abortreq": true,
+    "cases": [
+      {"fault": "HTTP500", "client_status": 500, "client_elapsed_s": 1.0029140678234398},
+      {"fault": "HTTP200 SSE error", "client_status": 502, "client_elapsed_s": 1.0022050868719816}
+    ],
+    "decode_abort_after_error_approximately_s": [3, 4],
+    "all_D_queues_drained": true,
+    "fault_endpoint_and_router_stopped": true,
+    "raw_result_sha256": "95533d80b8fa52b0080527834f4ea82e76fc75b4655da370510a67b75d04a64d"
+  },
+  "not_claimed": ["GPQA loop fixed", "full precision parity", "new 7K benchmark", "token-budget admission", "D-failure-to-P early cancellation", "arbitrary source version compatibility"]
+}

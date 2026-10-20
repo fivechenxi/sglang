@@ -1,0 +1,38 @@
+{
+  "model": "GLM-5.3-NVFP4",
+  "hardware": "6000D / SM120",
+  "prefill": {
+    "replicas": 4, "gpus_per_replica": 8,
+    "tp": 8, "ep": 8, "attention_cp": 4, "attention_tp": 2, "attention_dp": 1,
+    "layer_split": false, "full_kv_replication": true,
+    "memory_fraction": 0.88, "pool_tokens_observed": 110464,
+    "chunked_prefill_size": 16384, "max_prefill_tokens": 16384,
+    "prefill_max_requests": 1, "max_running_requests": 64, "cuda_graph": false,
+    "torch": "2.13.0+cu130", "flashinfer": "0.6.18", "sglang": "0.5.19+overlays"
+  },
+  "decode": {
+    "replicas": 1, "gpus_per_replica": 8,
+    "tp": 8, "ep": 8, "attention_dp": 4, "attention_tp": 2, "dcp": 2,
+    "dcp_backend": "a2a", "memory_fraction": 0.960,
+    "physical_pool_tokens_per_dp_observed": 150208,
+    "logical_pool_tokens_per_dp_observed": 300416,
+    "max_running_requests": 88, "cuda_graph_max_bs_decode": 22,
+    "num_reserved_decode_tokens": 512, "extra_slots": 4,
+    "max_inflight_transfers": 6, "context_length": 196608,
+    "speculative_algorithm": "EAGLE", "speculative_num_steps": 5,
+    "speculative_eagle_topk": 1, "speculative_num_draft_tokens": 6,
+    "synthetic_acceptance": false, "cross_phase_draft_seed_reuse": false,
+    "within_iteration_index_share": true,
+    "torch": "2.11.0+cu130", "flashinfer": "0.6.15", "sglang": "0.5.17+legacy-overlays"
+  },
+  "common": {"kv_cache_dtype": "fp8_e4m3", "moe_a2a_backend": "none", "moe_runner_backend": "flashinfer_cutlass"},
+  "router": {"prefill_policy": "cache_aware", "decode_policy": "cache_aware", "dp_aware": true, "retries": false},
+  "workload": {
+    "input_tokens": 81920, "cached_tokens": 73728, "output_tokens": 600,
+    "prefix_groups": 4, "prefix_seed": 221450000,
+    "suffix_seeds": [221651000, 221661000],
+    "ignore_eos": true, "temperature": 0,
+    "offered_req_s": 3.4, "requests_per_run": 2072,
+    "predeclared_window_s": [120, 540], "gpu_denominator": 40
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "format": 1,
+  "scope": "Pinned research overlays; not patches for arbitrary upstream versions.",
+  "patches": [
+    {
+      "file": "patches/bounded-pack.patch",
+      "path": "python/sglang/srt/disaggregation/mooncake/conn.py",
+      "role": "P",
+      "before_sha256": "336d672cc49bc32ef784e757f489dc3956a580996d986cac813c89abe274ecd9",
+      "after_sha256": "c4afd0430d77e9e32d31c596bfc2b1807cb6aeb9422b84fc0c4c973704f2777a",
+      "provenance": "Original and measured runtime snapshots"
+    },
+    {
+      "file": "patches/replicated-pcp-dcp.patch",
+      "path": "python/sglang/srt/disaggregation/common/conn.py",
+      "role": "D",
+      "before_sha256": "bfdaa7c09a0a8ca6e0190b3a59235b9a776aea012ac53295cb00706882d9d302",
+      "after_sha256": "2205920bf0e3f5f164178e7cd4daea755f2e4bc548f3870b4b82998377cbf126",
+      "provenance": "Preimage reconstructed by removing only the measured opt-in helper/callsite; exact hash required"
+    },
+    {
+      "file": "patches/gather-preload.patch",
+      "path": "python/sglang/srt/disaggregation/common/dcp_pack.py",
+      "role": "P",
+      "before_sha256": "b317d8b3e149d7990f29cf02091b3dbac7837f7f0c3070c7667486a11c9726d9",
+      "after_sha256": "7aad37d6b13fa227c68bf279d9b50d75335b7ed3679427f6cd6f8c3c478b3fdf",
+      "provenance": "Inverse-derived preimage; fixed 16K buffer profile only; exact hash required"
+    },
+    {
+      "file": "patches/draft-seed-recompute.patch",
+      "path": "python/sglang/srt/speculative/eagle_worker_v2.py",
+      "role": "D",
+      "before_sha256": "2b030af222f471e43397c2426ce40b53a3426f43296a80346915f74d177ee630",
+      "after_sha256": "b0715e16ec79bbb4edfdcfba26eaeae40706e0db31b40d13e4a49c74965e3e72",
+      "provenance": "Original and measured runtime snapshots; only os import and initializer change"
+    }
+  ],
+  "sources": {
+    "runtime/input_sp_research_hook.py": "5b44dc5c9521d5e25d291396d6199383cb21b25c828f62c2c72d6b8796459f1a",
+    "runtime/exact_topk_research_hook_r33.py": "8135ecf04d491795ebd11c972cf1512d94c016a0d5a4b13bb8a6574ec2831525",
+    "runtime/exact_d_topk_hook_r38.py": "d431a54ff31ec07b96abe0dea2e13e1455174bee091c60b7fefdb0ac18ad036e",
+    "kernels/p_topk.cu": "c734e6de5c15d92c17b6ef839ac5bb8956d5c21eadc7b8d24b647da524f7fcb4",
+    "kernels/p_bindings.cpp": "8be7b51e3aecb8aade1100520196abd2ef715c6dde4378cd1d647d0a42cddf65",
+    "kernels/d_topk.cu": "db648fadd5351a65a512c0d914917bb062222e4e570167c3276f90ffa07b7b1a",
+    "kernels/d_bindings.cpp": "6c798c02b659e7af4d3f57b3f6a373fdf0d1bd76b795d47520d753f6d45b975f",
+    "patches/router-stream-load.patch": "59864cc8868bd9a82c353b4b1e5a87ffd8ce9b50d399536cca2553471fb3f629"
+  }
+}
