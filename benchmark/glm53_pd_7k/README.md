@@ -4,15 +4,18 @@
 
 2026-10-19 补充：[回收、路由均衡与 P→D 错误联动修复](recovery/README.md)。包含独立补丁、真实回收/取消验证和固定源码哈希；不改写下面历史性能结果，GPQA 循环尚未完成归因。
 
+2026-10-20 审阅回复：[InputSP、LayerSplit 与有界打包的证据和修改决策](REVIEW_20261020.md)。
+补入历史配对 profile/负结果，修正单项收益归因；**没有修改运行 hook、patch 或正在评测的服务**。
+
 这是固定版本的研究补丁包，**不是新的一体化生产镜像，也不是“本 PR checkout 后直接启动即可得到 7K”**。实测 P 为 v0.5.19 / Torch 2.13，D 为带历史覆盖补丁的 v0.5.17 / Torch 2.11。`patches/` 的应用对象是相应运行源码，不是本分支任意版本的同名文件；移植到当前源码必须重新进行 GPU 正确性及端到端验收。
 
 ## 本次整理的内容
 
 | 项目 | 实际改动 | 已有证据与限制 |
 |---|---|---|
-| P InputSP | attention→MoE 边界采用 attention-TP ReduceScatter → 本地 LayerNorm → TP AllGather；恢复完整 residual | 实际层 hidden/residual 对照；配对 P 测试约 +5.3%，不是整机单项收益 |
-| P 完整 KV + PCP4 | 关闭 LayerSplit，保留 PCP4；每个 CP rank 持有完整历史 KV，避免 LayerSplit 历史 KV 广播 | P 代理计时约 +10.9%，包含交接；约多占 4.7 GiB/rank；不是免费容量收益 |
-| PD 有界打包 | 大请求分块复用已注册 pack buffer；必须同步传输完成后才能复用，失败立即返回 | 碎片物理页、层间不同字节数、失败不复用的回归；不单独声称 TPS 提升 |
+| P InputSP | attention→MoE 边界采用 attention-TP ReduceScatter → 本地 LayerNorm → TP AllGather；恢复完整 residual | 标准每 rank 发送 payload **4S→4.5S（+12.5%）**，不是通信减量；配对短轮 P 首增量速率代理约 +5.3%，双方积队列，不是整机/稳态单项收益 |
+| P 完整 KV + PCP4 | 关闭 LayerSplit，保留 PCP4；每个 CP rank 持有完整历史 KV，避免 LayerSplit 历史 KV 广播 | **完整 KV＋有界打包组合**在固定 110464-token 池的短轮 HTTP 完成代理约 +10.9%；双方积队列、包含交接、每卡多约 4.7 GiB；未证明同显存预算收益或关闭 LayerSplit 的独立收益 |
+| PD 有界打包 | 大请求分块复用已注册 pack buffer；必须同步传输完成后才能复用，失败立即返回 | 有超大传输原回退超时与候选完成的历史证据；缺少单变量延迟/吞吐 A/B 和 R65/R66 触发率，不单独声称 TPS 提升；暂不做双 buffer |
 | Gather 预加载 | KV 注册阶段预加载观测到的 gather shape，避免显存紧张时临时加载模块 | 固定 16K prefill profile；不能不检查 buffer 容量就推广到其他参数 |
 | D seed 重算 | 关闭跨阶段 draft-extend seed 复用，保留迭代内 IndexShare、target verify 和真实拒绝采样 | draft decode profile 从 1/4 到 4/4 步走 graph；提议/接受率可能变化，不保证逐 token 相同 |
 | 精确 DSA Top-K | P 使用社区精确选择修复；D 增加相同 score 时较小 index 优先的确定性 tie-break | D 实际张量 364 文件/1420 行，eager/graph 错误均 0，配对 rank 选择集合一致；属于正确性修复，不单列收益 |
@@ -41,6 +44,13 @@ InputSP、Top-K 的 `runtime/` 保留已实测的研究 hook 原始字节及 SHA
 - D×1：8 GPU；TP8 / EP8 / attention-DP4 / attention-TP2 / DCP2 a2a；memory=0.960；running=88；每 DP decode graph=22；reserved decode=512；extra slots=4；inflight transfer=6。
 - P/D：MoE a2a=`none`，runner=`flashinfer_cutlass`；真实 EAGLE steps=5、topk=1、draft tokens=6；不使用 synthetic acceptance。
 - Router：P/D 均 `cache_aware`，开启 DP-aware，关闭 retries。四组独立可复用前缀需要实际验证分配到四个 P，不能仅看 API 的 cached_tokens。
+
+这里关闭 LayerSplit 仅描述已测的有限热前缀配置，不是通用推荐。原 LayerSplit
+基线解决容量不足和缓存反复驱逐，继续保留。每 P 的 110464-token 池不能乘
+rank 数当成独立 token 容量；一个 73728-token 前缀加四条 8192-token suffix
+理论占 106496，加五条则 114688，尚未计其他保留项。`running=64` 不代表能
+同时驻留 64 条长输入。不同前缀工作集、同显存预算的容量/吞吐取舍和 CP0
+发送热点仍未验收；P 热命中也不等于 D 命中或 PD 仅发送新 suffix。
 
 ## 源码检查与离线回归
 
